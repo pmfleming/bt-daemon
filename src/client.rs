@@ -5,7 +5,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{api, backend::BluetoothBackend};
+use crate::{
+    api,
+    backend::BluetoothBackend,
+    daemon::{BUS_NAME, OBJECT_PATH},
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -22,6 +26,7 @@ enum Request {
 }
 
 pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
+    let dbus = zbus::Connection::session().await.ok();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await.context("read client request")? {
@@ -41,7 +46,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
         };
         match request {
             Request::Call { id, method, params } => {
-                let response = api::dispatch(Arc::clone(&backend), &method, params).await;
+                let response = dispatch(&dbus, Arc::clone(&backend), &method, params).await;
                 emit(
                     &mut stdout,
                     &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
@@ -55,6 +60,33 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn dispatch(
+    connection: &Option<zbus::Connection>,
+    fallback: Arc<dyn BluetoothBackend>,
+    method: &str,
+    params: Value,
+) -> Value {
+    if let Some(connection) = connection
+        && let Ok(proxy) = zbus::Proxy::new(
+            connection,
+            BUS_NAME,
+            OBJECT_PATH,
+            "org.laufan.BluetoothDaemon1",
+        )
+        .await
+    {
+        let params_json = params.to_string();
+        let response: zbus::Result<String> =
+            proxy.call("Call", &(method, params_json.as_str())).await;
+        if let Ok(response) = response
+            && let Ok(value) = serde_json::from_str(&response)
+        {
+            return value;
+        }
+    }
+    api::dispatch(fallback, method, params).await
 }
 
 async fn emit(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<()> {
