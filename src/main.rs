@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     let backend: Arc<dyn BluetoothBackend> = bluez.clone();
     match cli.command {
         Command::Daemon => {
-            let pairing = PairingBroker::new();
+            let pairing = PairingBroker::new(bluez.identity_registry());
             let _agent = bluez.register_agent(pairing.agent()).await?;
             daemon::run(backend, pairing).await
         }

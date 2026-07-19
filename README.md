@@ -47,4 +47,4 @@ bt-daemon debug protocol-registry
 bt-daemon debug contract-fixture
 ```
 
-Durable private-address identity, audio profiles, and OBEX remain staged work.
+Device identities are random opaque IDs persisted in a private, versioned state registry and shared by snapshots, pairing prompts, and operations. They survive daemon and machine restarts for identities resolved by BlueZ; truly unknown, unpaired devices that rotate private addresses cannot be safely correlated and remain separate until BlueZ resolves them. Audio profiles and OBEX remain staged work.

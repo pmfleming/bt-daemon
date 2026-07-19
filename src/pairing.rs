@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
-use crate::bluez::device_key_from_parts;
+use crate::identity::DeviceIdentityRegistry;
 
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -51,15 +51,17 @@ pub struct PairingBroker {
     sequence: AtomicU64,
     pending: Mutex<HashMap<String, PendingResponse>>,
     events: broadcast::Sender<PairingEvent>,
+    identities: Arc<DeviceIdentityRegistry>,
 }
 
 impl PairingBroker {
-    pub fn new() -> Arc<Self> {
+    pub fn new(identities: Arc<DeviceIdentityRegistry>) -> Arc<Self> {
         let (events, _) = broadcast::channel(32);
         Arc::new(Self {
             sequence: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             events,
+            identities,
         })
     }
 
@@ -207,7 +209,7 @@ impl PairingBroker {
             event: "requested".to_string(),
             request_id: id.clone(),
             kind: kind.to_string(),
-            device_key: device_key_from_parts(adapter, device),
+            device_key: self.identities.device_key(adapter, device),
             response_required: true,
             value,
             entered: None,
@@ -234,7 +236,7 @@ impl PairingBroker {
             event: "display".to_string(),
             request_id: id.clone(),
             kind: kind.to_string(),
-            device_key: device_key_from_parts(adapter, device),
+            device_key: self.identities.device_key(adapter, device),
             response_required: false,
             value: Some(value),
             entered,
@@ -257,7 +259,7 @@ impl PairingBroker {
             event: "cancelled".to_string(),
             request_id,
             kind: kind.to_string(),
-            device_key: device_key_from_parts(adapter, device),
+            device_key: self.identities.device_key(adapter, device),
             response_required: false,
             value: None,
             entered: None,
@@ -408,11 +410,13 @@ fn callback_display_passkey(broker: Arc<PairingBroker>) -> bluer::agent::Display
 mod tests {
     use serde_json::json;
 
+    use crate::identity::DeviceIdentityRegistry;
+
     use super::{PairingBroker, PendingResponse};
 
     #[tokio::test]
     async fn rejects_invalid_passkeys_without_answering_bluez() {
-        let broker = PairingBroker::new();
+        let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
         broker
             .pending
@@ -429,7 +433,10 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_event_uses_opaque_identity_and_accepts_response() {
-        let broker = PairingBroker::new();
+        let identities = DeviceIdentityRegistry::in_memory();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let expected_key = identities.device_key("hci0", address);
+        let broker = PairingBroker::new(identities);
         let mut events = broker.subscribe();
         let request_broker = broker.clone();
         let request = tokio::spawn(async move {
@@ -437,7 +444,7 @@ mod tests {
                 .request_unit(
                     "confirmation",
                     "hci0".into(),
-                    "AA:BB:CC:DD:EE:FF".parse().unwrap(),
+                    address,
                     Some("123456".into()),
                     None,
                 )
@@ -446,6 +453,7 @@ mod tests {
         let event = events.recv().await.unwrap();
         assert_eq!(event.kind, "confirmation");
         assert_eq!(event.value.as_deref(), Some("123456"));
+        assert_eq!(event.device_key, expected_key);
         assert!(!event.device_key.contains("AA:BB"));
         broker
             .respond(&json!({ "request_id": event.request_id, "accept": true }))
@@ -456,7 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_response_is_forwarded() {
-        let broker = PairingBroker::new();
+        let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
         let (sender, receiver) = tokio::sync::oneshot::channel();
         broker
             .pending

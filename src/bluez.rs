@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bluer::{
-    Adapter as BluezAdapter, Address, Device as BluezDevice, Session,
+    Adapter as BluezAdapter, Device as BluezDevice, Session,
     agent::{Agent, AgentHandle},
 };
 use futures::{
@@ -19,6 +19,7 @@ use tokio::{
 
 use crate::{
     backend::BluetoothBackend,
+    identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Snapshot},
 };
 
@@ -26,6 +27,7 @@ pub struct BluezBackend {
     session: Session,
     discovery_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     changes: broadcast::Sender<()>,
+    identities: Arc<DeviceIdentityRegistry>,
 }
 
 impl BluezBackend {
@@ -35,7 +37,12 @@ impl BluezBackend {
             session: Session::new().await.context("open BlueZ session")?,
             discovery_tasks: Mutex::new(HashMap::new()),
             changes,
+            identities: DeviceIdentityRegistry::load_default()?,
         })
+    }
+
+    pub fn identity_registry(&self) -> Arc<DeviceIdentityRegistry> {
+        Arc::clone(&self.identities)
     }
 
     pub async fn register_agent(&self, agent: Agent) -> Result<AgentHandle> {
@@ -123,7 +130,7 @@ impl BluezBackend {
                 .context("list adapter devices")?
             {
                 let device = adapter.device(address).context("open BlueZ device")?;
-                if device_key(&adapter, &device) == key {
+                if self.identities.device_key(adapter.name(), device.address()) == key {
                     return Ok((adapter, device));
                 }
             }
@@ -182,7 +189,9 @@ impl BluetoothBackend for BluezBackend {
                 let Ok(device) = adapter.device(address) else {
                     continue;
                 };
-                if let Some(value) = device_snapshot(&adapter, &device, &adapter_key).await {
+                if let Some(value) =
+                    device_snapshot(&adapter, &device, &adapter_key, &self.identities).await
+                {
                     devices_out.push(value);
                 }
             }
@@ -322,14 +331,6 @@ async fn adapter_key(adapter: &BluezAdapter) -> Result<String> {
     ))
 }
 
-fn device_key(adapter: &BluezAdapter, device: &BluezDevice) -> String {
-    device_key_from_parts(adapter.name(), device.address())
-}
-
-pub fn device_key_from_parts(adapter: &str, address: Address) -> String {
-    opaque_key("device", &format!("{adapter}:{address}"))
-}
-
 fn opaque_key(kind: &str, identity: &str) -> String {
     let digest = Sha256::digest(identity.as_bytes());
     format!("{kind}-{}", hex::encode(&digest[..12]))
@@ -339,6 +340,7 @@ async fn device_snapshot(
     adapter: &BluezAdapter,
     device: &BluezDevice,
     adapter_key: &str,
+    identities: &DeviceIdentityRegistry,
 ) -> Option<Device> {
     let paired = device.is_paired().await.ok()?;
     let connected = device.is_connected().await.unwrap_or(false);
@@ -361,7 +363,7 @@ async fn device_snapshot(
         })
         .unwrap_or_default();
     Some(Device {
-        key: device_key(adapter, device),
+        key: identities.device_key(adapter.name(), device.address()),
         adapter_key: adapter_key.to_string(),
         name: device
             .alias()
@@ -423,12 +425,12 @@ mod tests {
     use super::{opaque_key, signal_strength};
 
     #[test]
-    fn keys_are_opaque_and_deterministic() {
+    fn adapter_keys_are_opaque_and_deterministic() {
         assert_eq!(
-            opaque_key("device", "hci0:AA"),
-            opaque_key("device", "hci0:AA")
+            opaque_key("adapter", "hci0:AA"),
+            opaque_key("adapter", "hci0:AA")
         );
-        assert!(!opaque_key("device", "hci0:AA").contains("AA"));
+        assert!(!opaque_key("adapter", "hci0:AA").contains("AA"));
     }
 
     #[test]

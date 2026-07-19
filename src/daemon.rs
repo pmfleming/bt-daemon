@@ -390,7 +390,10 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::sync::{Mutex, broadcast};
 
-    use crate::{backend::BluetoothBackend, model::Snapshot, pairing::PairingBroker};
+    use crate::{
+        backend::BluetoothBackend, identity::DeviceIdentityRegistry, model::Snapshot,
+        pairing::PairingBroker,
+    };
 
     use super::{BluetoothDaemon, OperationEvent};
 
@@ -433,7 +436,7 @@ mod tests {
         (
             BluetoothDaemon {
                 backend: Arc::new(TestBackend { complete }),
-                pairing: PairingBroker::new(),
+                pairing: PairingBroker::new(DeviceIdentityRegistry::in_memory()),
                 sequence: AtomicU64::new(1),
                 subscriptions: Arc::new(Mutex::new(Default::default())),
                 operations: Arc::new(Mutex::new(Default::default())),
