@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use bt_daemon::{
-    api, backend::BluetoothBackend, bluez::BluezBackend, client, daemon, pairing::PairingBroker,
-    protocol,
+    api, audio, backend::BluetoothBackend, bluez::BluezBackend, client, daemon,
+    pairing::PairingBroker, protocol,
 };
 
 #[derive(Debug, Parser)]
@@ -35,6 +35,7 @@ enum Command {
 enum DebugCommand {
     ProtocolRegistry,
     ContractFixture,
+    AudioProbe,
 }
 
 #[tokio::main]
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
         let value = match command {
             DebugCommand::ProtocolRegistry => protocol::registry(),
             DebugCommand::ContractFixture => protocol::contract_fixture(),
+            DebugCommand::AudioProbe => serde_json::to_value(audio::probe()?)?,
         };
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());

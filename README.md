@@ -45,6 +45,9 @@ Inspect the canonical protocol metadata and checked fixture with:
 ```sh
 bt-daemon debug protocol-registry
 bt-daemon debug contract-fixture
+bt-daemon debug audio-probe
 ```
+
+`audio-probe` uses the native PipeWire API (not `wpctl` output parsing) to enumerate Bluetooth audio cards, active profiles, available A2DP/HSP/HFP profiles, priorities, availability, and codecs.
 
 Device identities are random opaque IDs persisted in a private, versioned state registry and shared by snapshots, pairing prompts, and operations. They survive daemon and machine restarts for identities resolved by BlueZ; truly unknown, unpaired devices that rotate private addresses cannot be safely correlated and remain separate until BlueZ resolves them. Audio profiles and OBEX remain staged work.

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audio;
 pub mod backend;
 pub mod bluez;
 pub mod client;
