@@ -20,6 +20,12 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         Some("bluetooth.changed"),
     ),
     ("bluetooth.obex.snapshot", "{}", "obex", None),
+    (
+        "bluetooth.obex.send",
+        r#"{"device_key":"device-opaque","path":"/selected/file"}"#,
+        "transfer",
+        Some("bluetooth.obex.transfer"),
+    ),
     ("bluetooth.audio.snapshot", "{}", "audio_devices", None),
     (
         "bluetooth.audio.setProfile",
@@ -50,6 +56,10 @@ pub const STREAMS: &[(&str, &[&str])] = &[
     (
         "bluetooth.operation",
         &["started", "completed", "failed", "cancelled"],
+    ),
+    (
+        "bluetooth.obex.transfer",
+        &["queued", "progress", "completed", "failed", "cancelled"],
     ),
     (
         "bluetooth.audio.changed",
@@ -127,11 +137,27 @@ pub fn contract_fixture() -> Value {
             "data": {
                 "obex": {
                     "available": true,
-                    "outgoing_object_push": false,
+                    "outgoing_object_push": true,
                     "incoming_authorization": false,
-                    "transfer_progress": false,
-                    "cancellation": false
+                    "transfer_progress": true,
+                    "cancellation": true
                 }
+            }
+        },
+        "obex_event": {
+            "protocol": "bt-api",
+            "version": 1,
+            "stream": "bluetooth.obex.transfer",
+            "event": "progress",
+            "subscription_id": "subscription-1",
+            "data": {
+                "event": "progress",
+                "request_id": "obex-transfer-1",
+                "device_key": "device-opaque",
+                "file_name": "document.pdf",
+                "status": "active",
+                "transferred": 512,
+                "size": 1024
             }
         },
         "audio_snapshot": {

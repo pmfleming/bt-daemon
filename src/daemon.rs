@@ -30,6 +30,7 @@ pub const CHANGED_STREAM: &str = "bluetooth.changed";
 pub const PAIRING_STREAM: &str = "pairing.request";
 pub const OPERATION_STREAM: &str = "bluetooth.operation";
 pub const AUDIO_STREAM: &str = "bluetooth.audio.changed";
+pub const OBEX_STREAM: &str = "bluetooth.obex.transfer";
 
 #[derive(Clone, Serialize)]
 struct OperationEvent {
@@ -40,6 +41,19 @@ struct OperationEvent {
     state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<crate::model::Snapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+}
+
+#[derive(Clone, Serialize)]
+struct ObexEvent {
+    event: String,
+    request_id: String,
+    device_key: String,
+    file_name: String,
+    status: String,
+    transferred: u64,
+    size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
 }
@@ -57,11 +71,101 @@ pub struct BluetoothDaemon {
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
     operation_events: broadcast::Sender<OperationEvent>,
     audio_events: broadcast::Sender<()>,
+    obex_events: broadcast::Sender<ObexEvent>,
+    obex_cancellations: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl BluetoothDaemon {
     fn next_id(&self, prefix: &str) -> String {
         format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
+    }
+
+    async fn start_obex_transfer(&self, params: &Value) -> Value {
+        let device_key = params
+            .get("device_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if device_key.is_empty() || path.is_empty() {
+            return api::error(
+                "validation-error",
+                "device_key and path are required".to_string(),
+            );
+        }
+        let target = match self.backend.obex_target(device_key).await {
+            Ok(target) => target,
+            Err(error) => return api::error("device-unavailable", format!("{error:#}")),
+        };
+        let transfer = match obex::start_file(&target.source, &target.destination, path).await {
+            Ok(transfer) => transfer,
+            Err(error) => return api::error("obex-start-failed", format!("{error:#}")),
+        };
+        let request_id = self.next_id("obex-transfer");
+        let file_name = transfer.file_name.clone();
+        let size = transfer.size;
+        let queued = ObexEvent {
+            event: "queued".into(),
+            request_id: request_id.clone(),
+            device_key: device_key.into(),
+            file_name: file_name.clone(),
+            status: "queued".into(),
+            transferred: 0,
+            size,
+            error: None,
+        };
+        let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        self.obex_cancellations
+            .lock()
+            .await
+            .insert(request_id.clone(), cancel_sender);
+        let events = self.obex_events.clone();
+        let cancellations = Arc::clone(&self.obex_cancellations);
+        let task_id = request_id.clone();
+        let task_device = device_key.to_string();
+        tokio::spawn(async move {
+            let update_events = events.clone();
+            let update_id = task_id.clone();
+            let update_device = task_device.clone();
+            let update_name = file_name.clone();
+            let result = transfer
+                .run(cancel_receiver, move |update| {
+                    let event = match update.status.as_str() {
+                        "complete" => "completed",
+                        "cancelled" => "cancelled",
+                        "error" => "failed",
+                        "queued" => "queued",
+                        _ => "progress",
+                    };
+                    let _ = update_events.send(ObexEvent {
+                        event: event.into(),
+                        request_id: update_id.clone(),
+                        device_key: update_device.clone(),
+                        file_name: update_name.clone(),
+                        status: update.status,
+                        transferred: update.transferred,
+                        size: update.size,
+                        error: None,
+                    });
+                })
+                .await;
+            cancellations.lock().await.remove(&task_id);
+            if let Err(error) = result {
+                let _ = events.send(ObexEvent {
+                    event: "failed".into(),
+                    request_id: task_id,
+                    device_key: task_device,
+                    file_name,
+                    status: "error".into(),
+                    transferred: 0,
+                    size,
+                    error: Some(api::error_value(&error)),
+                });
+            }
+        });
+        api::success(json!({ "transfer": queued }))
     }
 
     async fn set_audio_profile(&self, params: &Value) -> Value {
@@ -268,6 +372,9 @@ impl BluetoothDaemon {
 impl BluetoothDaemon {
     async fn call(&self, method: &str, params_json: &str) -> String {
         let params = serde_json::from_str::<Value>(params_json).unwrap_or(Value::Null);
+        if method == "bluetooth.obex.send" {
+            return self.start_obex_transfer(&params).await.to_string();
+        }
         if method == "bluetooth.obex.snapshot" {
             return match obex::probe().await {
                 Ok(capabilities) => api::success(json!({ "obex": capabilities })).to_string(),
@@ -319,11 +426,12 @@ impl BluetoothDaemon {
                     && stream != PAIRING_STREAM
                     && stream != OPERATION_STREAM
                     && stream != AUDIO_STREAM
+                    && stream != OBEX_STREAM
             })
         {
             return api::error(
                 "unsupported-stream",
-                "Subscriptions require bluetooth.changed, pairing.request, bluetooth.operation, and/or bluetooth.audio.changed"
+                "Subscriptions require bluetooth.changed, pairing.request, bluetooth.operation, bluetooth.audio.changed, and/or bluetooth.obex.transfer"
                     .to_string(),
             )
             .to_string();
@@ -332,11 +440,13 @@ impl BluetoothDaemon {
         let wants_pairing = streams.iter().any(|stream| stream == PAIRING_STREAM);
         let wants_operations = streams.iter().any(|stream| stream == OPERATION_STREAM);
         let wants_audio = streams.iter().any(|stream| stream == AUDIO_STREAM);
+        let wants_obex = streams.iter().any(|stream| stream == OBEX_STREAM);
         let id = self.next_id("subscription");
         let mut changes = self.backend.subscribe_changes();
         let mut pairing_events = self.pairing.subscribe();
         let mut operation_events = self.operation_events.subscribe();
         let mut audio_events = self.audio_events.subscribe();
+        let mut obex_events = self.obex_events.subscribe();
         let backend = Arc::clone(&self.backend);
         let pairing = Arc::clone(&self.pairing);
         let signal_emitter = emitter.to_owned();
@@ -375,6 +485,11 @@ impl BluetoothDaemon {
                             emit_audio(&signal_emitter, &pairing, &subscription_id, "changed").await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    result = obex_events.recv(), if wants_obex => match result {
+                        Ok(event) => emit_obex(&signal_emitter, &subscription_id, event).await,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
@@ -396,6 +511,11 @@ impl BluetoothDaemon {
             event.state = "cancelled".to_string();
             let _ = self.operation_events.send(event);
             return api::success(json!({ "cancelled": request_id, "kind": "operation" }))
+                .to_string();
+        }
+        if let Some(cancel) = self.obex_cancellations.lock().await.remove(request_id) {
+            let _ = cancel.send(());
+            return api::success(json!({ "cancelled": request_id, "kind": "obex-transfer" }))
                 .to_string();
         }
         api::error(
@@ -436,6 +556,20 @@ async fn emit_snapshot(
     };
     if let Err(error) = BluetoothDaemon::event(emitter, CHANGED_STREAM, &value.to_string()).await {
         tracing::debug!(%error, "could not emit Bluetooth subscription event");
+    }
+}
+
+async fn emit_obex(emitter: &SignalEmitter<'_>, subscription_id: &str, event: ObexEvent) {
+    let value = json!({
+        "protocol": api::PROTOCOL,
+        "version": api::VERSION,
+        "stream": OBEX_STREAM,
+        "event": event.event,
+        "subscription_id": subscription_id,
+        "data": event,
+    });
+    if let Err(error) = BluetoothDaemon::event(emitter, OBEX_STREAM, &value.to_string()).await {
+        tracing::debug!(%error, "could not emit OBEX transfer event");
     }
 }
 
@@ -502,6 +636,7 @@ async fn emit_pairing(emitter: &SignalEmitter<'_>, subscription_id: &str, event:
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
     let (operation_events, _) = broadcast::channel(32);
     let (audio_events, _) = broadcast::channel(32);
+    let (obex_events, _) = broadcast::channel(32);
     let monitor_events = audio_events.clone();
     std::thread::spawn(move || {
         loop {
@@ -529,6 +664,8 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
                 operations: Arc::new(Mutex::new(HashMap::new())),
                 operation_events,
                 audio_events,
+                obex_events,
+                obex_cancellations: Arc::new(Mutex::new(HashMap::new())),
             },
         )
         .context("export bt-daemon D-Bus interface")?
@@ -584,7 +721,9 @@ mod tests {
     use tokio::sync::{Mutex, broadcast};
 
     use crate::{
-        backend::BluetoothBackend, identity::DeviceIdentityRegistry, model::Snapshot,
+        backend::{BluetoothBackend, ObexTarget},
+        identity::DeviceIdentityRegistry,
+        model::Snapshot,
         pairing::PairingBroker,
     };
 
@@ -615,6 +754,13 @@ mod tests {
             self.snapshot().await
         }
 
+        async fn obex_target(&self, _: &str) -> Result<ObexTarget> {
+            Ok(ObexTarget {
+                source: "00:00:00:00:00:00".into(),
+                destination: "11:11:11:11:11:11".into(),
+            })
+        }
+
         async fn device_operation(&self, _: &str, _: &str, _: &Value) -> Result<Snapshot> {
             if self.complete {
                 self.snapshot().await
@@ -627,6 +773,7 @@ mod tests {
     fn daemon(complete: bool) -> (BluetoothDaemon, broadcast::Receiver<OperationEvent>) {
         let (operation_events, receiver) = broadcast::channel(8);
         let (audio_events, _) = broadcast::channel(8);
+        let (obex_events, _) = broadcast::channel(8);
         (
             BluetoothDaemon {
                 backend: Arc::new(TestBackend { complete }),
@@ -636,6 +783,8 @@ mod tests {
                 operations: Arc::new(Mutex::new(Default::default())),
                 operation_events,
                 audio_events,
+                obex_events,
+                obex_cancellations: Arc::new(Mutex::new(Default::default())),
             },
             receiver,
         )

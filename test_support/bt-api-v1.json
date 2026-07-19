@@ -28,14 +28,30 @@
     "protocol": "bt-api",
     "version": 1
   },
+  "obex_event": {
+    "data": {
+      "device_key": "device-opaque",
+      "event": "progress",
+      "file_name": "document.pdf",
+      "request_id": "obex-transfer-1",
+      "size": 1024,
+      "status": "active",
+      "transferred": 512
+    },
+    "event": "progress",
+    "protocol": "bt-api",
+    "stream": "bluetooth.obex.transfer",
+    "subscription_id": "subscription-1",
+    "version": 1
+  },
   "obex_snapshot": {
     "data": {
       "obex": {
         "available": true,
-        "cancellation": false,
+        "cancellation": true,
         "incoming_authorization": false,
-        "outgoing_object_push": false,
-        "transfer_progress": false
+        "outgoing_object_push": true,
+        "transfer_progress": true
       }
     },
     "ok": true,
@@ -105,6 +121,15 @@
         "stream": null
       },
       {
+        "name": "bluetooth.obex.send",
+        "params_example": {
+          "device_key": "device-opaque",
+          "path": "/selected/file"
+        },
+        "response_key": "transfer",
+        "stream": "bluetooth.obex.transfer"
+      },
+      {
         "name": "bluetooth.audio.snapshot",
         "params_example": {},
         "response_key": "audio_devices",
@@ -165,6 +190,16 @@
           "cancelled"
         ],
         "name": "bluetooth.operation"
+      },
+      {
+        "events": [
+          "queued",
+          "progress",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "name": "bluetooth.obex.transfer"
       },
       {
         "events": [

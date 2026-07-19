@@ -5,12 +5,19 @@ use tokio::sync::broadcast;
 
 use crate::model::Snapshot;
 
+#[derive(Debug, Clone)]
+pub struct ObexTarget {
+    pub source: String,
+    pub destination: String,
+}
+
 #[async_trait]
 pub trait BluetoothBackend: Send + Sync {
     fn subscribe_changes(&self) -> broadcast::Receiver<()>;
     async fn snapshot(&self) -> Result<Snapshot>;
     async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot>;
     async fn set_scanning(&self, enabled: bool) -> Result<Snapshot>;
+    async fn obex_target(&self, device_key: &str) -> Result<ObexTarget>;
     async fn device_operation(
         &self,
         device_key: &str,

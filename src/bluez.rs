@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    backend::BluetoothBackend,
+    backend::{BluetoothBackend, ObexTarget},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Snapshot},
 };
@@ -241,6 +241,18 @@ impl BluetoothBackend for BluezBackend {
             self.stop_discovery().await;
         }
         self.snapshot().await
+    }
+
+    async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
+        let (adapter, device) = self.find_device(device_key).await?;
+        Ok(ObexTarget {
+            source: adapter
+                .address()
+                .await
+                .context("read OBEX source address")?
+                .to_string(),
+            destination: device.address().to_string(),
+        })
     }
 
     async fn device_operation(
