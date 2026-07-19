@@ -17,7 +17,7 @@ use tokio::{
 use zbus::{connection, object_server::SignalEmitter};
 
 use crate::{
-    api,
+    api, audio,
     backend::BluetoothBackend,
     pairing::{PairingBroker, PairingEvent},
 };
@@ -59,6 +59,53 @@ pub struct BluetoothDaemon {
 impl BluetoothDaemon {
     fn next_id(&self, prefix: &str) -> String {
         format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
+    }
+
+    async fn audio_snapshot(&self) -> Value {
+        let devices = match tokio::task::spawn_blocking(audio::probe).await {
+            Ok(Ok(devices)) => devices,
+            Ok(Err(error)) => return api::error("audio-unavailable", format!("{error:#}")),
+            Err(error) => return api::error("audio-unavailable", error.to_string()),
+        };
+        let devices = devices
+            .into_iter()
+            .filter_map(|device| {
+                let address = device.address.parse().ok()?;
+                if device.adapter.is_empty() {
+                    return None;
+                }
+                let device_key = self.pairing.device_key(&device.adapter, address);
+                let active_profile_key = device
+                    .active_profile
+                    .and_then(|active| {
+                        device
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.index == active)
+                    })
+                    .map(|profile| audio::profile_key(&device_key, &profile.name));
+                let profiles = device
+                    .profiles
+                    .into_iter()
+                    .map(|profile| {
+                        json!({
+                            "key": audio::profile_key(&device_key, &profile.name),
+                            "label": profile.description,
+                            "mode": profile.mode,
+                            "codec": profile.codec,
+                            "available": profile.available,
+                            "priority": profile.priority,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Some(json!({
+                    "device_key": device_key,
+                    "active_profile_key": active_profile_key,
+                    "profiles": profiles,
+                }))
+            })
+            .collect::<Vec<_>>();
+        api::success(json!({ "audio_devices": devices }))
     }
 
     async fn start_operation(&self, params: Value) -> Value {
@@ -162,6 +209,9 @@ impl BluetoothDaemon {
 impl BluetoothDaemon {
     async fn call(&self, method: &str, params_json: &str) -> String {
         let params = serde_json::from_str::<Value>(params_json).unwrap_or(Value::Null);
+        if method == "bluetooth.audio.snapshot" {
+            return self.audio_snapshot().await.to_string();
+        }
         if method == "bluetooth.device.operation" {
             return self.start_operation(params).await.to_string();
         }

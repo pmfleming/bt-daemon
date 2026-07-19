@@ -69,6 +69,10 @@ impl PairingBroker {
         self.events.subscribe()
     }
 
+    pub fn device_key(&self, adapter: &str, address: Address) -> String {
+        self.identities.device_key(adapter, address)
+    }
+
     pub fn agent(self: &Arc<Self>) -> Agent {
         Agent {
             request_default: false,

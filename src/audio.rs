@@ -8,11 +8,13 @@ use pw::{
     types::ObjectType,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AudioDevice {
     pub pipewire_id: u32,
     pub address: String,
+    pub adapter: String,
     pub name: String,
     pub active_profile: Option<u32>,
     pub profiles: Vec<AudioProfile>,
@@ -80,6 +82,7 @@ fn probe_inner() -> Result<Vec<AudioDevice>> {
                         .get("api.bluez5.address")
                         .unwrap_or_default()
                         .to_string(),
+                    adapter: String::new(),
                     name: properties
                         .get("device.description")
                         .or_else(|| properties.get("device.alias"))
@@ -104,6 +107,9 @@ fn probe_inner() -> Result<Vec<AudioDevice>> {
                     };
                     if let Some(address) = properties.get("api.bluez5.address") {
                         audio_device.address = address.to_string();
+                    }
+                    if let Some(path) = properties.get("api.bluez5.path") {
+                        audio_device.adapter = adapter_from_bluez_path(path).unwrap_or_default();
                     }
                     if let Some(name) = properties
                         .get("device.description")
@@ -157,6 +163,17 @@ fn probe_inner() -> Result<Vec<AudioDevice>> {
     }
     result.sort_by_key(|device| device.name.to_lowercase());
     Ok(result)
+}
+
+pub fn profile_key(device_key: &str, profile_name: &str) -> String {
+    let digest = Sha256::digest(format!("{device_key}:{profile_name}").as_bytes());
+    format!("audio-profile-{}", hex::encode(&digest[..12]))
+}
+
+fn adapter_from_bluez_path(path: &str) -> Option<String> {
+    path.split('/')
+        .find(|part| part.starts_with("hci"))
+        .map(str::to_string)
 }
 
 fn parse_profile(pod: &pw::spa::pod::Pod) -> Option<AudioProfile> {
@@ -226,7 +243,7 @@ fn profile_codec(description: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_codec, profile_mode};
+    use super::{adapter_from_bluez_path, profile_codec, profile_key, profile_mode};
 
     #[test]
     fn classifies_bluetooth_audio_profiles() {
@@ -237,5 +254,12 @@ mod tests {
             profile_codec("High Fidelity Playback (A2DP Sink, codec AAC)").as_deref(),
             Some("AAC")
         );
+        assert_eq!(
+            adapter_from_bluez_path("/org/bluez/hci0/dev_AA"),
+            Some("hci0".into())
+        );
+        let key = profile_key("device-opaque", "a2dp-sink");
+        assert!(key.starts_with("audio-profile-"));
+        assert!(!key.contains("a2dp"));
     }
 }

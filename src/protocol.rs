@@ -19,6 +19,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         "snapshot",
         Some("bluetooth.changed"),
     ),
+    ("bluetooth.audio.snapshot", "{}", "audio_devices", None),
     (
         "bluetooth.device.operation",
         r#"{"key":"device-opaque","operation":"connect"}"#,
@@ -106,6 +107,25 @@ pub fn contract_fixture() -> Value {
                         }
                     }]
                 }
+            }
+        },
+        "audio_snapshot": {
+            "protocol": "bt-api",
+            "version": 1,
+            "ok": true,
+            "data": {
+                "audio_devices": [{
+                    "device_key": "device-opaque",
+                    "active_profile_key": "audio-profile-active",
+                    "profiles": [{
+                        "key": "audio-profile-active",
+                        "label": "High Fidelity Playback (codec AAC)",
+                        "mode": "high-fidelity",
+                        "codec": "AAC",
+                        "available": true,
+                        "priority": 100
+                    }]
+                }]
             }
         },
         "operation_event": {

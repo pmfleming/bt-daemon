@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
+    task::JoinSet,
 };
 
 use crate::{
@@ -48,6 +49,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
         spawn_owner_watcher(connection, Arc::clone(&output));
     }
 
+    let mut calls = JoinSet::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await.context("read client request")? {
         if line.trim().is_empty() {
@@ -69,7 +71,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
                 let connection = dbus.clone();
                 let fallback = Arc::clone(&backend);
                 let output = Arc::clone(&output);
-                tokio::spawn(async move {
+                calls.spawn(async move {
                     let response = dispatch(&connection, fallback, &method, params).await;
                     let _ = emit(
                         &output,
@@ -87,6 +89,11 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
                 emit_transport_response(&output, &id, response).await?;
             }
             Request::Shutdown { id } => {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while calls.join_next().await.is_some() {}
+                })
+                .await;
+                calls.abort_all();
                 emit(
                     &output,
                     &json!({ "kind": "response", "id": id, "ok": true, "response": { "shutdown": true } }),

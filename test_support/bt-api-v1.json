@@ -1,4 +1,27 @@
 {
+  "audio_snapshot": {
+    "data": {
+      "audio_devices": [
+        {
+          "active_profile_key": "audio-profile-active",
+          "device_key": "device-opaque",
+          "profiles": [
+            {
+              "available": true,
+              "codec": "AAC",
+              "key": "audio-profile-active",
+              "label": "High Fidelity Playback (codec AAC)",
+              "mode": "high-fidelity",
+              "priority": 100
+            }
+          ]
+        }
+      ]
+    },
+    "ok": true,
+    "protocol": "bt-api",
+    "version": 1
+  },
   "operation_event": {
     "data": {
       "device_key": "device-opaque",
@@ -54,6 +77,12 @@
         },
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
+      },
+      {
+        "name": "bluetooth.audio.snapshot",
+        "params_example": {},
+        "response_key": "audio_devices",
+        "stream": null
       },
       {
         "name": "bluetooth.device.operation",
