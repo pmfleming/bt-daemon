@@ -3,7 +3,10 @@ use std::sync::Arc;
 use anyhow::Error;
 use serde_json::{Value, json};
 
-use crate::{backend::BluetoothBackend, params::Params};
+use crate::{
+    backend::{BackendError, BackendErrorKind, BluetoothBackend},
+    params::Params,
+};
 
 pub use crate::protocol::{NAME as PROTOCOL, VERSION};
 
@@ -67,23 +70,15 @@ pub fn success(data: Value) -> Value {
 }
 
 pub fn error_value(error: &Error) -> Value {
-    let message = format!("{error:#}");
-    let lower = message.to_ascii_lowercase();
-    let code = if lower.contains("timed out") {
-        "timeout"
-    } else if lower.contains("not found")
-        || lower.contains("no bluetooth device")
-        || lower.contains("no longer available")
-    {
-        "device-unavailable"
-    } else if lower.contains("rejected") || lower.contains("authentication") {
-        "rejected"
-    } else if lower.contains("not ready") || lower.contains("unavailable") {
-        "bluez-unavailable"
-    } else {
-        "operation-failed"
-    };
-    json!({ "code": code, "message": message, "retryable": matches!(code, "timeout" | "device-unavailable" | "bluez-unavailable") })
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<BackendError>())
+        .map_or(BackendErrorKind::OperationFailed, |error| error.kind);
+    json!({
+        "code": kind.code(),
+        "message": format!("{error:#}"),
+        "retryable": kind.retryable(),
+    })
 }
 
 pub fn error(code: &str, message: String) -> Value {
@@ -94,21 +89,26 @@ pub fn error(code: &str, message: String) -> Value {
 mod tests {
     use anyhow::anyhow;
 
+    use crate::backend::{BackendError, BackendErrorKind};
+
     use super::error_value;
 
     #[test]
-    fn classifies_operation_errors() {
-        assert_eq!(
-            error_value(&anyhow!("connect timed out"))["code"],
-            "timeout"
-        );
-        assert_eq!(
-            error_value(&anyhow!("Bluetooth device not found"))["code"],
-            "device-unavailable"
-        );
-        assert_eq!(
-            error_value(&anyhow!("Authentication rejected"))["code"],
-            "rejected"
-        );
+    fn classifies_typed_errors_through_context() {
+        let error = anyhow!(BackendError::new(
+            BackendErrorKind::Timeout,
+            "connect timed out",
+        ))
+        .context("connect headset");
+        let value = error_value(&error);
+        assert_eq!(value["code"], "timeout");
+        assert_eq!(value["retryable"], true);
+    }
+
+    #[test]
+    fn untyped_errors_are_not_classified_by_message() {
+        let value = error_value(&anyhow!("authentication rejected after timeout"));
+        assert_eq!(value["code"], "operation-failed");
+        assert_eq!(value["retryable"], false);
     }
 }

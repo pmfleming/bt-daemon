@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use zbus::{DBusError, fdo::PropertiesProxy};
 use zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use crate::backend::BluetoothBackend;
+use crate::backend::{BluetoothBackend, ObexRemote};
 
 const BUS_NAME: &str = "org.bluez.obex";
 const OBJECT_PATH: &str = "/org/bluez/obex";
@@ -83,6 +83,55 @@ enum AuthorizationDecision {
 
 struct PendingAuthorization {
     sender: oneshot::Sender<AuthorizationDecision>,
+}
+
+struct IncomingAuthorization {
+    connection: zbus::Connection,
+    transfer_path: OwnedObjectPath,
+    request_id: String,
+    remote: ObexRemote,
+    details: IncomingDetails,
+    file_name: String,
+    destination: PathBuf,
+}
+
+impl IncomingAuthorization {
+    fn event(&self, event: &str, status: &str, timeout_ms: Option<u64>) -> ObexEvent {
+        incoming_event(
+            &self.request_id,
+            &self.remote,
+            &self.details,
+            &self.file_name,
+            event,
+            status,
+            timeout_ms,
+        )
+    }
+}
+
+fn incoming_event(
+    request_id: &str,
+    remote: &ObexRemote,
+    details: &IncomingDetails,
+    file_name: &str,
+    event: &str,
+    status: &str,
+    timeout_ms: Option<u64>,
+) -> ObexEvent {
+    ObexEvent {
+        event: event.into(),
+        request_id: request_id.into(),
+        direction: "incoming".into(),
+        device_key: remote.device_key.clone(),
+        device_name: Some(remote.name.clone()),
+        file_name: file_name.into(),
+        media_type: details.media_type.clone(),
+        status: status.into(),
+        transferred: 0,
+        size: details.size,
+        timeout_ms,
+        error: None,
+    }
 }
 
 pub struct IncomingBroker {
@@ -154,128 +203,132 @@ impl IncomingBroker {
     }
 
     async fn authorize(&self, transfer_path: OwnedObjectPath) -> Result<String, ObexAgentError> {
+        let authorization = self.prepare_authorization(transfer_path).await?;
+        match self.request_decision(&authorization).await? {
+            AuthorizationDecision::Accept => Ok(self.start_incoming(authorization).await),
+            AuthorizationDecision::Reject => Err(self.reject_authorization(
+                authorization,
+                ObexAgentError::Rejected("incoming transfer was rejected".into()),
+            )),
+            AuthorizationDecision::Cancel => Err(self.reject_authorization(
+                authorization,
+                ObexAgentError::Canceled("incoming transfer was cancelled".into()),
+            )),
+        }
+    }
+
+    async fn prepare_authorization(
+        &self,
+        transfer_path: OwnedObjectPath,
+    ) -> Result<IncomingAuthorization, ObexAgentError> {
         let connection = self.connection.get().cloned().ok_or_else(|| {
             ObexAgentError::Canceled("OBEX agent connection is unavailable".into())
         })?;
         let details = incoming_details(&connection, &transfer_path)
             .await
-            .map_err(|error| ObexAgentError::Rejected(format!("{error:#}")))?;
+            .map_err(rejected)?;
         let remote = self
             .backend
             .obex_remote(&details.source, &details.destination)
             .await
-            .map_err(|error| ObexAgentError::Rejected(format!("{error:#}")))?;
+            .map_err(rejected)?;
         let file_name = safe_file_name(&details.name);
-        let destination = incoming_destination(&file_name)
-            .map_err(|error| ObexAgentError::Rejected(format!("{error:#}")))?;
+        let destination = incoming_destination(&file_name).map_err(rejected)?;
         let request_id = format!(
             "obex-incoming-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
+        Ok(IncomingAuthorization {
+            connection,
+            transfer_path,
+            request_id,
+            remote,
+            details,
+            file_name,
+            destination,
+        })
+    }
+
+    async fn request_decision(
+        &self,
+        authorization: &IncomingAuthorization,
+    ) -> Result<AuthorizationDecision, ObexAgentError> {
         let (sender, receiver) = oneshot::channel();
-        self.pending
-            .lock()
-            .await
-            .insert(request_id.clone(), PendingAuthorization { sender });
-        let requested = ObexEvent {
-            event: "authorization-requested".into(),
-            request_id: request_id.clone(),
-            direction: "incoming".into(),
-            device_key: remote.device_key.clone(),
-            device_name: Some(remote.name.clone()),
-            file_name: file_name.clone(),
-            media_type: details.media_type.clone(),
-            status: "awaiting-authorization".into(),
-            transferred: 0,
-            size: details.size,
-            timeout_ms: Some(AUTHORIZATION_TIMEOUT.as_millis() as u64),
-            error: None,
-        };
-        let _ = self.events.send(requested.clone());
-        let decision = match tokio::time::timeout(AUTHORIZATION_TIMEOUT, receiver).await {
-            Ok(Ok(decision)) => decision,
-            Ok(Err(_)) => AuthorizationDecision::Cancel,
+        self.pending.lock().await.insert(
+            authorization.request_id.clone(),
+            PendingAuthorization { sender },
+        );
+        let requested = authorization.event(
+            "authorization-requested",
+            "awaiting-authorization",
+            Some(AUTHORIZATION_TIMEOUT.as_millis() as u64),
+        );
+        let _ = self.events.send(requested);
+        match tokio::time::timeout(AUTHORIZATION_TIMEOUT, receiver).await {
+            Ok(Ok(decision)) => Ok(decision),
+            Ok(Err(_)) => Ok(AuthorizationDecision::Cancel),
             Err(_) => {
-                self.pending.lock().await.remove(&request_id);
-                let mut expired = requested;
-                expired.event = "cancelled".into();
-                expired.status = "cancelled".into();
-                expired.timeout_ms = None;
-                let _ = self.events.send(expired);
-                return Err(ObexAgentError::Canceled(
+                self.pending.lock().await.remove(&authorization.request_id);
+                let _ = self
+                    .events
+                    .send(authorization.event("cancelled", "cancelled", None));
+                Err(ObexAgentError::Canceled(
                     "incoming transfer authorization timed out".into(),
-                ));
-            }
-        };
-        match decision {
-            AuthorizationDecision::Reject | AuthorizationDecision::Cancel => {
-                let mut rejected = requested;
-                rejected.event = "cancelled".into();
-                rejected.status = "cancelled".into();
-                rejected.timeout_ms = None;
-                let _ = self.events.send(rejected);
-                if matches!(decision, AuthorizationDecision::Reject) {
-                    Err(ObexAgentError::Rejected(
-                        "incoming transfer was rejected".into(),
-                    ))
-                } else {
-                    Err(ObexAgentError::Canceled(
-                        "incoming transfer was cancelled".into(),
-                    ))
-                }
-            }
-            AuthorizationDecision::Accept => {
-                let (cancel_sender, cancel_receiver) = oneshot::channel();
-                self.cancellations
-                    .lock()
-                    .await
-                    .insert(request_id.clone(), cancel_sender);
-                let events = self.events.clone();
-                let cancellations = Arc::clone(&self.cancellations);
-                let task_id = request_id.clone();
-                let event = ObexEvent {
-                    event: "queued".into(),
-                    request_id,
-                    direction: "incoming".into(),
-                    device_key: remote.device_key,
-                    device_name: Some(remote.name),
-                    file_name,
-                    media_type: details.media_type,
-                    status: "queued".into(),
-                    transferred: 0,
-                    size: details.size,
-                    timeout_ms: None,
-                    error: None,
-                };
-                let transfer_path_for_task = transfer_path.clone();
-                let connection_for_task = connection.clone();
-                tokio::spawn(async move {
-                    let result = monitor_incoming(
-                        &connection_for_task,
-                        transfer_path_for_task,
-                        cancel_receiver,
-                        event.clone(),
-                        &events,
-                    )
-                    .await;
-                    cancellations.lock().await.remove(&task_id);
-                    if let Err(error) = result {
-                        let mut failed = event;
-                        failed.event = "failed".into();
-                        failed.status = "error".into();
-                        failed.error = Some(serde_json::json!({
-                            "code": "obex-transfer-failed",
-                            "message": format!("{error:#}"),
-                        }));
-                        let _ = events.send(failed);
-                    }
-                });
-                Ok(destination.to_string_lossy().into_owned())
+                ))
             }
         }
     }
+
+    fn reject_authorization(
+        &self,
+        authorization: IncomingAuthorization,
+        error: ObexAgentError,
+    ) -> ObexAgentError {
+        let _ = self
+            .events
+            .send(authorization.event("cancelled", "cancelled", None));
+        error
+    }
+
+    async fn start_incoming(&self, authorization: IncomingAuthorization) -> String {
+        let (cancel_sender, cancel_receiver) = oneshot::channel();
+        self.cancellations
+            .lock()
+            .await
+            .insert(authorization.request_id.clone(), cancel_sender);
+        let events = self.events.clone();
+        let cancellations = Arc::clone(&self.cancellations);
+        let task_id = authorization.request_id.clone();
+        let event = authorization.event("queued", "queued", None);
+        let destination = authorization.destination.to_string_lossy().into_owned();
+        tokio::spawn(async move {
+            let result = monitor_incoming(
+                &authorization.connection,
+                authorization.transfer_path,
+                cancel_receiver,
+                event.clone(),
+                &events,
+            )
+            .await;
+            cancellations.lock().await.remove(&task_id);
+            if let Err(error) = result {
+                let mut failed = event;
+                failed.event = "failed".into();
+                failed.status = "error".into();
+                failed.error = Some(serde_json::json!({
+                    "code": "obex-transfer-failed",
+                    "message": format!("{error:#}"),
+                }));
+                let _ = events.send(failed);
+            }
+        });
+        destination
+    }
 }
 
+fn rejected(error: anyhow::Error) -> ObexAgentError {
+    ObexAgentError::Rejected(format!("{error:#}"))
+}
 #[derive(Clone)]
 pub struct ObexAgent {
     broker: Arc<IncomingBroker>,
@@ -751,7 +804,12 @@ fn borrowed_u64(value: &Value<'_>) -> Option<u64> {
 mod tests {
     use std::fs;
 
-    use super::{incoming_destination_in, safe_file_name, validate_outgoing_path};
+    use crate::backend::ObexRemote;
+
+    use super::{
+        IncomingDetails, incoming_destination_in, incoming_event, lifecycle_event, safe_file_name,
+        validate_outgoing_path,
+    };
 
     #[test]
     fn incoming_names_are_confined_to_the_download_directory() {
@@ -770,6 +828,34 @@ mod tests {
             directory.join("example (1).txt")
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incoming_event_lifecycle_is_built_without_dbus() {
+        let details = IncomingDetails {
+            source: "00:11:22:33:44:55".into(),
+            destination: "AA:BB:CC:DD:EE:FF".into(),
+            name: "photo.jpg".into(),
+            media_type: Some("image/jpeg".into()),
+            size: 2048,
+        };
+        let event = incoming_event(
+            "request-1",
+            &ObexRemote {
+                device_key: "device-1".into(),
+                name: "Phone".into(),
+            },
+            &details,
+            "photo.jpg",
+            "authorization-requested",
+            "awaiting-authorization",
+            Some(60_000),
+        );
+        assert_eq!(event.device_key, "device-1");
+        assert_eq!(event.size, 2048);
+        assert_eq!(event.timeout_ms, Some(60_000));
+        assert_eq!(lifecycle_event("complete"), "completed");
+        assert_eq!(lifecycle_event("active"), "progress");
     }
 
     #[test]

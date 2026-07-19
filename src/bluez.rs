@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bluer::{
     Adapter as BluezAdapter, Device as BluezDevice, Session,
@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    backend::{BluetoothBackend, ObexRemote, ObexTarget},
+    backend::{BackendError, BackendErrorKind, BluetoothBackend, ObexRemote, ObexTarget},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
     params::Params,
@@ -37,7 +37,7 @@ impl BluezBackend {
     pub async fn new() -> Result<Self> {
         let (changes, _) = broadcast::channel(64);
         Ok(Self {
-            session: Session::new().await.context("open BlueZ session")?,
+            session: Session::new().await.backend_context("open BlueZ session")?,
             discovery_tasks: Mutex::new(HashMap::new()),
             changes,
             identities: DeviceIdentityRegistry::load_default()?,
@@ -56,7 +56,7 @@ impl BluezBackend {
         self.session
             .register_agent(agent)
             .await
-            .context("register BlueZ pairing agent")
+            .backend_context("register BlueZ pairing agent")
     }
 
     pub fn start_monitoring(self: &Arc<Self>) {
@@ -78,7 +78,7 @@ impl BluezBackend {
             self.session
                 .events()
                 .await
-                .context("watch adapter hotplug")?
+                .backend_context("watch adapter hotplug")?
                 .map(|_| ())
                 .boxed(),
         );
@@ -87,7 +87,7 @@ impl BluezBackend {
                 adapter
                     .events()
                     .await
-                    .context("watch adapter changes")?
+                    .backend_context("watch adapter changes")?
                     .map(|_| ())
                     .boxed(),
             );
@@ -109,12 +109,12 @@ impl BluezBackend {
             .session
             .adapter_names()
             .await
-            .context("list BlueZ adapters")?
+            .backend_context("list BlueZ adapters")?
         {
             adapters.push(
                 self.session
                     .adapter(&name)
-                    .with_context(|| format!("open adapter {name}"))?,
+                    .backend_context(&format!("open adapter {name}"))?,
             );
         }
         Ok(adapters)
@@ -126,7 +126,11 @@ impl BluezBackend {
                 return Ok(adapter);
             }
         }
-        bail!("Bluetooth adapter is no longer available")
+        Err(BackendError::new(
+            BackendErrorKind::DeviceUnavailable,
+            "Bluetooth adapter is no longer available",
+        )
+        .into())
     }
 
     async fn find_device(&self, key: &str) -> Result<(BluezAdapter, BluezDevice)> {
@@ -134,15 +138,21 @@ impl BluezBackend {
             for address in adapter
                 .device_addresses()
                 .await
-                .context("list adapter devices")?
+                .backend_context("list adapter devices")?
             {
-                let device = adapter.device(address).context("open BlueZ device")?;
+                let device = adapter
+                    .device(address)
+                    .backend_context("open BlueZ device")?;
                 if self.identities.device_key(adapter.name(), device.address()) == key {
                     return Ok((adapter, device));
                 }
             }
         }
-        bail!("Bluetooth device is no longer available")
+        Err(BackendError::new(
+            BackendErrorKind::DeviceUnavailable,
+            "Bluetooth device is no longer available",
+        )
+        .into())
     }
 
     async fn start_discovery(&self, adapter: BluezAdapter) -> Result<()> {
@@ -154,7 +164,7 @@ impl BluezBackend {
         let mut events = adapter
             .discover_devices_with_changes()
             .await
-            .with_context(|| format!("start discovery on {name}"))?;
+            .backend_context(&format!("start discovery on {name}"))?;
         tasks.insert(
             name,
             tokio::spawn(async move { while events.next().await.is_some() {} }),
@@ -190,36 +200,42 @@ impl BluetoothBackend for BluezBackend {
             adapters_out.push(Adapter {
                 key: adapter_key.clone(),
                 name: adapter.name().to_string(),
-                alias: adapter
-                    .alias()
-                    .await
-                    .unwrap_or_else(|_| adapter.name().to_string()),
-                address: adapter
-                    .address()
-                    .await
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                address_type: adapter
-                    .address_type()
-                    .await
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                powered: adapter.is_powered().await.unwrap_or(false),
-                discovering: adapter.is_discovering().await.unwrap_or(false),
-                discoverable: adapter.is_discoverable().await.unwrap_or(false),
-                pairable: adapter.is_pairable().await.unwrap_or(false),
-                discoverable_timeout: adapter.discoverable_timeout().await.unwrap_or(0),
-                pairable_timeout: adapter.pairable_timeout().await.unwrap_or(0),
-                modalias: adapter
-                    .modalias()
-                    .await
-                    .unwrap_or(None)
+                alias: bluez_result(adapter.alias().await, "read adapter alias")?,
+                address: bluez_result(adapter.address().await, "read adapter address")?.to_string(),
+                address_type: bluez_result(
+                    adapter.address_type().await,
+                    "read adapter address type",
+                )?
+                .to_string(),
+                powered: bluez_result(adapter.is_powered().await, "read adapter power")?,
+                discovering: bluez_result(
+                    adapter.is_discovering().await,
+                    "read adapter discovery state",
+                )?,
+                discoverable: bluez_result(
+                    adapter.is_discoverable().await,
+                    "read adapter discoverable state",
+                )?,
+                pairable: bluez_result(adapter.is_pairable().await, "read adapter pairable state")?,
+                discoverable_timeout: bluez_result(
+                    adapter.discoverable_timeout().await,
+                    "read adapter discoverable timeout",
+                )?,
+                pairable_timeout: bluez_result(
+                    adapter.pairable_timeout().await,
+                    "read adapter pairable timeout",
+                )?,
+                modalias: bluez_result(adapter.modalias().await, "read adapter modalias")?
                     .map(modalias_string),
             });
-            for address in adapter.device_addresses().await.unwrap_or_default() {
-                let Ok(device) = adapter.device(address) else {
-                    continue;
-                };
+            for address in adapter
+                .device_addresses()
+                .await
+                .backend_context("list adapter devices")?
+            {
+                let device = adapter
+                    .device(address)
+                    .backend_context("open BlueZ device")?;
                 if let Some(value) = device_snapshot(
                     &adapter,
                     &device,
@@ -228,7 +244,7 @@ impl BluetoothBackend for BluezBackend {
                     &self.last_seen,
                     &self.system_bus,
                 )
-                .await
+                .await?
                 {
                     devices_out.push(value);
                 }
@@ -253,13 +269,13 @@ impl BluetoothBackend for BluezBackend {
                 .await?
                 .set_powered(powered)
                 .await
-                .context("set adapter power")?;
+                .backend_context("set adapter power")?;
         } else {
             for adapter in self.adapters().await? {
                 adapter
                     .set_powered(powered)
                     .await
-                    .context("set adapter power")?;
+                    .backend_context("set adapter power")?;
             }
         }
         if !powered {
@@ -273,7 +289,7 @@ impl BluetoothBackend for BluezBackend {
             let adapter = self.find_adapter(key).await?;
             let name = adapter.name().to_string();
             if enabled {
-                if adapter.is_powered().await.unwrap_or(false) {
+                if bluez_result(adapter.is_powered().await, "read adapter power")? {
                     self.start_discovery(adapter).await?;
                 }
             } else {
@@ -281,7 +297,7 @@ impl BluetoothBackend for BluezBackend {
             }
         } else if enabled {
             for adapter in self.adapters().await? {
-                if adapter.is_powered().await.unwrap_or(false) {
+                if bluez_result(adapter.is_powered().await, "read adapter power")? {
                     self.start_discovery(adapter).await?;
                 }
             }
@@ -302,24 +318,30 @@ impl BluetoothBackend for BluezBackend {
             "set-alias" => adapter
                 .set_alias(params.require_string("alias")?.to_string())
                 .await
-                .context("set adapter alias")?,
+                .backend_context("set adapter alias")?,
             "set-discoverable" => adapter
                 .set_discoverable(params.require_bool("discoverable")?)
                 .await
-                .context("set adapter discoverable state")?,
+                .backend_context("set adapter discoverable state")?,
             "set-pairable" => adapter
                 .set_pairable(params.require_bool("pairable")?)
                 .await
-                .context("set adapter pairable state")?,
+                .backend_context("set adapter pairable state")?,
             "set-discoverable-timeout" => adapter
                 .set_discoverable_timeout(params.require_u32("timeout")?)
                 .await
-                .context("set adapter discoverable timeout")?,
+                .backend_context("set adapter discoverable timeout")?,
             "set-pairable-timeout" => adapter
                 .set_pairable_timeout(params.require_u32("timeout")?)
                 .await
-                .context("set adapter pairable timeout")?,
-            _ => bail!("unsupported Bluetooth adapter operation: {operation}"),
+                .backend_context("set adapter pairable timeout")?,
+            _ => {
+                return Err(BackendError::new(
+                    BackendErrorKind::InvalidInput,
+                    format!("unsupported Bluetooth adapter operation: {operation}"),
+                )
+                .into());
+            }
         }
         self.snapshot().await
     }
@@ -330,41 +352,61 @@ impl BluetoothBackend for BluezBackend {
             source: adapter
                 .address()
                 .await
-                .context("read OBEX source address")?
+                .backend_context("read OBEX source address")?
                 .to_string(),
             destination: device.address().to_string(),
         })
     }
 
     async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote> {
-        let source = source
-            .parse()
-            .context("parse incoming OBEX adapter address")?;
-        let destination = destination
-            .parse()
-            .context("parse incoming OBEX device address")?;
+        let source = source.parse().map_err(|error| {
+            BackendError::new(
+                BackendErrorKind::InvalidInput,
+                format!("parse incoming OBEX adapter address: {error}"),
+            )
+        })?;
+        let destination = destination.parse().map_err(|error| {
+            BackendError::new(
+                BackendErrorKind::InvalidInput,
+                format!("parse incoming OBEX device address: {error}"),
+            )
+        })?;
         for adapter in self.adapters().await? {
-            if adapter.address().await.context("read adapter address")? != source {
+            if adapter
+                .address()
+                .await
+                .backend_context("read adapter address")?
+                != source
+            {
                 continue;
             }
             let device = adapter
                 .device(destination)
-                .context("open incoming OBEX device")?;
-            if !device.is_paired().await.unwrap_or(false) {
-                bail!("incoming transfers require a paired Bluetooth device");
+                .backend_context("open incoming OBEX device")?;
+            if !bluez_result(device.is_paired().await, "read device paired state")? {
+                return Err(BackendError::new(
+                    BackendErrorKind::Rejected,
+                    "incoming transfers require a paired Bluetooth device",
+                )
+                .into());
             }
-            if device.is_blocked().await.unwrap_or(false) {
-                bail!("incoming transfers are disabled for blocked Bluetooth devices");
+            if bluez_result(device.is_blocked().await, "read device blocked state")? {
+                return Err(BackendError::new(
+                    BackendErrorKind::Rejected,
+                    "incoming transfers are disabled for blocked Bluetooth devices",
+                )
+                .into());
             }
             return Ok(ObexRemote {
                 device_key: self.identities.device_key(adapter.name(), device.address()),
-                name: device
-                    .alias()
-                    .await
-                    .unwrap_or_else(|_| "Bluetooth device".to_string()),
+                name: bluez_result(device.alias().await, "read device alias")?,
             });
         }
-        bail!("incoming OBEX adapter is unavailable")
+        Err(BackendError::new(
+            BackendErrorKind::DeviceUnavailable,
+            "incoming OBEX adapter is unavailable",
+        )
+        .into())
     }
 
     async fn device_operation(
@@ -390,9 +432,9 @@ impl BluetoothBackend for BluezBackend {
                     device
                         .set_trusted(true)
                         .await
-                        .context("trust paired Bluetooth device")?;
+                        .backend_context("trust paired Bluetooth device")?;
                 }
-                if !device.is_connected().await.unwrap_or(false) {
+                if !bluez_result(device.is_connected().await, "read device connected state")? {
                     operation_timeout(
                         Duration::from_secs(25),
                         "connect paired Bluetooth device",
@@ -418,7 +460,7 @@ impl BluetoothBackend for BluezBackend {
                 .await?
             }
             "remove" => {
-                if device.is_connected().await.unwrap_or(false) {
+                if bluez_result(device.is_connected().await, "read device connected state")? {
                     operation_timeout(
                         Duration::from_secs(12),
                         "disconnect Bluetooth device before removal",
@@ -429,32 +471,41 @@ impl BluetoothBackend for BluezBackend {
                 adapter
                     .remove_device(device.address())
                     .await
-                    .context("remove Bluetooth device")?;
+                    .backend_context("remove Bluetooth device")?;
             }
             "set-trusted" => device
                 .set_trusted(params.require_bool("trusted")?)
                 .await
-                .context("set trusted state")?,
+                .backend_context("set trusted state")?,
             "set-blocked" => device
                 .set_blocked(params.require_bool("blocked")?)
                 .await
-                .context("set blocked state")?,
+                .backend_context("set blocked state")?,
             "set-wake-allowed" => device
                 .set_wake_allowed(params.require_bool("wake_allowed")?)
                 .await
-                .context("set wake permission")?,
+                .backend_context("set wake permission")?,
             "set-alias" => device
                 .set_alias(params.require_string("alias")?.to_string())
                 .await
-                .context("set device alias")?,
-            _ => bail!("unsupported Bluetooth device operation: {operation}"),
+                .backend_context("set device alias")?,
+            _ => {
+                return Err(BackendError::new(
+                    BackendErrorKind::InvalidInput,
+                    format!("unsupported Bluetooth device operation: {operation}"),
+                )
+                .into());
+            }
         }
         self.snapshot().await
     }
 }
 
 async fn adapter_key(adapter: &BluezAdapter) -> Result<String> {
-    let address = adapter.address().await.context("read adapter identity")?;
+    let address = adapter
+        .address()
+        .await
+        .backend_context("read adapter identity")?;
     Ok(opaque_key(
         "adapter",
         &format!("{}:{address}", adapter.name()),
@@ -473,24 +524,22 @@ async fn device_snapshot(
     identities: &DeviceIdentityRegistry,
     last_seen: &Mutex<HashMap<String, u64>>,
     system_bus: &zbus::Connection,
-) -> Option<Device> {
-    let paired = device.is_paired().await.ok()?;
-    let connected = device.is_connected().await.unwrap_or(false);
-    let rssi = device.rssi().await.unwrap_or(None);
+) -> Result<Option<Device>> {
+    let identity = device.address();
+    let paired = bluez_result(device.is_paired().await, "read device paired state")?;
+    let connected = bluez_result(device.is_connected().await, "read device connected state")?;
+    let rssi = bluez_result(device.rssi().await, "read device signal strength")?;
     if !paired && !connected && rssi.is_none() {
-        return None;
+        return Ok(None);
     }
-    let trusted = device.is_trusted().await.unwrap_or(false);
-    let blocked = device.is_blocked().await.unwrap_or(false);
-    let wake_allowed = device.is_wake_allowed().await.unwrap_or(None);
-    let alias = device
-        .alias()
-        .await
-        .unwrap_or_else(|_| "Unknown device".to_string());
-    let mut uuids = device
-        .uuids()
-        .await
-        .unwrap_or(None)
+    let trusted = bluez_result(device.is_trusted().await, "read device trusted state")?;
+    let blocked = bluez_result(device.is_blocked().await, "read device blocked state")?;
+    let wake_allowed = bluez_result(
+        device.is_wake_allowed().await,
+        "read device wake permission",
+    )?;
+    let alias = bluez_result(device.alias().await, "read device alias")?;
+    let mut uuids = bluez_result(device.uuids().await, "read device UUIDs")?
         .unwrap_or_default()
         .into_iter()
         .map(|value| value.to_string())
@@ -503,7 +552,7 @@ async fn device_snapshot(
             label: service_label(uuid).to_string(),
         })
         .collect();
-    let key = identities.device_key(adapter.name(), device.address());
+    let key = identities.device_key(adapter.name(), identity);
     let last_seen_ms = {
         let mut seen = last_seen.lock().await;
         if rssi.is_some() || connected {
@@ -517,10 +566,7 @@ async fn device_snapshot(
             seen.get(&key).copied()
         }
     };
-    let battery = device
-        .battery_percentage()
-        .await
-        .unwrap_or(None)
+    let battery = bluez_result(device.battery_percentage().await, "read device battery")?
         .map(|percentage| {
             vec![Battery {
                 id: "aggregate".to_string(),
@@ -532,14 +578,56 @@ async fn device_snapshot(
             }]
         })
         .unwrap_or_default();
+    let capabilities = device_capabilities(paired, connected, blocked, wake_allowed);
+    Ok(Some(Device {
+        key,
+        adapter_key: adapter_key.to_string(),
+        name: alias.clone(),
+        alias,
+        address: identity.to_string(),
+        address_type: bluez_result(device.address_type().await, "read device address type")?
+            .to_string(),
+        icon: bluez_result(device.icon().await, "read device icon")?,
+        paired,
+        bonded: bonded_property(system_bus, adapter.name(), identity).await,
+        connected,
+        services_resolved: bluez_result(
+            device.is_services_resolved().await,
+            "read device services state",
+        )?,
+        trusted,
+        blocked,
+        wake_allowed,
+        legacy_pairing: bluez_result(
+            device.is_legacy_pairing().await,
+            "read device legacy-pairing state",
+        )?,
+        modalias: bluez_result(device.modalias().await, "read device modalias")?
+            .map(modalias_string),
+        uuids,
+        services,
+        battery,
+        rssi,
+        signal_strength: rssi.map(signal_strength),
+        present: rssi.is_some() || connected,
+        last_seen_ms,
+        capabilities,
+    }))
+}
+
+fn device_capabilities(
+    paired: bool,
+    connected: bool,
+    blocked: bool,
+    wake_allowed: Option<bool>,
+) -> DeviceCapabilities {
     let mut unsupported_reasons = HashMap::new();
     if paired {
         unsupported_reasons.insert("pair".into(), "Device is already paired".into());
     }
     if connected {
         unsupported_reasons.insert("connect".into(), "Device is already connected".into());
-    }
-    if !connected {
+    } else {
         unsupported_reasons.insert("disconnect".into(), "Device is not connected".into());
     }
     if wake_allowed.is_none() {
@@ -554,46 +642,53 @@ async fn device_snapshot(
             "Pair the device before sending files".into(),
         );
     }
-    Some(Device {
-        key,
-        adapter_key: adapter_key.to_string(),
-        name: alias.clone(),
-        alias,
-        address: device.address().to_string(),
-        address_type: device
-            .address_type()
-            .await
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        icon: device.icon().await.unwrap_or(None),
-        paired,
-        bonded: bonded_property(system_bus, adapter.name(), device.address()).await,
-        connected,
-        services_resolved: device.is_services_resolved().await.unwrap_or(false),
-        trusted,
-        blocked,
-        wake_allowed,
-        legacy_pairing: device.is_legacy_pairing().await.unwrap_or(false),
-        modalias: device.modalias().await.unwrap_or(None).map(modalias_string),
-        uuids,
-        services,
-        battery,
-        rssi,
-        signal_strength: rssi.map(signal_strength),
-        present: rssi.is_some() || connected,
-        last_seen_ms,
-        capabilities: DeviceCapabilities {
-            can_pair: !paired && !blocked,
-            can_connect: !connected && !blocked,
-            can_disconnect: connected,
-            can_remove: paired,
-            can_trust: paired,
-            can_block: true,
-            can_wake: wake_allowed.is_some(),
-            can_rename: true,
-            can_send_file: paired && !blocked,
-            unsupported_reasons,
-        },
+    DeviceCapabilities {
+        can_pair: !paired && !blocked,
+        can_connect: !connected && !blocked,
+        can_disconnect: connected,
+        can_remove: paired,
+        can_trust: paired,
+        can_block: true,
+        can_wake: wake_allowed.is_some(),
+        can_rename: true,
+        can_send_file: paired && !blocked,
+        unsupported_reasons,
+    }
+}
+
+trait BluezResultExt<T> {
+    fn backend_context(self, operation: &str) -> Result<T>;
+}
+
+impl<T> BluezResultExt<T> for bluer::Result<T> {
+    fn backend_context(self, operation: &str) -> Result<T> {
+        bluez_result(self, operation)
+    }
+}
+
+fn bluez_result<T>(result: bluer::Result<T>, operation: &str) -> Result<T> {
+    result.map_err(|error| {
+        let kind = match error.kind {
+            bluer::ErrorKind::AuthenticationCanceled
+            | bluer::ErrorKind::AuthenticationFailed
+            | bluer::ErrorKind::AuthenticationRejected
+            | bluer::ErrorKind::NotAuthorized
+            | bluer::ErrorKind::NotPermitted => BackendErrorKind::Rejected,
+            bluer::ErrorKind::AuthenticationTimeout => BackendErrorKind::Timeout,
+            bluer::ErrorKind::DoesNotExist | bluer::ErrorKind::NotFound => {
+                BackendErrorKind::DeviceUnavailable
+            }
+            bluer::ErrorKind::NotAvailable
+            | bluer::ErrorKind::NotReady
+            | bluer::ErrorKind::Internal(_) => BackendErrorKind::Unavailable,
+            bluer::ErrorKind::InvalidArguments
+            | bluer::ErrorKind::InvalidLength
+            | bluer::ErrorKind::InvalidOffset
+            | bluer::ErrorKind::InvalidAddress(_)
+            | bluer::ErrorKind::InvalidName(_) => BackendErrorKind::InvalidInput,
+            _ => BackendErrorKind::OperationFailed,
+        };
+        BackendError::new(kind, format!("{operation}: {error}")).into()
     })
 }
 
@@ -602,10 +697,14 @@ async fn operation_timeout<T>(
     operation: &'static str,
     future: impl std::future::Future<Output = bluer::Result<T>>,
 ) -> Result<T> {
-    tokio::time::timeout(duration, future)
-        .await
-        .with_context(|| format!("{operation} timed out"))?
-        .with_context(|| operation)
+    match tokio::time::timeout(duration, future).await {
+        Ok(result) => bluez_result(result, operation),
+        Err(_) => Err(BackendError::new(
+            BackendErrorKind::Timeout,
+            format!("{operation} timed out"),
+        )
+        .into()),
+    }
 }
 
 fn service_label(uuid: &str) -> &'static str {
@@ -661,7 +760,9 @@ fn signal_strength(rssi: i16) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{opaque_key, signal_strength};
+    use crate::backend::{BackendError, BackendErrorKind};
+
+    use super::{bluez_result, device_capabilities, opaque_key, signal_strength};
 
     #[test]
     fn adapter_keys_are_opaque_and_deterministic() {
@@ -679,5 +780,34 @@ mod tests {
         assert_eq!(signal_strength(-70), 50);
         assert_eq!(signal_strength(-40), 100);
         assert_eq!(signal_strength(-10), 100);
+    }
+
+    #[test]
+    fn false_properties_are_values_but_unavailable_properties_are_errors() {
+        assert!(!bluez_result(Ok(false), "read paired state").unwrap());
+        let error = bluez_result::<bool>(
+            Err(bluer::Error {
+                kind: bluer::ErrorKind::NotReady,
+                message: "adapter restarting".into(),
+            }),
+            "read paired state",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<BackendError>().unwrap().kind,
+            BackendErrorKind::Unavailable
+        );
+    }
+
+    #[test]
+    fn capabilities_preserve_false_state_without_claiming_unavailability() {
+        let capabilities = device_capabilities(false, false, false, None);
+        assert!(capabilities.can_pair);
+        assert!(capabilities.can_connect);
+        assert!(!capabilities.can_disconnect);
+        assert_eq!(
+            capabilities.unsupported_reasons["disconnect"],
+            "Device is not connected"
+        );
     }
 }

@@ -1,5 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
+
+use crate::backend::{BackendError, BackendErrorKind};
 
 pub(crate) trait Params {
     fn require_bool(&self, name: &str) -> Result<bool>;
@@ -13,23 +15,39 @@ pub(crate) trait Params {
 
 impl Params for Value {
     fn require_bool(&self, name: &str) -> Result<bool> {
-        self.get(name)
-            .and_then(Value::as_bool)
-            .with_context(|| format!("missing or invalid boolean parameter '{name}'"))
+        self.get(name).and_then(Value::as_bool).ok_or_else(|| {
+            BackendError::new(
+                BackendErrorKind::InvalidInput,
+                format!("missing or invalid boolean parameter '{name}'"),
+            )
+            .into()
+        })
     }
 
     fn require_string<'a>(&'a self, name: &str) -> Result<&'a str> {
         self.get(name)
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("missing or invalid string parameter '{name}'"))
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorKind::InvalidInput,
+                    format!("missing or invalid string parameter '{name}'"),
+                )
+                .into()
+            })
     }
 
     fn require_u32(&self, name: &str) -> Result<u32> {
         self.get(name)
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
-            .with_context(|| format!("missing or invalid unsigned integer parameter '{name}'"))
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorKind::InvalidInput,
+                    format!("missing or invalid unsigned integer parameter '{name}'"),
+                )
+                .into()
+            })
     }
 }
 
