@@ -297,7 +297,9 @@ pub enum ObexAgentError {
 #[zbus::interface(name = "org.bluez.obex.Agent1")]
 impl ObexAgent {
     async fn release(&self) {
-        self.broker.available.store(false, Ordering::Relaxed);
+        // NameOwnerChanged is authoritative for registration state. During an
+        // obexd replacement, the old owner can deliver Release after the new
+        // owner has already accepted this same agent again.
         self.broker.cancel_authorizations().await;
     }
 
@@ -357,7 +359,7 @@ async fn watch_agent_owner(
     )
     .await?;
     let mut changes = proxy.receive_signal("NameOwnerChanged").await?;
-    let mut retry = tokio::time::interval(Duration::from_secs(5));
+    let mut retry = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             message = changes.next() => {
