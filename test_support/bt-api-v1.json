@@ -28,9 +28,30 @@
     "protocol": "bt-api",
     "version": 1
   },
+  "obex_authorization_event": {
+    "data": {
+      "device_key": "device-opaque",
+      "device_name": "Phone",
+      "direction": "incoming",
+      "event": "authorization-requested",
+      "file_name": "photo.jpg",
+      "media_type": "image/jpeg",
+      "request_id": "obex-incoming-1",
+      "size": 2048,
+      "status": "awaiting-authorization",
+      "timeout_ms": 60000,
+      "transferred": 0
+    },
+    "event": "authorization-requested",
+    "protocol": "bt-api",
+    "stream": "bluetooth.obex.transfer",
+    "subscription_id": "subscription-1",
+    "version": 1
+  },
   "obex_event": {
     "data": {
       "device_key": "device-opaque",
+      "direction": "outgoing",
       "event": "progress",
       "file_name": "document.pdf",
       "request_id": "obex-transfer-1",
@@ -49,7 +70,7 @@
       "obex": {
         "available": true,
         "cancellation": true,
-        "incoming_authorization": false,
+        "incoming_authorization": true,
         "outgoing_object_push": true,
         "transfer_progress": true
       }
@@ -130,6 +151,15 @@
         "stream": "bluetooth.obex.transfer"
       },
       {
+        "name": "bluetooth.obex.respond",
+        "params_example": {
+          "accept": true,
+          "request_id": "obex-incoming-1"
+        },
+        "response_key": "authorization",
+        "stream": "bluetooth.obex.transfer"
+      },
+      {
         "name": "bluetooth.audio.snapshot",
         "params_example": {},
         "response_key": "audio_devices",
@@ -193,6 +223,7 @@
       },
       {
         "events": [
+          "authorization-requested",
           "queued",
           "progress",
           "completed",

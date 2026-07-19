@@ -45,19 +45,6 @@ struct OperationEvent {
     error: Option<Value>,
 }
 
-#[derive(Clone, Serialize)]
-struct ObexEvent {
-    event: String,
-    request_id: String,
-    device_key: String,
-    file_name: String,
-    status: String,
-    transferred: u64,
-    size: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<Value>,
-}
-
 struct OperationTask {
     handle: JoinHandle<()>,
     event: OperationEvent,
@@ -71,8 +58,9 @@ pub struct BluetoothDaemon {
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
     operation_events: broadcast::Sender<OperationEvent>,
     audio_events: broadcast::Sender<()>,
-    obex_events: broadcast::Sender<ObexEvent>,
+    obex_events: broadcast::Sender<obex::ObexEvent>,
     obex_cancellations: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    incoming_obex: Arc<obex::IncomingBroker>,
 }
 
 impl BluetoothDaemon {
@@ -106,14 +94,18 @@ impl BluetoothDaemon {
         let request_id = self.next_id("obex-transfer");
         let file_name = transfer.file_name.clone();
         let size = transfer.size;
-        let queued = ObexEvent {
+        let queued = obex::ObexEvent {
             event: "queued".into(),
             request_id: request_id.clone(),
+            direction: "outgoing".into(),
             device_key: device_key.into(),
+            device_name: None,
             file_name: file_name.clone(),
+            media_type: None,
             status: "queued".into(),
             transferred: 0,
             size,
+            timeout_ms: None,
             error: None,
         };
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
@@ -139,28 +131,36 @@ impl BluetoothDaemon {
                         "queued" => "queued",
                         _ => "progress",
                     };
-                    let _ = update_events.send(ObexEvent {
+                    let _ = update_events.send(obex::ObexEvent {
                         event: event.into(),
                         request_id: update_id.clone(),
+                        direction: "outgoing".into(),
                         device_key: update_device.clone(),
+                        device_name: None,
                         file_name: update_name.clone(),
+                        media_type: None,
                         status: update.status,
                         transferred: update.transferred,
                         size: update.size,
+                        timeout_ms: None,
                         error: None,
                     });
                 })
                 .await;
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
-                let _ = events.send(ObexEvent {
+                let _ = events.send(obex::ObexEvent {
                     event: "failed".into(),
                     request_id: task_id,
+                    direction: "outgoing".into(),
                     device_key: task_device,
+                    device_name: None,
                     file_name,
+                    media_type: None,
                     status: "error".into(),
                     transferred: 0,
                     size,
+                    timeout_ms: None,
                     error: Some(api::error_value(&error)),
                 });
             }
@@ -375,8 +375,31 @@ impl BluetoothDaemon {
         if method == "bluetooth.obex.send" {
             return self.start_obex_transfer(&params).await.to_string();
         }
+        if method == "bluetooth.obex.respond" {
+            let request_id = params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let accept = params
+                .get("accept")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if request_id.is_empty() {
+                return api::error("validation-error", "request_id is required".to_string())
+                    .to_string();
+            }
+            return match self.incoming_obex.respond(request_id, accept).await {
+                Ok(()) => api::success(json!({
+                    "authorization": { "request_id": request_id, "accepted": accept }
+                }))
+                .to_string(),
+                Err(error) => {
+                    api::error("obex-response-rejected", format!("{error:#}")).to_string()
+                }
+            };
+        }
         if method == "bluetooth.obex.snapshot" {
-            return match obex::probe().await {
+            return match obex::probe(self.incoming_obex.is_available()).await {
                 Ok(capabilities) => api::success(json!({ "obex": capabilities })).to_string(),
                 Err(error) => api::success(json!({
                     "obex": {
@@ -518,6 +541,10 @@ impl BluetoothDaemon {
             return api::success(json!({ "cancelled": request_id, "kind": "obex-transfer" }))
                 .to_string();
         }
+        if self.incoming_obex.cancel_transfer(request_id).await {
+            return api::success(json!({ "cancelled": request_id, "kind": "obex-transfer" }))
+                .to_string();
+        }
         api::error(
             "request-not-found",
             format!("No active subscription or operation named {request_id}"),
@@ -559,7 +586,7 @@ async fn emit_snapshot(
     }
 }
 
-async fn emit_obex(emitter: &SignalEmitter<'_>, subscription_id: &str, event: ObexEvent) {
+async fn emit_obex(emitter: &SignalEmitter<'_>, subscription_id: &str, event: obex::ObexEvent) {
     let value = json!({
         "protocol": api::PROTOCOL,
         "version": api::VERSION,
@@ -637,6 +664,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     let (operation_events, _) = broadcast::channel(32);
     let (audio_events, _) = broadcast::channel(32);
     let (obex_events, _) = broadcast::channel(32);
+    let incoming_obex = obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
     let monitor_events = audio_events.clone();
     std::thread::spawn(move || {
         loop {
@@ -650,7 +678,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });
-    let _connection = connection::Builder::session()
+    let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
         .context("claim bt-daemon bus name")?
@@ -666,12 +694,23 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
                 audio_events,
                 obex_events,
                 obex_cancellations: Arc::new(Mutex::new(HashMap::new())),
+                incoming_obex: Arc::clone(&incoming_obex),
             },
         )
         .context("export bt-daemon D-Bus interface")?
+        .serve_at(
+            obex::AGENT_PATH,
+            obex::ObexAgent::new(Arc::clone(&incoming_obex)),
+        )
+        .context("export incoming OBEX agent")?
         .build()
         .await
         .context("start bt-daemon D-Bus service")?;
+    incoming_obex.set_connection(connection.clone());
+    if let Err(error) = obex::register_agent(&connection, &incoming_obex).await {
+        tracing::warn!(%error, "incoming OBEX authorization is unavailable");
+    }
+    obex::monitor_agent_owner(connection, incoming_obex);
     tracing::info!(
         bus_name = BUS_NAME,
         object_path = OBJECT_PATH,
@@ -721,7 +760,7 @@ mod tests {
     use tokio::sync::{Mutex, broadcast};
 
     use crate::{
-        backend::{BluetoothBackend, ObexTarget},
+        backend::{BluetoothBackend, ObexRemote, ObexTarget},
         identity::DeviceIdentityRegistry,
         model::Snapshot,
         pairing::PairingBroker,
@@ -761,6 +800,13 @@ mod tests {
             })
         }
 
+        async fn obex_remote(&self, _: &str, _: &str) -> Result<ObexRemote> {
+            Ok(ObexRemote {
+                device_key: "device-opaque".into(),
+                name: "Test device".into(),
+            })
+        }
+
         async fn device_operation(&self, _: &str, _: &str, _: &Value) -> Result<Snapshot> {
             if self.complete {
                 self.snapshot().await
@@ -774,9 +820,12 @@ mod tests {
         let (operation_events, receiver) = broadcast::channel(8);
         let (audio_events, _) = broadcast::channel(8);
         let (obex_events, _) = broadcast::channel(8);
+        let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend { complete });
+        let incoming_obex =
+            crate::obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
         (
             BluetoothDaemon {
-                backend: Arc::new(TestBackend { complete }),
+                backend,
                 pairing: PairingBroker::new(DeviceIdentityRegistry::in_memory()),
                 sequence: AtomicU64::new(1),
                 subscriptions: Arc::new(Mutex::new(Default::default())),
@@ -785,6 +834,7 @@ mod tests {
                 audio_events,
                 obex_events,
                 obex_cancellations: Arc::new(Mutex::new(Default::default())),
+                incoming_obex,
             },
             receiver,
         )

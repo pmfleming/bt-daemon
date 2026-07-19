@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    backend::{BluetoothBackend, ObexTarget},
+    backend::{BluetoothBackend, ObexRemote, ObexTarget},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Snapshot},
 };
@@ -253,6 +253,37 @@ impl BluetoothBackend for BluezBackend {
                 .to_string(),
             destination: device.address().to_string(),
         })
+    }
+
+    async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote> {
+        let source = source
+            .parse()
+            .context("parse incoming OBEX adapter address")?;
+        let destination = destination
+            .parse()
+            .context("parse incoming OBEX device address")?;
+        for adapter in self.adapters().await? {
+            if adapter.address().await.context("read adapter address")? != source {
+                continue;
+            }
+            let device = adapter
+                .device(destination)
+                .context("open incoming OBEX device")?;
+            if !device.is_paired().await.unwrap_or(false) {
+                bail!("incoming transfers require a paired Bluetooth device");
+            }
+            if device.is_blocked().await.unwrap_or(false) {
+                bail!("incoming transfers are disabled for blocked Bluetooth devices");
+            }
+            return Ok(ObexRemote {
+                device_key: self.identities.device_key(adapter.name(), device.address()),
+                name: device
+                    .alias()
+                    .await
+                    .unwrap_or_else(|_| "Bluetooth device".to_string()),
+            });
+        }
+        bail!("incoming OBEX adapter is unavailable")
     }
 
     async fn device_operation(

@@ -26,6 +26,12 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         "transfer",
         Some("bluetooth.obex.transfer"),
     ),
+    (
+        "bluetooth.obex.respond",
+        r#"{"request_id":"obex-incoming-1","accept":true}"#,
+        "authorization",
+        Some("bluetooth.obex.transfer"),
+    ),
     ("bluetooth.audio.snapshot", "{}", "audio_devices", None),
     (
         "bluetooth.audio.setProfile",
@@ -59,7 +65,14 @@ pub const STREAMS: &[(&str, &[&str])] = &[
     ),
     (
         "bluetooth.obex.transfer",
-        &["queued", "progress", "completed", "failed", "cancelled"],
+        &[
+            "authorization-requested",
+            "queued",
+            "progress",
+            "completed",
+            "failed",
+            "cancelled",
+        ],
     ),
     (
         "bluetooth.audio.changed",
@@ -138,7 +151,7 @@ pub fn contract_fixture() -> Value {
                 "obex": {
                     "available": true,
                     "outgoing_object_push": true,
-                    "incoming_authorization": false,
+                    "incoming_authorization": true,
                     "transfer_progress": true,
                     "cancellation": true
                 }
@@ -153,11 +166,32 @@ pub fn contract_fixture() -> Value {
             "data": {
                 "event": "progress",
                 "request_id": "obex-transfer-1",
+                "direction": "outgoing",
                 "device_key": "device-opaque",
                 "file_name": "document.pdf",
                 "status": "active",
                 "transferred": 512,
                 "size": 1024
+            }
+        },
+        "obex_authorization_event": {
+            "protocol": "bt-api",
+            "version": 1,
+            "stream": "bluetooth.obex.transfer",
+            "event": "authorization-requested",
+            "subscription_id": "subscription-1",
+            "data": {
+                "event": "authorization-requested",
+                "request_id": "obex-incoming-1",
+                "direction": "incoming",
+                "device_key": "device-opaque",
+                "device_name": "Phone",
+                "file_name": "photo.jpg",
+                "media_type": "image/jpeg",
+                "status": "awaiting-authorization",
+                "transferred": 0,
+                "size": 2048,
+                "timeout_ms": 60000
             }
         },
         "audio_snapshot": {

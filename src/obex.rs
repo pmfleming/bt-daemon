@@ -1,20 +1,32 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde::Serialize;
-use tokio::sync::oneshot;
-use zbus::fdo::PropertiesProxy;
+use serde_json::Value as JsonValue;
+use tokio::sync::{Mutex, broadcast, oneshot};
+use zbus::{DBusError, fdo::PropertiesProxy};
 use zvariant::{OwnedObjectPath, OwnedValue, Value};
+
+use crate::backend::BluetoothBackend;
 
 const BUS_NAME: &str = "org.bluez.obex";
 const OBJECT_PATH: &str = "/org/bluez/obex";
 const CLIENT_INTERFACE: &str = "org.bluez.obex.Client1";
+const AGENT_MANAGER_INTERFACE: &str = "org.bluez.obex.AgentManager1";
 const PUSH_INTERFACE: &str = "org.bluez.obex.ObjectPush1";
 const TRANSFER_INTERFACE: &str = "org.bluez.obex.Transfer1";
+const SESSION_INTERFACE: &str = "org.bluez.obex.Session1";
+pub const AGENT_PATH: &str = "/org/laufan/BluetoothDaemon/ObexAgent";
+const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ObexCapabilities {
@@ -23,6 +35,26 @@ pub struct ObexCapabilities {
     pub incoming_authorization: bool,
     pub transfer_progress: bool,
     pub cancellation: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObexEvent {
+    pub event: String,
+    pub request_id: String,
+    pub direction: String,
+    pub device_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    pub file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    pub status: String,
+    pub transferred: u64,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,7 +74,316 @@ pub struct ActiveTransfer {
     initial_transferred: u64,
 }
 
-pub async fn probe() -> Result<ObexCapabilities> {
+#[derive(Clone, Copy)]
+enum AuthorizationDecision {
+    Accept,
+    Reject,
+    Cancel,
+}
+
+struct PendingAuthorization {
+    sender: oneshot::Sender<AuthorizationDecision>,
+}
+
+pub struct IncomingBroker {
+    backend: Arc<dyn BluetoothBackend>,
+    events: broadcast::Sender<ObexEvent>,
+    sequence: AtomicU64,
+    available: AtomicBool,
+    connection: OnceLock<zbus::Connection>,
+    pending: Mutex<HashMap<String, PendingAuthorization>>,
+    cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+}
+
+impl IncomingBroker {
+    pub fn new(
+        backend: Arc<dyn BluetoothBackend>,
+        events: broadcast::Sender<ObexEvent>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            backend,
+            events,
+            sequence: AtomicU64::new(1),
+            available: AtomicBool::new(false),
+            connection: OnceLock::new(),
+            pending: Mutex::new(HashMap::new()),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub fn set_connection(&self, connection: zbus::Connection) {
+        let _ = self.connection.set(connection);
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Relaxed)
+    }
+
+    pub async fn respond(&self, request_id: &str, accept: bool) -> Result<()> {
+        let pending = self
+            .pending
+            .lock()
+            .await
+            .remove(request_id)
+            .context("incoming transfer authorization is no longer pending")?;
+        let decision = if accept {
+            AuthorizationDecision::Accept
+        } else {
+            AuthorizationDecision::Reject
+        };
+        let _ = pending.sender.send(decision);
+        Ok(())
+    }
+
+    pub async fn cancel_transfer(&self, request_id: &str) -> bool {
+        if let Some(pending) = self.pending.lock().await.remove(request_id) {
+            let _ = pending.sender.send(AuthorizationDecision::Cancel);
+            return true;
+        }
+        if let Some(cancel) = self.cancellations.lock().await.remove(request_id) {
+            let _ = cancel.send(());
+            return true;
+        }
+        false
+    }
+
+    async fn cancel_authorizations(&self) {
+        for (_, pending) in self.pending.lock().await.drain() {
+            let _ = pending.sender.send(AuthorizationDecision::Cancel);
+        }
+    }
+
+    async fn authorize(&self, transfer_path: OwnedObjectPath) -> Result<String, ObexAgentError> {
+        let connection = self.connection.get().cloned().ok_or_else(|| {
+            ObexAgentError::Canceled("OBEX agent connection is unavailable".into())
+        })?;
+        let details = incoming_details(&connection, &transfer_path)
+            .await
+            .map_err(|error| ObexAgentError::Rejected(format!("{error:#}")))?;
+        let remote = self
+            .backend
+            .obex_remote(&details.source, &details.destination)
+            .await
+            .map_err(|error| ObexAgentError::Rejected(format!("{error:#}")))?;
+        let file_name = safe_file_name(&details.name);
+        let destination = incoming_destination(&file_name)
+            .map_err(|error| ObexAgentError::Rejected(format!("{error:#}")))?;
+        let request_id = format!(
+            "obex-incoming-{}",
+            self.sequence.fetch_add(1, Ordering::Relaxed)
+        );
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .lock()
+            .await
+            .insert(request_id.clone(), PendingAuthorization { sender });
+        let requested = ObexEvent {
+            event: "authorization-requested".into(),
+            request_id: request_id.clone(),
+            direction: "incoming".into(),
+            device_key: remote.device_key.clone(),
+            device_name: Some(remote.name.clone()),
+            file_name: file_name.clone(),
+            media_type: details.media_type.clone(),
+            status: "awaiting-authorization".into(),
+            transferred: 0,
+            size: details.size,
+            timeout_ms: Some(AUTHORIZATION_TIMEOUT.as_millis() as u64),
+            error: None,
+        };
+        let _ = self.events.send(requested.clone());
+        let decision = match tokio::time::timeout(AUTHORIZATION_TIMEOUT, receiver).await {
+            Ok(Ok(decision)) => decision,
+            Ok(Err(_)) => AuthorizationDecision::Cancel,
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                let mut expired = requested;
+                expired.event = "cancelled".into();
+                expired.status = "cancelled".into();
+                expired.timeout_ms = None;
+                let _ = self.events.send(expired);
+                return Err(ObexAgentError::Canceled(
+                    "incoming transfer authorization timed out".into(),
+                ));
+            }
+        };
+        match decision {
+            AuthorizationDecision::Reject | AuthorizationDecision::Cancel => {
+                let mut rejected = requested;
+                rejected.event = "cancelled".into();
+                rejected.status = "cancelled".into();
+                rejected.timeout_ms = None;
+                let _ = self.events.send(rejected);
+                if matches!(decision, AuthorizationDecision::Reject) {
+                    Err(ObexAgentError::Rejected(
+                        "incoming transfer was rejected".into(),
+                    ))
+                } else {
+                    Err(ObexAgentError::Canceled(
+                        "incoming transfer was cancelled".into(),
+                    ))
+                }
+            }
+            AuthorizationDecision::Accept => {
+                let (cancel_sender, cancel_receiver) = oneshot::channel();
+                self.cancellations
+                    .lock()
+                    .await
+                    .insert(request_id.clone(), cancel_sender);
+                let events = self.events.clone();
+                let cancellations = Arc::clone(&self.cancellations);
+                let task_id = request_id.clone();
+                let event = ObexEvent {
+                    event: "queued".into(),
+                    request_id,
+                    direction: "incoming".into(),
+                    device_key: remote.device_key,
+                    device_name: Some(remote.name),
+                    file_name,
+                    media_type: details.media_type,
+                    status: "queued".into(),
+                    transferred: 0,
+                    size: details.size,
+                    timeout_ms: None,
+                    error: None,
+                };
+                let transfer_path_for_task = transfer_path.clone();
+                let connection_for_task = connection.clone();
+                tokio::spawn(async move {
+                    let result = monitor_incoming(
+                        &connection_for_task,
+                        transfer_path_for_task,
+                        cancel_receiver,
+                        event.clone(),
+                        &events,
+                    )
+                    .await;
+                    cancellations.lock().await.remove(&task_id);
+                    if let Err(error) = result {
+                        let mut failed = event;
+                        failed.event = "failed".into();
+                        failed.status = "error".into();
+                        failed.error = Some(serde_json::json!({
+                            "code": "obex-transfer-failed",
+                            "message": format!("{error:#}"),
+                        }));
+                        let _ = events.send(failed);
+                    }
+                });
+                Ok(destination.to_string_lossy().into_owned())
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ObexAgent {
+    broker: Arc<IncomingBroker>,
+}
+
+impl ObexAgent {
+    pub fn new(broker: Arc<IncomingBroker>) -> Self {
+        Self { broker }
+    }
+}
+
+#[derive(Debug, DBusError)]
+#[zbus(prefix = "org.bluez.obex.Error")]
+pub enum ObexAgentError {
+    Rejected(String),
+    Canceled(String),
+}
+
+#[zbus::interface(name = "org.bluez.obex.Agent1")]
+impl ObexAgent {
+    async fn release(&self) {
+        self.broker.available.store(false, Ordering::Relaxed);
+        self.broker.cancel_authorizations().await;
+    }
+
+    async fn authorize_push(
+        &self,
+        transfer: OwnedObjectPath,
+    ) -> std::result::Result<String, ObexAgentError> {
+        self.broker.authorize(transfer).await
+    }
+
+    async fn cancel(&self) {
+        self.broker.cancel_authorizations().await;
+    }
+}
+
+pub async fn register_agent(
+    connection: &zbus::Connection,
+    broker: &Arc<IncomingBroker>,
+) -> Result<()> {
+    let manager = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, AGENT_MANAGER_INTERFACE)
+        .await
+        .context("create OBEX agent-manager proxy")?;
+    let path = OwnedObjectPath::try_from(AGENT_PATH).context("create OBEX agent path")?;
+    manager
+        .call::<_, _, ()>("RegisterAgent", &(path,))
+        .await
+        .context("register incoming OBEX authorization agent")?;
+    broker.available.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn monitor_agent_owner(connection: zbus::Connection, broker: Arc<IncomingBroker>) {
+    tokio::spawn(async move {
+        loop {
+            let result = watch_agent_owner(&connection, &broker).await;
+            broker.available.store(false, Ordering::Relaxed);
+            if let Err(error) = result {
+                tracing::warn!(%error, "OBEX agent owner monitor is retrying");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Err(error) = register_agent(&connection, &broker).await {
+                tracing::warn!(%error, "could not restore incoming OBEX agent");
+            }
+        }
+    });
+}
+
+async fn watch_agent_owner(
+    connection: &zbus::Connection,
+    broker: &Arc<IncomingBroker>,
+) -> Result<()> {
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )
+    .await?;
+    let mut changes = proxy.receive_signal("NameOwnerChanged").await?;
+    let mut retry = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            message = changes.next() => {
+                let message = message.context("OBEX owner watch ended")?;
+                let (name, old_owner, new_owner): (String, String, String) =
+                    message.body().deserialize()?;
+                if name == BUS_NAME && old_owner != new_owner {
+                    broker.available.store(false, Ordering::Relaxed);
+                    broker.cancel_authorizations().await;
+                    if !new_owner.is_empty()
+                        && let Err(error) = register_agent(connection, broker).await
+                    {
+                        tracing::debug!(%error, "incoming OBEX agent is waiting for ownership");
+                    }
+                }
+            }
+            _ = retry.tick(), if !broker.is_available() => {
+                if let Err(error) = register_agent(connection, broker).await {
+                    tracing::debug!(%error, "incoming OBEX agent is waiting for ownership");
+                }
+            }
+        }
+    }
+}
+
+pub async fn probe(incoming_authorization: bool) -> Result<ObexCapabilities> {
     let connection = zbus::Connection::session()
         .await
         .context("connect to session D-Bus for OBEX")?;
@@ -60,7 +401,7 @@ pub async fn probe() -> Result<ObexCapabilities> {
     Ok(ObexCapabilities {
         available: true,
         outgoing_object_push: true,
-        incoming_authorization: false,
+        incoming_authorization,
         transfer_progress: true,
         cancellation: true,
     })
@@ -189,6 +530,188 @@ impl ActiveTransfer {
     }
 }
 
+struct IncomingDetails {
+    source: String,
+    destination: String,
+    name: String,
+    media_type: Option<String>,
+    size: u64,
+}
+
+async fn incoming_details(
+    connection: &zbus::Connection,
+    transfer_path: &OwnedObjectPath,
+) -> Result<IncomingDetails> {
+    let transfer = PropertiesProxy::builder(connection)
+        .destination(BUS_NAME)?
+        .path(transfer_path.clone())?
+        .build()
+        .await?;
+    let values = transfer
+        .get_all(TRANSFER_INTERFACE.try_into()?)
+        .await
+        .context("read incoming OBEX transfer")?;
+    let session_path = values
+        .get("Session")
+        .and_then(|value| value.try_clone().ok())
+        .and_then(|value| OwnedObjectPath::try_from(value).ok())
+        .context("incoming OBEX transfer has no session")?;
+    let session = PropertiesProxy::builder(connection)
+        .destination(BUS_NAME)?
+        .path(session_path)?
+        .build()
+        .await?;
+    let session_values = session
+        .get_all(SESSION_INTERFACE.try_into()?)
+        .await
+        .context("read incoming OBEX session")?;
+    let name = property_string(&values, "Name")
+        .or_else(|| {
+            property_string(&values, "Filename").and_then(|value| {
+                Path::new(&value)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| "bluetooth-transfer".into());
+    Ok(IncomingDetails {
+        source: property_string(&session_values, "Source")
+            .context("incoming OBEX session has no source")?,
+        destination: property_string(&session_values, "Destination")
+            .context("incoming OBEX session has no destination")?,
+        name,
+        media_type: property_string(&values, "Type"),
+        size: property_u64(&values, "Size").unwrap_or(0),
+    })
+}
+
+async fn monitor_incoming(
+    connection: &zbus::Connection,
+    transfer_path: OwnedObjectPath,
+    mut cancel: oneshot::Receiver<()>,
+    mut event: ObexEvent,
+    events: &broadcast::Sender<ObexEvent>,
+) -> Result<()> {
+    let transfer = zbus::Proxy::new(
+        connection,
+        BUS_NAME,
+        transfer_path.as_str(),
+        TRANSFER_INTERFACE,
+    )
+    .await
+    .context("create incoming OBEX transfer proxy")?;
+    let properties = PropertiesProxy::builder(connection)
+        .destination(BUS_NAME)?
+        .path(transfer_path.clone())?
+        .build()
+        .await?;
+    let mut changes = properties.receive_properties_changed().await?;
+    let initial = properties.get_all(TRANSFER_INTERFACE.try_into()?).await?;
+    event.status = property_string(&initial, "Status").unwrap_or_else(|| "queued".into());
+    event.transferred = property_u64(&initial, "Transferred").unwrap_or(0);
+    event.size = property_u64(&initial, "Size").unwrap_or(event.size);
+    event.event = lifecycle_event(&event.status).into();
+    let _ = events.send(event.clone());
+    while !matches!(event.status.as_str(), "complete" | "error" | "cancelled") {
+        tokio::select! {
+            _ = &mut cancel => {
+                transfer.call::<_, _, ()>("Cancel", &()).await.context("cancel incoming OBEX transfer")?;
+                event.event = "cancelled".into();
+                event.status = "cancelled".into();
+                let _ = events.send(event.clone());
+                return Ok(());
+            }
+            signal = changes.next() => {
+                let signal = signal.context("incoming OBEX property stream ended")?;
+                let args = signal.args()?;
+                if args.interface_name() != TRANSFER_INTERFACE { continue; }
+                if let Some(status) = args.changed_properties().get("Status").and_then(borrowed_string) {
+                    event.status = status;
+                }
+                if let Some(value) = args.changed_properties().get("Transferred").and_then(borrowed_u64) {
+                    event.transferred = value;
+                }
+                event.event = lifecycle_event(&event.status).into();
+                let _ = events.send(event.clone());
+            }
+        }
+    }
+    if event.status == "error" {
+        bail!("incoming OBEX transfer failed");
+    }
+    Ok(())
+}
+
+fn lifecycle_event(status: &str) -> &'static str {
+    match status {
+        "complete" => "completed",
+        "cancelled" => "cancelled",
+        "error" => "failed",
+        "queued" => "queued",
+        _ => "progress",
+    }
+}
+
+fn incoming_destination(file_name: &str) -> Result<PathBuf> {
+    let directory = std::env::var_os("BT_DAEMON_DOWNLOAD_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_DOWNLOAD_DIR").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
+        .context("no incoming Bluetooth download directory is configured")?;
+    incoming_destination_in(&directory, file_name)
+}
+
+fn incoming_destination_in(directory: &Path, file_name: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "create Bluetooth download directory {}",
+            directory.display()
+        )
+    })?;
+    let directory = directory
+        .canonicalize()
+        .context("resolve Bluetooth download directory")?;
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bluetooth-transfer");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for suffix in 1..10_000 {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({suffix}).{extension}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        let candidate = directory.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not allocate a unique incoming Bluetooth filename")
+}
+
+fn safe_file_name(value: &str) -> String {
+    let basename = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bluetooth-transfer");
+    let sanitized = basename
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(180)
+        .collect::<String>();
+    if sanitized.is_empty() || matches!(sanitized.as_str(), "." | "..") {
+        "bluetooth-transfer".into()
+    } else {
+        sanitized
+    }
+}
+
 fn validate_outgoing_path(value: &str) -> Result<PathBuf> {
     if value.is_empty() {
         bail!("outgoing file path is required");
@@ -226,19 +749,25 @@ fn borrowed_u64(value: &Value<'_>) -> Option<u64> {
 mod tests {
     use std::fs;
 
-    use super::{ObexCapabilities, validate_outgoing_path};
+    use super::{incoming_destination_in, safe_file_name, validate_outgoing_path};
 
     #[test]
-    fn staged_capabilities_are_explicit() {
-        let capabilities = ObexCapabilities {
-            available: true,
-            outgoing_object_push: true,
-            incoming_authorization: false,
-            transfer_progress: true,
-            cancellation: true,
-        };
-        assert!(capabilities.outgoing_object_push);
-        assert!(!capabilities.incoming_authorization);
+    fn incoming_names_are_confined_to_the_download_directory() {
+        assert_eq!(safe_file_name("../../secret.txt"), "secret.txt");
+        assert_eq!(safe_file_name(".."), "bluetooth-transfer");
+        assert_eq!(safe_file_name("bad\nname.txt"), "badname.txt");
+    }
+
+    #[test]
+    fn incoming_names_do_not_overwrite_existing_files() {
+        let directory = std::env::temp_dir().join(format!("bt-obex-in-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("example.txt"), b"existing").unwrap();
+        assert_eq!(
+            incoming_destination_in(&directory, "example.txt").unwrap(),
+            directory.join("example (1).txt")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

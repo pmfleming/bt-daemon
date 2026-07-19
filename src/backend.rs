@@ -11,6 +11,12 @@ pub struct ObexTarget {
     pub destination: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObexRemote {
+    pub device_key: String,
+    pub name: String,
+}
+
 #[async_trait]
 pub trait BluetoothBackend: Send + Sync {
     fn subscribe_changes(&self) -> broadcast::Receiver<()>;
@@ -18,6 +24,7 @@ pub trait BluetoothBackend: Send + Sync {
     async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot>;
     async fn set_scanning(&self, enabled: bool) -> Result<Snapshot>;
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget>;
+    async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote>;
     async fn device_operation(
         &self,
         device_key: &str,
