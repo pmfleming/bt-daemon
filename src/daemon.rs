@@ -6,7 +6,8 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, task::JoinHandle};
 use zbus::{connection, object_server::SignalEmitter};
@@ -180,6 +181,36 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         object_path = OBJECT_PATH,
         "bt-daemon started"
     );
-    std::future::pending::<()>().await;
-    Ok(())
+    watch_bluez_owner().await
+}
+
+async fn watch_bluez_owner() -> Result<()> {
+    let connection = zbus::Connection::system()
+        .await
+        .context("connect BlueZ owner watcher to system D-Bus")?;
+    let proxy = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )
+    .await
+    .context("create system D-Bus owner proxy")?;
+    let mut changes = proxy
+        .receive_signal("NameOwnerChanged")
+        .await
+        .context("subscribe to system bus owner changes")?;
+    while let Some(message) = changes.next().await {
+        let (name, old_owner, new_owner): (String, String, String) =
+            message
+                .body()
+                .deserialize()
+                .context("decode system bus owner change")?;
+        if name == "org.bluez" && old_owner != new_owner {
+            bail!(
+                "BlueZ owner changed; restarting bt-daemon to rebuild sessions and pairing agent"
+            );
+        }
+    }
+    bail!("BlueZ owner watch ended")
 }
