@@ -44,7 +44,8 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
     let dbus = zbus::Connection::session().await.ok();
     let output = Arc::new(Mutex::new(tokio::io::stdout()));
     if let Some(connection) = dbus.clone() {
-        spawn_event_forwarder(connection, Arc::clone(&output));
+        spawn_event_forwarder(connection.clone(), Arc::clone(&output));
+        spawn_owner_watcher(connection, Arc::clone(&output));
     }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -140,6 +141,42 @@ async fn call_cancel(connection: Option<&zbus::Connection>, request_id: &str) ->
         connection.ok_or_else(|| zbus::Error::Failure("session D-Bus unavailable".into()))?;
     let proxy = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
     proxy.call("Cancel", &(request_id,)).await
+}
+
+fn spawn_owner_watcher(connection: zbus::Connection, output: Output) {
+    tokio::spawn(async move {
+        let result = async {
+            let proxy = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+            )
+            .await?;
+            let mut changes = proxy.receive_signal("NameOwnerChanged").await?;
+            while let Some(message) = changes.next().await {
+                let (name, old_owner, new_owner): (String, String, String) =
+                    message.body().deserialize()?;
+                if name == BUS_NAME && !old_owner.is_empty() && old_owner != new_owner {
+                    emit(
+                        &output,
+                        &json!({ "kind": "transport-error", "error": "bt-daemon restarted; reconnecting" }),
+                    )
+                    .await?;
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = emit(
+                &output,
+                &json!({ "kind": "transport-error", "error": error.to_string() }),
+            )
+            .await;
+        }
+    });
 }
 
 fn spawn_event_forwarder(connection: zbus::Connection, output: Output) {
