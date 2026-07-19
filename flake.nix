@@ -16,8 +16,10 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = with pkgs; [ pkg-config ];
-            buildInputs = with pkgs; [ dbus ];
+            nativeBuildInputs = with pkgs; [ llvmPackages.libclang pkg-config ];
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+            buildInputs = with pkgs; [ dbus pipewire ];
             strictDeps = true;
             postInstall = ''
               install -Dm644 ${./packaging/systemd/bt-daemon.service} $out/share/systemd/user/bt-daemon.service
@@ -62,8 +64,10 @@
             gcc
             jq
             just
+            llvmPackages.libclang
             llvmPackages.llvm
             pkg-config
+            pipewire
             rust-analyzer
             rustc
             rustfmt
@@ -71,6 +75,8 @@
             wireplumber
           ];
 
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
           LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
           LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
           RUST_BACKTRACE = "1";
