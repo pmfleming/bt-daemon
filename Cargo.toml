@@ -1,0 +1,23 @@
+[package]
+name = "bt-daemon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bluetooth policy and API daemon for Shelllist"
+repository = "https://github.com/pmfleming/bt-daemon"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bluer = { version = "0.17", features = ["bluetoothd", "serde"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5", features = ["tokio"] }
+zvariant = "5"
