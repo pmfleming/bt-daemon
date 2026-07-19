@@ -28,6 +28,20 @@
     "protocol": "bt-api",
     "version": 1
   },
+  "obex_snapshot": {
+    "data": {
+      "obex": {
+        "available": true,
+        "cancellation": false,
+        "incoming_authorization": false,
+        "outgoing_object_push": false,
+        "transfer_progress": false
+      }
+    },
+    "ok": true,
+    "protocol": "bt-api",
+    "version": 1
+  },
   "operation_event": {
     "data": {
       "device_key": "device-opaque",
@@ -83,6 +97,12 @@
         },
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
+      },
+      {
+        "name": "bluetooth.obex.snapshot",
+        "params_example": {},
+        "response_key": "obex",
+        "stream": null
       },
       {
         "name": "bluetooth.audio.snapshot",

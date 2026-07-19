@@ -19,6 +19,7 @@ use zbus::{connection, object_server::SignalEmitter};
 use crate::{
     api, audio,
     backend::BluetoothBackend,
+    obex,
     pairing::{PairingBroker, PairingEvent},
 };
 
@@ -267,6 +268,22 @@ impl BluetoothDaemon {
 impl BluetoothDaemon {
     async fn call(&self, method: &str, params_json: &str) -> String {
         let params = serde_json::from_str::<Value>(params_json).unwrap_or(Value::Null);
+        if method == "bluetooth.obex.snapshot" {
+            return match obex::probe().await {
+                Ok(capabilities) => api::success(json!({ "obex": capabilities })).to_string(),
+                Err(error) => api::success(json!({
+                    "obex": {
+                        "available": false,
+                        "outgoing_object_push": false,
+                        "incoming_authorization": false,
+                        "transfer_progress": false,
+                        "cancellation": false,
+                        "reason": format!("{error:#}"),
+                    }
+                }))
+                .to_string(),
+            };
+        }
         if method == "bluetooth.audio.snapshot" {
             return Self::audio_snapshot_for(Arc::clone(&self.pairing))
                 .await

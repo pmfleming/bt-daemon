@@ -6,5 +6,6 @@ pub mod client;
 pub mod daemon;
 pub mod identity;
 pub mod model;
+pub mod obex;
 pub mod pairing;
 pub mod protocol;

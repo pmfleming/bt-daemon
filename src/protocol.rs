@@ -19,6 +19,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         "snapshot",
         Some("bluetooth.changed"),
     ),
+    ("bluetooth.obex.snapshot", "{}", "obex", None),
     ("bluetooth.audio.snapshot", "{}", "audio_devices", None),
     (
         "bluetooth.audio.setProfile",
@@ -116,6 +117,20 @@ pub fn contract_fixture() -> Value {
                             "can_rename": true
                         }
                     }]
+                }
+            }
+        },
+        "obex_snapshot": {
+            "protocol": "bt-api",
+            "version": 1,
+            "ok": true,
+            "data": {
+                "obex": {
+                    "available": true,
+                    "outgoing_object_push": false,
+                    "incoming_authorization": false,
+                    "transfer_progress": false,
+                    "cancellation": false
                 }
             }
         },
