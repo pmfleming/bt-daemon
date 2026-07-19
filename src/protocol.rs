@@ -21,6 +21,12 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
     ),
     ("bluetooth.audio.snapshot", "{}", "audio_devices", None),
     (
+        "bluetooth.audio.setProfile",
+        r#"{"device_key":"device-opaque","profile_key":"audio-profile-opaque"}"#,
+        "audio_devices",
+        None,
+    ),
+    (
         "bluetooth.device.operation",
         r#"{"key":"device-opaque","operation":"connect"}"#,
         "operation",

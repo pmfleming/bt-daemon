@@ -1,4 +1,11 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    io::Cursor,
+    rc::Rc,
+    sync::Once,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use pipewire as pw;
@@ -37,11 +44,84 @@ struct Objects {
     listeners: Vec<Box<dyn Listener>>,
 }
 
+fn initialize() {
+    static INITIALIZE: Once = Once::new();
+    INITIALIZE.call_once(pw::init);
+}
+
 pub fn probe() -> Result<Vec<AudioDevice>> {
-    pw::init();
-    let result = probe_inner();
-    unsafe { pw::deinit() };
-    result
+    initialize();
+    probe_inner()
+}
+
+pub fn set_profile(address: &str, index: u32) -> Result<()> {
+    initialize();
+    set_profile_inner(address, index)
+}
+
+fn set_profile_inner(address: &str, index: u32) -> Result<()> {
+    use pw::spa::pod::{Object, Property, Value, serialize::PodSerializer};
+
+    let index = i32::try_from(index).context("PipeWire profile index exceeds i32")?;
+    let value = Value::Object(Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamProfile,
+        id: pw::spa::sys::SPA_PARAM_Profile,
+        properties: vec![
+            Property::new(pw::spa::sys::SPA_PARAM_PROFILE_index, Value::Int(index)),
+            Property::new(pw::spa::sys::SPA_PARAM_PROFILE_save, Value::Bool(true)),
+        ],
+    });
+    let bytes = PodSerializer::serialize(Cursor::new(Vec::new()), &value)
+        .context("serialize PipeWire profile parameter")?
+        .0
+        .into_inner();
+    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
+    let context =
+        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
+    let core = context.connect_rc(None).context("connect to PipeWire")?;
+    let registry = core.get_registry_rc().context("open PipeWire registry")?;
+    let registry_weak = registry.downgrade();
+    let expected_name = format!("bluez_card.{}", address.replace(':', "_"));
+    let applied = Rc::new(Cell::new(false));
+    let applied_for_registry = Rc::clone(&applied);
+    let proxies = Rc::new(RefCell::new(Vec::<Box<dyn ProxyT>>::new()));
+    let proxies_for_registry = Rc::clone(&proxies);
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if global.type_ != ObjectType::Device
+                || global.props.and_then(|props| props.get("device.name"))
+                    != Some(expected_name.as_str())
+            {
+                return;
+            }
+            let Some(registry) = registry_weak.upgrade() else {
+                return;
+            };
+            let Ok(device) = registry.bind::<Device, _>(global) else {
+                return;
+            };
+            let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
+                return;
+            };
+            device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
+            applied_for_registry.set(true);
+            proxies_for_registry.borrow_mut().push(Box::new(device));
+        })
+        .register();
+    let main_loop_for_timer = main_loop.clone();
+    let timer = main_loop
+        .loop_()
+        .add_timer(move |_| main_loop_for_timer.quit());
+    timer
+        .update_timer(Some(Duration::from_millis(500)), None)
+        .into_result()
+        .context("arm PipeWire profile timer")?;
+    main_loop.run();
+    if !applied.get() {
+        anyhow::bail!("Bluetooth audio device is not available in PipeWire");
+    }
+    Ok(())
 }
 
 fn probe_inner() -> Result<Vec<AudioDevice>> {

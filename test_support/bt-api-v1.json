@@ -85,6 +85,15 @@
         "stream": null
       },
       {
+        "name": "bluetooth.audio.setProfile",
+        "params_example": {
+          "device_key": "device-opaque",
+          "profile_key": "audio-profile-opaque"
+        },
+        "response_key": "audio_devices",
+        "stream": null
+      },
+      {
         "name": "bluetooth.device.operation",
         "params_example": {
           "key": "device-opaque",

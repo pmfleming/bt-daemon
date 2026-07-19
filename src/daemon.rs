@@ -61,6 +61,51 @@ impl BluetoothDaemon {
         format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
     }
 
+    async fn set_audio_profile(&self, params: &Value) -> Value {
+        let device_key = params
+            .get("device_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let profile_key = params
+            .get("profile_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if device_key.is_empty() || profile_key.is_empty() {
+            return api::error(
+                "validation-error",
+                "device_key and profile_key are required".to_string(),
+            );
+        }
+        let devices = match tokio::task::spawn_blocking(audio::probe).await {
+            Ok(Ok(devices)) => devices,
+            Ok(Err(error)) => return api::error("audio-unavailable", format!("{error:#}")),
+            Err(error) => return api::error("audio-unavailable", error.to_string()),
+        };
+        let selection = devices.into_iter().find_map(|device| {
+            let address = device.address.parse().ok()?;
+            if device.adapter.is_empty()
+                || self.pairing.device_key(&device.adapter, address) != device_key
+            {
+                return None;
+            }
+            let profile = device.profiles.into_iter().find(|profile| {
+                audio::profile_key(device_key, &profile.name) == profile_key && profile.available
+            })?;
+            Some((device.address, profile.index))
+        });
+        let Some((address, index)) = selection else {
+            return api::error(
+                "audio-profile-unavailable",
+                "Bluetooth audio profile is not available".to_string(),
+            );
+        };
+        match tokio::task::spawn_blocking(move || audio::set_profile(&address, index)).await {
+            Ok(Ok(())) => self.audio_snapshot().await,
+            Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
+            Err(error) => api::error("audio-operation-failed", error.to_string()),
+        }
+    }
+
     async fn audio_snapshot(&self) -> Value {
         let devices = match tokio::task::spawn_blocking(audio::probe).await {
             Ok(Ok(devices)) => devices,
@@ -211,6 +256,9 @@ impl BluetoothDaemon {
         let params = serde_json::from_str::<Value>(params_json).unwrap_or(Value::Null);
         if method == "bluetooth.audio.snapshot" {
             return self.audio_snapshot().await.to_string();
+        }
+        if method == "bluetooth.audio.setProfile" {
+            return self.set_audio_profile(&params).await.to_string();
         }
         if method == "bluetooth.device.operation" {
             return self.start_operation(params).await.to_string();
