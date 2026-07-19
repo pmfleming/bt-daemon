@@ -242,16 +242,56 @@ impl BluetoothBackend for BluezBackend {
     ) -> Result<Snapshot> {
         let (adapter, device) = self.find_device(device_key).await?;
         match operation {
-            "pair" => device.pair().await.context("pair Bluetooth device")?,
-            "connect" => device.connect().await.context("connect Bluetooth device")?,
-            "disconnect" => device
-                .disconnect()
-                .await
-                .context("disconnect Bluetooth device")?,
-            "remove" => adapter
-                .remove_device(device.address())
-                .await
-                .context("remove Bluetooth device")?,
+            "pair" => {
+                operation_timeout(
+                    Duration::from_secs(75),
+                    "pair Bluetooth device",
+                    device.pair(),
+                )
+                .await?;
+                device
+                    .set_trusted(true)
+                    .await
+                    .context("trust paired Bluetooth device")?;
+                if !device.is_connected().await.unwrap_or(false) {
+                    operation_timeout(
+                        Duration::from_secs(25),
+                        "connect paired Bluetooth device",
+                        device.connect(),
+                    )
+                    .await?;
+                }
+            }
+            "connect" => {
+                operation_timeout(
+                    Duration::from_secs(25),
+                    "connect Bluetooth device",
+                    device.connect(),
+                )
+                .await?
+            }
+            "disconnect" => {
+                operation_timeout(
+                    Duration::from_secs(12),
+                    "disconnect Bluetooth device",
+                    device.disconnect(),
+                )
+                .await?
+            }
+            "remove" => {
+                if device.is_connected().await.unwrap_or(false) {
+                    operation_timeout(
+                        Duration::from_secs(12),
+                        "disconnect Bluetooth device before removal",
+                        device.disconnect(),
+                    )
+                    .await?;
+                }
+                adapter
+                    .remove_device(device.address())
+                    .await
+                    .context("remove Bluetooth device")?;
+            }
             "set-trusted" => device
                 .set_trusted(required_bool(params, "trusted")?)
                 .await
@@ -347,6 +387,17 @@ async fn device_snapshot(
             can_rename: true,
         },
     })
+}
+
+async fn operation_timeout<T>(
+    duration: Duration,
+    operation: &'static str,
+    future: impl std::future::Future<Output = bluer::Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(duration, future)
+        .await
+        .with_context(|| format!("{operation} timed out"))?
+        .with_context(|| operation)
 }
 
 fn signal_strength(rssi: i16) -> u8 {
