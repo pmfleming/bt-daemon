@@ -47,16 +47,6 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    if let Command::Debug { command } = &cli.command {
-        let value = match command {
-            DebugCommand::ProtocolRegistry => protocol::registry(),
-            DebugCommand::ContractFixture => protocol::contract_fixture(),
-            DebugCommand::AudioProbe => serde_json::to_value(audio::probe()?)?,
-        };
-        println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
-    }
-
     match cli.command {
         Command::Daemon => {
             let bluez = Arc::new(BluezBackend::new().await?);
@@ -79,6 +69,14 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Debug { .. } => unreachable!("debug commands return before BlueZ startup"),
+        Command::Debug { command } => {
+            let value = match command {
+                DebugCommand::ProtocolRegistry => protocol::registry(),
+                DebugCommand::ContractFixture => protocol::contract_fixture(),
+                DebugCommand::AudioProbe => serde_json::to_value(audio::probe()?)?,
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
     }
 }

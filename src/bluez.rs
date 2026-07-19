@@ -21,6 +21,7 @@ use crate::{
     backend::{BluetoothBackend, ObexRemote, ObexTarget},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
+    params::Params,
 };
 
 pub struct BluezBackend {
@@ -299,23 +300,23 @@ impl BluetoothBackend for BluezBackend {
         let adapter = self.find_adapter(adapter_key).await?;
         match operation {
             "set-alias" => adapter
-                .set_alias(required_string(params, "alias")?.to_string())
+                .set_alias(params.require_string("alias")?.to_string())
                 .await
                 .context("set adapter alias")?,
             "set-discoverable" => adapter
-                .set_discoverable(required_bool(params, "discoverable")?)
+                .set_discoverable(params.require_bool("discoverable")?)
                 .await
                 .context("set adapter discoverable state")?,
             "set-pairable" => adapter
-                .set_pairable(required_bool(params, "pairable")?)
+                .set_pairable(params.require_bool("pairable")?)
                 .await
                 .context("set adapter pairable state")?,
             "set-discoverable-timeout" => adapter
-                .set_discoverable_timeout(required_u32(params, "timeout")?)
+                .set_discoverable_timeout(params.require_u32("timeout")?)
                 .await
                 .context("set adapter discoverable timeout")?,
             "set-pairable-timeout" => adapter
-                .set_pairable_timeout(required_u32(params, "timeout")?)
+                .set_pairable_timeout(params.require_u32("timeout")?)
                 .await
                 .context("set adapter pairable timeout")?,
             _ => bail!("unsupported Bluetooth adapter operation: {operation}"),
@@ -431,19 +432,19 @@ impl BluetoothBackend for BluezBackend {
                     .context("remove Bluetooth device")?;
             }
             "set-trusted" => device
-                .set_trusted(required_bool(params, "trusted")?)
+                .set_trusted(params.require_bool("trusted")?)
                 .await
                 .context("set trusted state")?,
             "set-blocked" => device
-                .set_blocked(required_bool(params, "blocked")?)
+                .set_blocked(params.require_bool("blocked")?)
                 .await
                 .context("set blocked state")?,
             "set-wake-allowed" => device
-                .set_wake_allowed(required_bool(params, "wake_allowed")?)
+                .set_wake_allowed(params.require_bool("wake_allowed")?)
                 .await
                 .context("set wake permission")?,
             "set-alias" => device
-                .set_alias(required_string(params, "alias")?.to_string())
+                .set_alias(params.require_string("alias")?.to_string())
                 .await
                 .context("set device alias")?,
             _ => bail!("unsupported Bluetooth device operation: {operation}"),
@@ -656,28 +657,6 @@ fn modalias_string(value: bluer::Modalias) -> String {
 
 fn signal_strength(rssi: i16) -> u8 {
     (((i32::from(rssi) + 100) * 100) / 60).clamp(0, 100) as u8
-}
-
-fn required_bool(params: &Value, name: &str) -> Result<bool> {
-    params
-        .get(name)
-        .and_then(Value::as_bool)
-        .with_context(|| format!("missing boolean parameter '{name}'"))
-}
-
-fn required_u32(params: &Value, name: &str) -> Result<u32> {
-    params
-        .get(name)
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .with_context(|| format!("missing unsigned integer parameter '{name}'"))
-}
-
-fn required_string<'a>(params: &'a Value, name: &str) -> Result<&'a str> {
-    params
-        .get(name)
-        .and_then(Value::as_str)
-        .with_context(|| format!("missing string parameter '{name}'"))
 }
 
 #[cfg(test)]

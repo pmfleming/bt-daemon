@@ -645,7 +645,7 @@ async fn monitor_incoming(
     Ok(())
 }
 
-fn lifecycle_event(status: &str) -> &'static str {
+pub(crate) fn lifecycle_event(status: &str) -> &'static str {
     match status {
         "complete" => "completed",
         "cancelled" => "cancelled",

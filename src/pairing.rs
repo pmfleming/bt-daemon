@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
-use crate::identity::DeviceIdentityRegistry;
+use crate::{identity::DeviceIdentityRegistry, params::Params};
 
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -87,15 +87,9 @@ impl PairingBroker {
         }
     }
 
-    pub async fn respond(&self, params: &Value) -> Result<()> {
-        let request_id = params
-            .get("request_id")
-            .and_then(Value::as_str)
-            .context("missing pairing request_id")?;
-        let accept = params
-            .get("accept")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    pub async fn respond(&self, params: &Value) -> Result<bool> {
+        let request_id = params.require_string("request_id")?;
+        let accept = params.require_bool("accept")?;
         let pending = self
             .pending
             .lock()
@@ -104,7 +98,7 @@ impl PairingBroker {
             .context("pairing request is no longer pending")?;
         if !accept {
             reject(pending);
-            return Ok(());
+            return Ok(false);
         }
         match pending {
             PendingResponse::Pin(sender) => {
@@ -143,7 +137,7 @@ impl PairingBroker {
                 let _ = sender.send(Ok(()));
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn request_pin(&self, adapter: String, device: Address) -> ReqResult<String> {

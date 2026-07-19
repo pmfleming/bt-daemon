@@ -3,56 +3,43 @@ use std::sync::Arc;
 use anyhow::Error;
 use serde_json::{Value, json};
 
-use crate::backend::BluetoothBackend;
+use crate::{backend::BluetoothBackend, params::Params};
 
-pub const PROTOCOL: &str = "bt-api";
-pub const VERSION: u8 = 1;
+pub use crate::protocol::{NAME as PROTOCOL, VERSION};
 
 pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: Value) -> Value {
     let result = match method {
         "bluetooth.snapshot" => backend.snapshot().await,
         "bluetooth.setPowered" => {
+            let powered = match params.require_bool("powered") {
+                Ok(powered) => powered,
+                Err(error) => return validation_error(error),
+            };
             backend
-                .set_powered(
-                    params.get("adapter_key").and_then(Value::as_str),
-                    params
-                        .get("powered")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                )
+                .set_powered(params.get("adapter_key").and_then(Value::as_str), powered)
                 .await
         }
         "bluetooth.scan" => {
+            let enabled = match params.require_bool("enabled") {
+                Ok(enabled) => enabled,
+                Err(error) => return validation_error(error),
+            };
             backend
-                .set_scanning(
-                    params.get("adapter_key").and_then(Value::as_str),
-                    params
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
-                )
+                .set_scanning(params.get("adapter_key").and_then(Value::as_str), enabled)
                 .await
         }
         "bluetooth.adapter.operation" => {
-            let key = params
-                .get("key")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let operation = params
-                .get("operation")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let (key, operation) = match params.require_strings("key", "operation") {
+                Ok(params) => params,
+                Err(error) => return validation_error(error),
+            };
             backend.adapter_operation(key, operation, &params).await
         }
         "bluetooth.device.operation" => {
-            let key = params
-                .get("key")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let operation = params
-                .get("operation")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let (key, operation) = match params.require_strings("key", "operation") {
+                Ok(params) => params,
+                Err(error) => return validation_error(error),
+            };
             backend.device_operation(key, operation, &params).await
         }
         _ => {
@@ -69,6 +56,10 @@ pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: 
             json!({ "protocol": PROTOCOL, "version": VERSION, "ok": false, "error": details })
         }
     }
+}
+
+fn validation_error(error: Error) -> Value {
+    self::error("validation-error", error.to_string())
 }
 
 pub fn success(data: Value) -> Value {

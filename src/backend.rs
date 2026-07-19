@@ -38,15 +38,3 @@ pub trait BluetoothBackend: Send + Sync {
         params: &Value,
     ) -> Result<Snapshot>;
 }
-
-/// PipeWire/WirePlumber integration boundary. Audio profile control is staged after core BlueZ parity.
-#[async_trait]
-pub trait AudioBackend: Send + Sync {
-    async fn refresh(&self) -> Result<()>;
-}
-
-/// BlueZ OBEX integration boundary. File transfer is staged after core BlueZ parity.
-#[async_trait]
-pub trait ObexBackend: Send + Sync {
-    async fn refresh(&self) -> Result<()>;
-}
