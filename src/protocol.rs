@@ -22,8 +22,8 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
     (
         "bluetooth.device.operation",
         r#"{"key":"device-opaque","operation":"connect"}"#,
-        "snapshot",
-        Some("bluetooth.changed"),
+        "operation",
+        Some("bluetooth.operation"),
     ),
     (
         "bluetooth.pairing.respond",
@@ -39,6 +39,10 @@ pub const STREAMS: &[(&str, &[&str])] = &[
         &["subscribed", "changed", "unavailable"],
     ),
     ("pairing.request", &["requested", "display", "cancelled"]),
+    (
+        "bluetooth.operation",
+        &["started", "completed", "failed", "cancelled"],
+    ),
 ];
 
 pub fn registry() -> Value {
@@ -102,6 +106,20 @@ pub fn contract_fixture() -> Value {
                         }
                     }]
                 }
+            }
+        },
+        "operation_event": {
+            "protocol": "bt-api",
+            "version": 1,
+            "stream": "bluetooth.operation",
+            "event": "completed",
+            "subscription_id": "subscription-1",
+            "data": {
+                "event": "completed",
+                "request_id": "operation-1",
+                "device_key": "device-opaque",
+                "operation": "connect",
+                "state": "completed"
             }
         },
         "pairing_event": {

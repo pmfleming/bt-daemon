@@ -38,7 +38,7 @@ nix run -- probe-bluez
 
 The current `bt-api` v1 slice provides adapter/device snapshots, adapter power and owned discovery, and pair/connect/disconnect/trust/block/wake/rename/remove operations. Pair is a bounded pair → trust → connect workflow; remove disconnects first. The daemon monitors BlueZ adapter hotplug, adapter properties, device additions/removals, and device properties, then publishes debounced `bluetooth.changed` snapshots.
 
-`bt-daemon daemon` owns `org.laufan.BluetoothDaemon` on the session bus. `bt-daemon client` bridges newline-delimited frontend JSON through that service, with a direct BlueZ fallback for ordinary calls. The application-specific BlueR pairing agent covers PIN input/display, passkey input/display, numeric confirmation, pairing authorization, service authorization, BlueZ cancellation, and a 60-second prompt timeout without requesting default-agent ownership from Blueman.
+`bt-daemon daemon` owns `org.laufan.BluetoothDaemon` on the session bus. `bt-daemon client` bridges newline-delimited frontend JSON through that service, with a direct BlueZ fallback for ordinary calls. Device operations receive opaque request IDs and publish queued/running/completed/failed/cancelled lifecycle events; active operations can be cancelled through the transport. Errors distinguish timeout, unavailable-device, rejected, BlueZ-unavailable, validation, and generic failures. The application-specific BlueR pairing agent covers PIN input/display, passkey input/display, numeric confirmation, pairing authorization, service authorization, BlueZ cancellation, and a 60-second prompt timeout without requesting default-agent ownership from Blueman.
 
 Inspect the canonical protocol metadata and checked fixture with:
 
@@ -47,4 +47,4 @@ bt-daemon debug protocol-registry
 bt-daemon debug contract-fixture
 ```
 
-Operation request IDs/cancellation, durable private-address identity, audio profiles, and OBEX remain staged work.
+Durable private-address identity, audio profiles, and OBEX remain staged work.

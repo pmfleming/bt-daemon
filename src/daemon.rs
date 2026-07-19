@@ -8,8 +8,12 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
+use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, broadcast, oneshot},
+    task::JoinHandle,
+};
 use zbus::{connection, object_server::SignalEmitter};
 
 use crate::{
@@ -23,17 +27,134 @@ pub const OBJECT_PATH: &str = "/org/laufan/BluetoothDaemon";
 pub const INTERFACE: &str = "org.laufan.BluetoothDaemon1";
 pub const CHANGED_STREAM: &str = "bluetooth.changed";
 pub const PAIRING_STREAM: &str = "pairing.request";
+pub const OPERATION_STREAM: &str = "bluetooth.operation";
+
+#[derive(Clone, Serialize)]
+struct OperationEvent {
+    event: String,
+    request_id: String,
+    device_key: String,
+    operation: String,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<crate::model::Snapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+}
+
+struct OperationTask {
+    handle: JoinHandle<()>,
+    event: OperationEvent,
+}
 
 pub struct BluetoothDaemon {
     backend: Arc<dyn BluetoothBackend>,
     pairing: Arc<PairingBroker>,
     sequence: AtomicU64,
     subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    operations: Arc<Mutex<HashMap<String, OperationTask>>>,
+    operation_events: broadcast::Sender<OperationEvent>,
 }
 
 impl BluetoothDaemon {
     fn next_id(&self, prefix: &str) -> String {
         format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
+    }
+
+    async fn start_operation(&self, params: Value) -> Value {
+        let device_key = params
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let operation = params
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if device_key.is_empty() {
+            return api::error("validation-error", "device key is required".to_string());
+        }
+        if !matches!(
+            operation,
+            "pair"
+                | "connect"
+                | "disconnect"
+                | "remove"
+                | "set-trusted"
+                | "set-blocked"
+                | "set-wake-allowed"
+                | "set-alias"
+        ) {
+            return api::error(
+                "validation-error",
+                format!("unsupported Bluetooth device operation: {operation}"),
+            );
+        }
+
+        let request_id = self.next_id("operation");
+        let queued = OperationEvent {
+            event: "queued".to_string(),
+            request_id: request_id.clone(),
+            device_key: device_key.to_string(),
+            operation: operation.to_string(),
+            state: "queued".to_string(),
+            snapshot: None,
+            error: None,
+        };
+        let backend = Arc::clone(&self.backend);
+        let operations = Arc::clone(&self.operations);
+        let events = self.operation_events.clone();
+        let task_id = request_id.clone();
+        let task_key = device_key.to_string();
+        let task_operation = operation.to_string();
+        let (start_sender, start_receiver) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if start_receiver.await.is_err() {
+                return;
+            }
+            let _ = events.send(OperationEvent {
+                event: "started".to_string(),
+                request_id: task_id.clone(),
+                device_key: task_key.clone(),
+                operation: task_operation.clone(),
+                state: "running".to_string(),
+                snapshot: None,
+                error: None,
+            });
+            let result = backend
+                .device_operation(&task_key, &task_operation, &params)
+                .await;
+            operations.lock().await.remove(&task_id);
+            let event = match result {
+                Ok(snapshot) => OperationEvent {
+                    event: "completed".to_string(),
+                    request_id: task_id,
+                    device_key: task_key,
+                    operation: task_operation,
+                    state: "completed".to_string(),
+                    snapshot: Some(snapshot),
+                    error: None,
+                },
+                Err(error) => OperationEvent {
+                    event: "failed".to_string(),
+                    request_id: task_id,
+                    device_key: task_key,
+                    operation: task_operation,
+                    state: "failed".to_string(),
+                    snapshot: None,
+                    error: Some(api::error_value(&error)),
+                },
+            };
+            let _ = events.send(event);
+        });
+        self.operations.lock().await.insert(
+            request_id.clone(),
+            OperationTask {
+                handle,
+                event: queued.clone(),
+            },
+        );
+        let _ = start_sender.send(());
+        api::success(json!({ "operation": queued }))
     }
 }
 
@@ -41,6 +162,9 @@ impl BluetoothDaemon {
 impl BluetoothDaemon {
     async fn call(&self, method: &str, params_json: &str) -> String {
         let params = serde_json::from_str::<Value>(params_json).unwrap_or(Value::Null);
+        if method == "bluetooth.device.operation" {
+            return self.start_operation(params).await.to_string();
+        }
         if method == "bluetooth.pairing.respond" {
             return match self.pairing.respond(&params).await {
                 Ok(()) => api::success(json!({ "result": { "accepted": true } })).to_string(),
@@ -60,21 +184,24 @@ impl BluetoothDaemon {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> String {
         if streams.is_empty()
-            || streams
-                .iter()
-                .any(|stream| stream != CHANGED_STREAM && stream != PAIRING_STREAM)
+            || streams.iter().any(|stream| {
+                stream != CHANGED_STREAM && stream != PAIRING_STREAM && stream != OPERATION_STREAM
+            })
         {
             return api::error(
                 "unsupported-stream",
-                "Subscriptions require bluetooth.changed and/or pairing.request".to_string(),
+                "Subscriptions require bluetooth.changed, pairing.request, and/or bluetooth.operation"
+                    .to_string(),
             )
             .to_string();
         }
         let wants_changes = streams.iter().any(|stream| stream == CHANGED_STREAM);
         let wants_pairing = streams.iter().any(|stream| stream == PAIRING_STREAM);
+        let wants_operations = streams.iter().any(|stream| stream == OPERATION_STREAM);
         let id = self.next_id("subscription");
         let mut changes = self.backend.subscribe_changes();
         let mut pairing_events = self.pairing.subscribe();
+        let mut operation_events = self.operation_events.subscribe();
         let backend = Arc::clone(&self.backend);
         let signal_emitter = emitter.to_owned();
         let subscription_id = id.clone();
@@ -96,6 +223,11 @@ impl BluetoothDaemon {
                         Ok(event) => emit_pairing(&signal_emitter, &subscription_id, event).await,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    result = operation_events.recv(), if wants_operations => match result {
+                        Ok(event) => emit_operation(&signal_emitter, &subscription_id, event).await,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
@@ -104,10 +236,26 @@ impl BluetoothDaemon {
         api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
     }
 
-    async fn cancel(&self, request_id: &str) {
+    async fn cancel(&self, request_id: &str) -> String {
         if let Some(task) = self.subscriptions.lock().await.remove(request_id) {
             task.abort();
+            return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
+                .to_string();
         }
+        if let Some(task) = self.operations.lock().await.remove(request_id) {
+            task.handle.abort();
+            let mut event = task.event;
+            event.event = "cancelled".to_string();
+            event.state = "cancelled".to_string();
+            let _ = self.operation_events.send(event);
+            return api::success(json!({ "cancelled": request_id, "kind": "operation" }))
+                .to_string();
+        }
+        api::error(
+            "request-not-found",
+            format!("No active subscription or operation named {request_id}"),
+        )
+        .to_string()
     }
 
     #[zbus(signal)]
@@ -144,6 +292,21 @@ async fn emit_snapshot(
     }
 }
 
+async fn emit_operation(emitter: &SignalEmitter<'_>, subscription_id: &str, event: OperationEvent) {
+    let value = json!({
+        "protocol": api::PROTOCOL,
+        "version": api::VERSION,
+        "stream": OPERATION_STREAM,
+        "subscription_id": subscription_id,
+        "event": event.event,
+        "data": event,
+    });
+    if let Err(error) = BluetoothDaemon::event(emitter, OPERATION_STREAM, &value.to_string()).await
+    {
+        tracing::debug!(%error, "could not emit Bluetooth operation event");
+    }
+}
+
 async fn emit_pairing(emitter: &SignalEmitter<'_>, subscription_id: &str, event: PairingEvent) {
     let value = json!({
         "protocol": api::PROTOCOL,
@@ -159,6 +322,7 @@ async fn emit_pairing(emitter: &SignalEmitter<'_>, subscription_id: &str, event:
 }
 
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
+    let (operation_events, _) = broadcast::channel(32);
     let _connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
@@ -170,6 +334,8 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
                 pairing,
                 sequence: AtomicU64::new(1),
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                operations: Arc::new(Mutex::new(HashMap::new())),
+                operation_events,
             },
         )
         .context("export bt-daemon D-Bus interface")?
@@ -213,4 +379,96 @@ async fn watch_bluez_owner() -> Result<()> {
         }
     }
     bail!("BlueZ owner watch ended")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+    use tokio::sync::{Mutex, broadcast};
+
+    use crate::{backend::BluetoothBackend, model::Snapshot, pairing::PairingBroker};
+
+    use super::{BluetoothDaemon, OperationEvent};
+
+    struct TestBackend {
+        complete: bool,
+    }
+
+    #[async_trait]
+    impl BluetoothBackend for TestBackend {
+        fn subscribe_changes(&self) -> broadcast::Receiver<()> {
+            broadcast::channel(1).1
+        }
+
+        async fn snapshot(&self) -> Result<Snapshot> {
+            Ok(Snapshot {
+                adapters: vec![],
+                devices: vec![],
+            })
+        }
+
+        async fn set_powered(&self, _: Option<&str>, _: bool) -> Result<Snapshot> {
+            self.snapshot().await
+        }
+
+        async fn set_scanning(&self, _: bool) -> Result<Snapshot> {
+            self.snapshot().await
+        }
+
+        async fn device_operation(&self, _: &str, _: &str, _: &Value) -> Result<Snapshot> {
+            if self.complete {
+                self.snapshot().await
+            } else {
+                std::future::pending().await
+            }
+        }
+    }
+
+    fn daemon(complete: bool) -> (BluetoothDaemon, broadcast::Receiver<OperationEvent>) {
+        let (operation_events, receiver) = broadcast::channel(8);
+        (
+            BluetoothDaemon {
+                backend: Arc::new(TestBackend { complete }),
+                pairing: PairingBroker::new(),
+                sequence: AtomicU64::new(1),
+                subscriptions: Arc::new(Mutex::new(Default::default())),
+                operations: Arc::new(Mutex::new(Default::default())),
+                operation_events,
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn operation_emits_started_and_completed_events() {
+        let (daemon, mut events) = daemon(true);
+        let response = daemon
+            .start_operation(json!({ "key": "device-opaque", "operation": "connect" }))
+            .await;
+        assert_eq!(response["data"]["operation"]["state"], "queued");
+        assert_eq!(events.recv().await.unwrap().event, "started");
+        assert_eq!(events.recv().await.unwrap().event, "completed");
+        assert!(daemon.operations.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_operation_can_be_cancelled() {
+        let (daemon, mut events) = daemon(false);
+        let response = daemon
+            .start_operation(json!({ "key": "device-opaque", "operation": "pair" }))
+            .await;
+        let request_id = response["data"]["operation"]["request_id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(events.recv().await.unwrap().event, "started");
+        let response: Value = serde_json::from_str(&daemon.cancel(request_id).await).unwrap();
+        assert_eq!(response["data"]["kind"], "operation");
+        let cancelled = events.recv().await.unwrap();
+        assert_eq!(cancelled.event, "cancelled");
+        assert_eq!(cancelled.request_id, request_id);
+    }
 }

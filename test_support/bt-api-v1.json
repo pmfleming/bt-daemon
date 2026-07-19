@@ -1,4 +1,18 @@
 {
+  "operation_event": {
+    "data": {
+      "device_key": "device-opaque",
+      "event": "completed",
+      "operation": "connect",
+      "request_id": "operation-1",
+      "state": "completed"
+    },
+    "event": "completed",
+    "protocol": "bt-api",
+    "stream": "bluetooth.operation",
+    "subscription_id": "subscription-1",
+    "version": 1
+  },
   "pairing_event": {
     "data": {
       "device_key": "device-opaque",
@@ -47,8 +61,8 @@
           "key": "device-opaque",
           "operation": "connect"
         },
-        "response_key": "snapshot",
-        "stream": "bluetooth.changed"
+        "response_key": "operation",
+        "stream": "bluetooth.operation"
       },
       {
         "name": "bluetooth.pairing.respond",
@@ -78,6 +92,15 @@
           "cancelled"
         ],
         "name": "pairing.request"
+      },
+      {
+        "events": [
+          "started",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "name": "bluetooth.operation"
       }
     ],
     "version": 1

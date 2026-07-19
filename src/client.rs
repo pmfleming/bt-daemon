@@ -84,12 +84,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
             }
             Request::Cancel { id, request_id } => {
                 let response = call_cancel(dbus.as_ref(), &request_id).await;
-                emit_transport_response(
-                    &output,
-                    &id,
-                    response.map(|()| json!({ "cancelled": request_id })),
-                )
-                .await?;
+                emit_transport_response(&output, &id, response).await?;
             }
             Request::Shutdown { id } => {
                 emit(
@@ -136,11 +131,15 @@ async fn call_subscribe(
     serde_json::from_str(&response).map_err(|error| zbus::Error::Failure(error.to_string()))
 }
 
-async fn call_cancel(connection: Option<&zbus::Connection>, request_id: &str) -> zbus::Result<()> {
+async fn call_cancel(
+    connection: Option<&zbus::Connection>,
+    request_id: &str,
+) -> zbus::Result<Value> {
     let connection =
         connection.ok_or_else(|| zbus::Error::Failure("session D-Bus unavailable".into()))?;
     let proxy = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
-    proxy.call("Cancel", &(request_id,)).await
+    let response: String = proxy.call("Cancel", &(request_id,)).await?;
+    serde_json::from_str(&response).map_err(|error| zbus::Error::Failure(error.to_string()))
 }
 
 fn spawn_owner_watcher(connection: zbus::Connection, output: Output) {
