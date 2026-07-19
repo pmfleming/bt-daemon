@@ -1,0 +1,136 @@
+{
+  "pairing_event": {
+    "data": {
+      "device_key": "device-opaque",
+      "event": "requested",
+      "kind": "confirmation",
+      "request_id": "pairing-1",
+      "response_required": true,
+      "timeout_ms": 60000,
+      "value": "123456"
+    },
+    "event": "requested",
+    "protocol": "bt-api",
+    "stream": "pairing.request",
+    "subscription_id": "subscription-1",
+    "version": 1
+  },
+  "protocol": "bt-api",
+  "registry": {
+    "methods": [
+      {
+        "name": "bluetooth.snapshot",
+        "params_example": {},
+        "response_key": "snapshot",
+        "stream": "bluetooth.changed"
+      },
+      {
+        "name": "bluetooth.setPowered",
+        "params_example": {
+          "adapter_key": null,
+          "powered": true
+        },
+        "response_key": "snapshot",
+        "stream": "bluetooth.changed"
+      },
+      {
+        "name": "bluetooth.scan",
+        "params_example": {
+          "enabled": true
+        },
+        "response_key": "snapshot",
+        "stream": "bluetooth.changed"
+      },
+      {
+        "name": "bluetooth.device.operation",
+        "params_example": {
+          "key": "device-opaque",
+          "operation": "connect"
+        },
+        "response_key": "snapshot",
+        "stream": "bluetooth.changed"
+      },
+      {
+        "name": "bluetooth.pairing.respond",
+        "params_example": {
+          "accept": true,
+          "request_id": "pairing-1",
+          "value": null
+        },
+        "response_key": "result",
+        "stream": "pairing.request"
+      }
+    ],
+    "protocol": "bt-api",
+    "streams": [
+      {
+        "events": [
+          "subscribed",
+          "changed",
+          "unavailable"
+        ],
+        "name": "bluetooth.changed"
+      },
+      {
+        "events": [
+          "requested",
+          "display",
+          "cancelled"
+        ],
+        "name": "pairing.request"
+      }
+    ],
+    "version": 1
+  },
+  "snapshot": {
+    "data": {
+      "snapshot": {
+        "adapters": [
+          {
+            "alias": "computer",
+            "discovering": false,
+            "key": "adapter-opaque",
+            "name": "hci0",
+            "pairable": true,
+            "powered": true
+          }
+        ],
+        "devices": [
+          {
+            "adapter_key": "adapter-opaque",
+            "battery": [
+              {
+                "component": "main",
+                "percentage": 80
+              }
+            ],
+            "blocked": false,
+            "capabilities": {
+              "can_block": true,
+              "can_connect": true,
+              "can_disconnect": false,
+              "can_pair": false,
+              "can_remove": true,
+              "can_rename": true,
+              "can_trust": true,
+              "can_wake": false
+            },
+            "connected": false,
+            "icon": "audio-headset",
+            "key": "device-opaque",
+            "name": "Headphones",
+            "paired": true,
+            "present": false,
+            "signal_strength": null,
+            "trusted": true,
+            "wake_allowed": null
+          }
+        ]
+      }
+    },
+    "ok": true,
+    "protocol": "bt-api",
+    "version": 1
+  },
+  "version": 1
+}

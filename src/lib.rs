@@ -4,3 +4,5 @@ pub mod bluez;
 pub mod client;
 pub mod daemon;
 pub mod model;
+pub mod pairing;
+pub mod protocol;

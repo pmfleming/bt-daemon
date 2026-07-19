@@ -31,7 +31,7 @@ pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: 
                 )
                 .await
         }
-        "device.operation" => {
+        "bluetooth.device.operation" => {
             let key = params
                 .get("key")
                 .and_then(Value::as_str)

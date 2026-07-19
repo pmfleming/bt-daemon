@@ -1,11 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::broadcast;
 
 use crate::model::Snapshot;
 
 #[async_trait]
 pub trait BluetoothBackend: Send + Sync {
+    fn subscribe_changes(&self) -> broadcast::Receiver<()>;
     async fn snapshot(&self) -> Result<Snapshot>;
     async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot>;
     async fn set_scanning(&self, enabled: bool) -> Result<Snapshot>;

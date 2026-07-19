@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::Mutex,
+};
 
 use crate::{
     api,
     backend::BluetoothBackend,
-    daemon::{BUS_NAME, OBJECT_PATH},
+    daemon::{BUS_NAME, INTERFACE, OBJECT_PATH},
 };
 
 #[derive(Debug, Deserialize)]
@@ -20,15 +24,30 @@ enum Request {
         #[serde(default)]
         params: Value,
     },
+    Subscribe {
+        id: String,
+        #[serde(default)]
+        streams: Vec<String>,
+    },
+    Cancel {
+        id: String,
+        request_id: String,
+    },
     Shutdown {
         id: String,
     },
 }
 
+type Output = Arc<Mutex<tokio::io::Stdout>>;
+
 pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
     let dbus = zbus::Connection::session().await.ok();
+    let output = Arc::new(Mutex::new(tokio::io::stdout()));
+    if let Some(connection) = dbus.clone() {
+        spawn_event_forwarder(connection, Arc::clone(&output));
+    }
+
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await.context("read client request")? {
         if line.trim().is_empty() {
             continue;
@@ -37,7 +56,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
             Ok(request) => request,
             Err(error) => {
                 emit(
-                    &mut stdout,
+                    &output,
                     &json!({ "kind": "protocol-error", "error": error.to_string() }),
                 )
                 .await?;
@@ -46,15 +65,37 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
         };
         match request {
             Request::Call { id, method, params } => {
-                let response = dispatch(&dbus, Arc::clone(&backend), &method, params).await;
-                emit(
-                    &mut stdout,
-                    &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
+                let connection = dbus.clone();
+                let fallback = Arc::clone(&backend);
+                let output = Arc::clone(&output);
+                tokio::spawn(async move {
+                    let response = dispatch(&connection, fallback, &method, params).await;
+                    let _ = emit(
+                        &output,
+                        &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
+                    )
+                    .await;
+                });
+            }
+            Request::Subscribe { id, streams } => {
+                let response = call_subscribe(dbus.as_ref(), streams).await;
+                emit_transport_response(&output, &id, response).await?;
+            }
+            Request::Cancel { id, request_id } => {
+                let response = call_cancel(dbus.as_ref(), &request_id).await;
+                emit_transport_response(
+                    &output,
+                    &id,
+                    response.map(|()| json!({ "cancelled": request_id })),
                 )
                 .await?;
             }
             Request::Shutdown { id } => {
-                emit(&mut stdout, &json!({ "kind": "response", "id": id, "ok": true, "response": { "shutdown": true } })).await?;
+                emit(
+                    &output,
+                    &json!({ "kind": "response", "id": id, "ok": true, "response": { "shutdown": true } }),
+                )
+                .await?;
                 break;
             }
         }
@@ -69,13 +110,7 @@ async fn dispatch(
     params: Value,
 ) -> Value {
     if let Some(connection) = connection
-        && let Ok(proxy) = zbus::Proxy::new(
-            connection,
-            BUS_NAME,
-            OBJECT_PATH,
-            "org.laufan.BluetoothDaemon1",
-        )
-        .await
+        && let Ok(proxy) = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE).await
     {
         let params_json = params.to_string();
         let response: zbus::Result<String> =
@@ -89,7 +124,68 @@ async fn dispatch(
     api::dispatch(fallback, method, params).await
 }
 
-async fn emit(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<()> {
+async fn call_subscribe(
+    connection: Option<&zbus::Connection>,
+    streams: Vec<String>,
+) -> zbus::Result<Value> {
+    let connection =
+        connection.ok_or_else(|| zbus::Error::Failure("session D-Bus unavailable".into()))?;
+    let proxy = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
+    let response: String = proxy.call("Subscribe", &(streams,)).await?;
+    serde_json::from_str(&response).map_err(|error| zbus::Error::Failure(error.to_string()))
+}
+
+async fn call_cancel(connection: Option<&zbus::Connection>, request_id: &str) -> zbus::Result<()> {
+    let connection =
+        connection.ok_or_else(|| zbus::Error::Failure("session D-Bus unavailable".into()))?;
+    let proxy = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
+    proxy.call("Cancel", &(request_id,)).await
+}
+
+fn spawn_event_forwarder(connection: zbus::Connection, output: Output) {
+    tokio::spawn(async move {
+        let result = async {
+            let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
+            let mut signals = proxy.receive_signal("Event").await?;
+            while let Some(message) = signals.next().await {
+                let (stream, event_json): (String, String) = message.body().deserialize()?;
+                let event = serde_json::from_str::<Value>(&event_json)
+                    .unwrap_or_else(|_| json!({ "raw": event_json }));
+                emit(
+                    &output,
+                    &json!({ "kind": "event", "stream": stream, "event": event }),
+                )
+                .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = emit(
+                &output,
+                &json!({ "kind": "transport-error", "error": error.to_string() }),
+            )
+            .await;
+        }
+    });
+}
+
+async fn emit_transport_response(
+    output: &Output,
+    id: &str,
+    response: zbus::Result<Value>,
+) -> Result<()> {
+    let value = match response {
+        Ok(response) => json!({ "kind": "response", "id": id, "ok": true, "response": response }),
+        Err(error) => {
+            json!({ "kind": "response", "id": id, "ok": false, "error": error.to_string() })
+        }
+    };
+    emit(output, &value).await
+}
+
+async fn emit(output: &Output, value: &Value) -> Result<()> {
+    let mut stdout = output.lock().await;
     let mut bytes = serde_json::to_vec(value).context("serialize client response")?;
     bytes.push(b'\n');
     stdout
