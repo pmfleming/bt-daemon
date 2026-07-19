@@ -25,12 +25,24 @@ pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: 
         "bluetooth.scan" => {
             backend
                 .set_scanning(
+                    params.get("adapter_key").and_then(Value::as_str),
                     params
                         .get("enabled")
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
                 )
                 .await
+        }
+        "bluetooth.adapter.operation" => {
+            let key = params
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let operation = params
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            backend.adapter_operation(key, operation, &params).await
         }
         "bluetooth.device.operation" => {
             let key = params

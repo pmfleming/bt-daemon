@@ -15,7 +15,13 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
     ),
     (
         "bluetooth.scan",
-        r#"{"enabled":true}"#,
+        r#"{"adapter_key":"adapter-opaque","enabled":true,"timeout_ms":15000}"#,
+        "scan",
+        Some("bluetooth.scan"),
+    ),
+    (
+        "bluetooth.adapter.operation",
+        r#"{"key":"adapter-opaque","operation":"set-discoverable","discoverable":true}"#,
         "snapshot",
         Some("bluetooth.changed"),
     ),
@@ -61,6 +67,10 @@ pub const STREAMS: &[(&str, &[&str])] = &[
     ("pairing.request", &["requested", "display", "cancelled"]),
     (
         "bluetooth.operation",
+        &["started", "completed", "failed", "cancelled"],
+    ),
+    (
+        "bluetooth.scan",
         &["started", "completed", "failed", "cancelled"],
     ),
     (
@@ -112,23 +122,46 @@ pub fn contract_fixture() -> Value {
                         "key": "adapter-opaque",
                         "name": "hci0",
                         "alias": "computer",
+                        "address": "00:11:22:33:44:55",
+                        "address_type": "public",
                         "powered": true,
                         "discovering": false,
-                        "pairable": true
+                        "discoverable": false,
+                        "pairable": true,
+                        "discoverable_timeout": 180,
+                        "pairable_timeout": 0,
+                        "modalias": null
                     }],
                     "devices": [{
                         "key": "device-opaque",
                         "adapter_key": "adapter-opaque",
                         "name": "Headphones",
+                        "alias": "Headphones",
+                        "address": "AA:BB:CC:DD:EE:FF",
+                        "address_type": "public",
                         "icon": "audio-headset",
                         "paired": true,
+                        "bonded": true,
                         "connected": false,
+                        "services_resolved": true,
                         "trusted": true,
                         "blocked": false,
                         "wake_allowed": null,
-                        "battery": [{ "component": "main", "percentage": 80 }],
+                        "legacy_pairing": false,
+                        "modalias": null,
+                        "uuids": ["0000110b-0000-1000-8000-00805f9b34fb"],
+                        "services": [{
+                            "uuid": "0000110b-0000-1000-8000-00805f9b34fb",
+                            "label": "Audio Sink"
+                        }],
+                        "battery": [{
+                            "id": "aggregate", "label": "Battery", "component": "main",
+                            "percentage": 80, "source": "bluez", "confidence": "standard"
+                        }],
+                        "rssi": null,
                         "signal_strength": null,
                         "present": false,
+                        "last_seen_ms": null,
                         "capabilities": {
                             "can_pair": false,
                             "can_connect": true,
@@ -137,10 +170,30 @@ pub fn contract_fixture() -> Value {
                             "can_trust": true,
                             "can_block": true,
                             "can_wake": false,
-                            "can_rename": true
+                            "can_rename": true,
+                            "can_send_file": true,
+                            "unsupported_reasons": {
+                                "pair": "Device is already paired",
+                                "disconnect": "Device is not connected",
+                                "wake": "BlueZ does not expose wake control for this device"
+                            }
                         }
                     }]
                 }
+            }
+        },
+        "scan_event": {
+            "protocol": "bt-api",
+            "version": 1,
+            "stream": "bluetooth.scan",
+            "event": "started",
+            "subscription_id": "subscription-1",
+            "data": {
+                "event": "started",
+                "request_id": "scan-1",
+                "adapter_key": "adapter-opaque",
+                "state": "running",
+                "timeout_ms": 15000
             }
         },
         "obex_snapshot": {

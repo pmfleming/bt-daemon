@@ -12,7 +12,6 @@ use tokio::{
 
 use crate::{
     api,
-    backend::BluetoothBackend,
     daemon::{BUS_NAME, INTERFACE, OBJECT_PATH},
 };
 
@@ -41,7 +40,7 @@ enum Request {
 
 type Output = Arc<Mutex<tokio::io::Stdout>>;
 
-pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
+pub async fn run() -> Result<()> {
     let dbus = zbus::Connection::session().await.ok();
     let output = Arc::new(Mutex::new(tokio::io::stdout()));
     if let Some(connection) = dbus.clone() {
@@ -69,10 +68,9 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
         match request {
             Request::Call { id, method, params } => {
                 let connection = dbus.clone();
-                let fallback = Arc::clone(&backend);
                 let output = Arc::clone(&output);
                 calls.spawn(async move {
-                    let response = dispatch(&connection, fallback, &method, params).await;
+                    let response = dispatch(&connection, &method, params).await;
                     let _ = emit(
                         &output,
                         &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
@@ -106,12 +104,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch(
-    connection: &Option<zbus::Connection>,
-    fallback: Arc<dyn BluetoothBackend>,
-    method: &str,
-    params: Value,
-) -> Value {
+async fn dispatch(connection: &Option<zbus::Connection>, method: &str, params: Value) -> Value {
     if let Some(connection) = connection
         && let Ok(proxy) = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE).await
     {
@@ -124,7 +117,10 @@ async fn dispatch(
             return value;
         }
     }
-    api::dispatch(fallback, method, params).await
+    api::error(
+        "daemon-unavailable",
+        "bt-daemon session service is unavailable".to_string(),
+    )
 }
 
 async fn call_subscribe(

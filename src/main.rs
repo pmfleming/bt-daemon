@@ -20,7 +20,7 @@ struct Cli {
 enum Command {
     /// Run the session D-Bus service.
     Daemon,
-    /// Run a frontend-owned JSON Lines session directly against BlueZ.
+    /// Bridge a frontend-owned JSON Lines session through the D-Bus daemon.
     Client,
     /// Verify BlueZ access and print the current bt-api snapshot.
     ProbeBluez,
@@ -57,17 +57,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let bluez = Arc::new(BluezBackend::new().await?);
-    bluez.start_monitoring();
-    let backend: Arc<dyn BluetoothBackend> = bluez.clone();
     match cli.command {
         Command::Daemon => {
+            let bluez = Arc::new(BluezBackend::new().await?);
+            bluez.start_monitoring();
+            let backend: Arc<dyn BluetoothBackend> = bluez.clone();
             let pairing = PairingBroker::new(bluez.identity_registry());
             let _agent = bluez.register_agent(pairing.agent()).await?;
             daemon::run(backend, pairing).await
         }
-        Command::Client => client::run(backend).await,
+        Command::Client => client::run().await,
         Command::ProbeBluez => {
+            let bluez = Arc::new(BluezBackend::new().await?);
+            bluez.start_monitoring();
+            let backend: Arc<dyn BluetoothBackend> = bluez;
             println!(
                 "{}",
                 serde_json::to_string_pretty(

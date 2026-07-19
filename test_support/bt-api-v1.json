@@ -130,7 +130,19 @@
       {
         "name": "bluetooth.scan",
         "params_example": {
-          "enabled": true
+          "adapter_key": "adapter-opaque",
+          "enabled": true,
+          "timeout_ms": 15000
+        },
+        "response_key": "scan",
+        "stream": "bluetooth.scan"
+      },
+      {
+        "name": "bluetooth.adapter.operation",
+        "params_example": {
+          "discoverable": true,
+          "key": "adapter-opaque",
+          "operation": "set-discoverable"
         },
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
@@ -223,6 +235,15 @@
       },
       {
         "events": [
+          "started",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "name": "bluetooth.scan"
+      },
+      {
+        "events": [
           "authorization-requested",
           "queued",
           "progress",
@@ -243,29 +264,57 @@
     ],
     "version": 1
   },
+  "scan_event": {
+    "data": {
+      "adapter_key": "adapter-opaque",
+      "event": "started",
+      "request_id": "scan-1",
+      "state": "running",
+      "timeout_ms": 15000
+    },
+    "event": "started",
+    "protocol": "bt-api",
+    "stream": "bluetooth.scan",
+    "subscription_id": "subscription-1",
+    "version": 1
+  },
   "snapshot": {
     "data": {
       "snapshot": {
         "adapters": [
           {
+            "address": "00:11:22:33:44:55",
+            "address_type": "public",
             "alias": "computer",
+            "discoverable": false,
+            "discoverable_timeout": 180,
             "discovering": false,
             "key": "adapter-opaque",
+            "modalias": null,
             "name": "hci0",
             "pairable": true,
+            "pairable_timeout": 0,
             "powered": true
           }
         ],
         "devices": [
           {
             "adapter_key": "adapter-opaque",
+            "address": "AA:BB:CC:DD:EE:FF",
+            "address_type": "public",
+            "alias": "Headphones",
             "battery": [
               {
                 "component": "main",
-                "percentage": 80
+                "confidence": "standard",
+                "id": "aggregate",
+                "label": "Battery",
+                "percentage": 80,
+                "source": "bluez"
               }
             ],
             "blocked": false,
+            "bonded": true,
             "capabilities": {
               "can_block": true,
               "can_connect": true,
@@ -273,17 +322,37 @@
               "can_pair": false,
               "can_remove": true,
               "can_rename": true,
+              "can_send_file": true,
               "can_trust": true,
-              "can_wake": false
+              "can_wake": false,
+              "unsupported_reasons": {
+                "disconnect": "Device is not connected",
+                "pair": "Device is already paired",
+                "wake": "BlueZ does not expose wake control for this device"
+              }
             },
             "connected": false,
             "icon": "audio-headset",
             "key": "device-opaque",
+            "last_seen_ms": null,
+            "legacy_pairing": false,
+            "modalias": null,
             "name": "Headphones",
             "paired": true,
             "present": false,
+            "rssi": null,
+            "services": [
+              {
+                "label": "Audio Sink",
+                "uuid": "0000110b-0000-1000-8000-00805f9b34fb"
+              }
+            ],
+            "services_resolved": true,
             "signal_strength": null,
             "trusted": true,
+            "uuids": [
+              "0000110b-0000-1000-8000-00805f9b34fb"
+            ],
             "wake_allowed": null
           }
         ]
