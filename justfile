@@ -17,7 +17,7 @@ test:
 check: fmt-check lint test
 
 probe:
-    cargo run -- --probe-bluez
+    cargo run -- probe-bluez
 
 nix-check:
     nix flake check --show-trace

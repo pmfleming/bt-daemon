@@ -1,0 +1,14 @@
+[Unit]
+Description=Shelllist Bluetooth user service
+Documentation=https://github.com/pmfleming/bt-daemon
+After=graphical-session.target bluetooth.target
+
+[Service]
+Type=dbus
+BusName=org.laufan.BluetoothDaemon
+ExecStart=@out@/bin/bt-daemon daemon
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

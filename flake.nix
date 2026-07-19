@@ -19,8 +19,17 @@
             nativeBuildInputs = with pkgs; [ pkg-config ];
             buildInputs = with pkgs; [ dbus ];
             strictDeps = true;
+            postInstall = ''
+              install -Dm644 ${./packaging/systemd/bt-daemon.service} $out/share/systemd/user/bt-daemon.service
+              install -Dm644 ${./packaging/dbus/org.laufan.BluetoothDaemon.service} \
+                $out/share/dbus-1/services/org.laufan.BluetoothDaemon.service
+              substituteInPlace \
+                $out/share/systemd/user/bt-daemon.service \
+                $out/share/dbus-1/services/org.laufan.BluetoothDaemon.service \
+                --replace-fail @out@ $out
+            '';
             meta = {
-              description = "Bluetooth policy and API daemon for Shelllist";
+              description = "BlueZ policy and bt-api daemon for Shelllist";
               mainProgram = "bt-daemon";
               platforms = pkgs.lib.platforms.linux;
             };

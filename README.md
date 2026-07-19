@@ -21,7 +21,7 @@ just check
 nix flake check
 ```
 
-Verify access to the running BlueZ service and list adapters:
+Verify access to BlueZ and print the current adapter/device snapshot:
 
 ```sh
 just probe
@@ -31,9 +31,9 @@ Build or run through Nix:
 
 ```sh
 nix build
-nix run -- --probe-bluez
+nix run -- probe-bluez
 ```
 
 ## Current status
 
-This is the Phase 0 environment and BlueZ connectivity probe. The versioned `bt-api`, pairing agent, operation state machines, cache, and Shelllist integration are not implemented yet.
+The first `bt-api` v1 slice provides adapter/device snapshots, adapter power and discovery control, and pair/connect/disconnect/trust/block/wake/rename/remove operations. `bt-daemon client` exposes newline-delimited JSON for Shelllist, while `bt-daemon daemon` exports the initial session D-Bus endpoint. Pairing prompts, operation events/cancellation, durable private-address identity, audio profiles, and OBEX remain staged work.

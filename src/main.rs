@@ -1,14 +1,26 @@
+use std::sync::Arc;
+
 use anyhow::Result;
-use clap::Parser;
-use tracing::info;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+
+use bt_daemon::{api, backend::BluetoothBackend, bluez::BluezBackend, client, daemon};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Verify that a BlueZ session can be opened, then exit.
-    #[arg(long)]
-    probe_bluez: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run the session D-Bus service.
+    Daemon,
+    /// Run a frontend-owned JSON Lines session directly against BlueZ.
+    Client,
+    /// Verify BlueZ access and print the current bt-api snapshot.
+    ProbeBluez,
 }
 
 #[tokio::main]
@@ -18,18 +30,19 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("bt_daemon=info")),
         )
         .init();
-
     let cli = Cli::parse();
-    if cli.probe_bluez {
-        let session = bluer::Session::new().await?;
-        let adapters = session.adapter_names().await?;
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({ "adapters": adapters }))?
-        );
-        return Ok(());
+    let backend: Arc<dyn BluetoothBackend> = Arc::new(BluezBackend::new().await?);
+    match cli.command {
+        Command::Daemon => daemon::run(backend).await,
+        Command::Client => client::run(backend).await,
+        Command::ProbeBluez => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &api::dispatch(backend, "bluetooth.snapshot", serde_json::json!({})).await
+                )?
+            );
+            Ok(())
+        }
     }
-
-    info!("bt-daemon development environment is ready");
-    Ok(())
 }

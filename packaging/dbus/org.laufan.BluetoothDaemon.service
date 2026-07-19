@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.laufan.BluetoothDaemon
+Exec=@out@/bin/bt-daemon daemon
+SystemdService=bt-daemon.service
