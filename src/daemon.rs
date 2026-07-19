@@ -28,6 +28,7 @@ pub const INTERFACE: &str = "org.laufan.BluetoothDaemon1";
 pub const CHANGED_STREAM: &str = "bluetooth.changed";
 pub const PAIRING_STREAM: &str = "pairing.request";
 pub const OPERATION_STREAM: &str = "bluetooth.operation";
+pub const AUDIO_STREAM: &str = "bluetooth.audio.changed";
 
 #[derive(Clone, Serialize)]
 struct OperationEvent {
@@ -54,6 +55,7 @@ pub struct BluetoothDaemon {
     subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
     operation_events: broadcast::Sender<OperationEvent>,
+    audio_events: broadcast::Sender<()>,
 }
 
 impl BluetoothDaemon {
@@ -100,13 +102,13 @@ impl BluetoothDaemon {
             );
         };
         match tokio::task::spawn_blocking(move || audio::set_profile(&address, index)).await {
-            Ok(Ok(())) => self.audio_snapshot().await,
+            Ok(Ok(())) => Self::audio_snapshot_for(Arc::clone(&self.pairing)).await,
             Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
             Err(error) => api::error("audio-operation-failed", error.to_string()),
         }
     }
 
-    async fn audio_snapshot(&self) -> Value {
+    async fn audio_snapshot_for(pairing: Arc<PairingBroker>) -> Value {
         let devices = match tokio::task::spawn_blocking(audio::probe).await {
             Ok(Ok(devices)) => devices,
             Ok(Err(error)) => return api::error("audio-unavailable", format!("{error:#}")),
@@ -119,7 +121,7 @@ impl BluetoothDaemon {
                 if device.adapter.is_empty() {
                     return None;
                 }
-                let device_key = self.pairing.device_key(&device.adapter, address);
+                let device_key = pairing.device_key(&device.adapter, address);
                 let active_profile_key = device
                     .active_profile
                     .and_then(|active| {
@@ -143,10 +145,21 @@ impl BluetoothDaemon {
                         })
                     })
                     .collect::<Vec<_>>();
+                let endpoint = |value: Option<audio::AudioEndpoint>| {
+                    value.map(|endpoint| {
+                        json!({
+                            "ready": !matches!(endpoint.state.as_str(), "creating" | "error"),
+                            "state": endpoint.state,
+                            "is_default": endpoint.is_default,
+                        })
+                    })
+                };
                 Some(json!({
                     "device_key": device_key,
                     "active_profile_key": active_profile_key,
                     "profiles": profiles,
+                    "sink": endpoint(device.sink),
+                    "source": endpoint(device.source),
                 }))
             })
             .collect::<Vec<_>>();
@@ -255,7 +268,9 @@ impl BluetoothDaemon {
     async fn call(&self, method: &str, params_json: &str) -> String {
         let params = serde_json::from_str::<Value>(params_json).unwrap_or(Value::Null);
         if method == "bluetooth.audio.snapshot" {
-            return self.audio_snapshot().await.to_string();
+            return Self::audio_snapshot_for(Arc::clone(&self.pairing))
+                .await
+                .to_string();
         }
         if method == "bluetooth.audio.setProfile" {
             return self.set_audio_profile(&params).await.to_string();
@@ -283,12 +298,15 @@ impl BluetoothDaemon {
     ) -> String {
         if streams.is_empty()
             || streams.iter().any(|stream| {
-                stream != CHANGED_STREAM && stream != PAIRING_STREAM && stream != OPERATION_STREAM
+                stream != CHANGED_STREAM
+                    && stream != PAIRING_STREAM
+                    && stream != OPERATION_STREAM
+                    && stream != AUDIO_STREAM
             })
         {
             return api::error(
                 "unsupported-stream",
-                "Subscriptions require bluetooth.changed, pairing.request, and/or bluetooth.operation"
+                "Subscriptions require bluetooth.changed, pairing.request, bluetooth.operation, and/or bluetooth.audio.changed"
                     .to_string(),
             )
             .to_string();
@@ -296,16 +314,22 @@ impl BluetoothDaemon {
         let wants_changes = streams.iter().any(|stream| stream == CHANGED_STREAM);
         let wants_pairing = streams.iter().any(|stream| stream == PAIRING_STREAM);
         let wants_operations = streams.iter().any(|stream| stream == OPERATION_STREAM);
+        let wants_audio = streams.iter().any(|stream| stream == AUDIO_STREAM);
         let id = self.next_id("subscription");
         let mut changes = self.backend.subscribe_changes();
         let mut pairing_events = self.pairing.subscribe();
         let mut operation_events = self.operation_events.subscribe();
+        let mut audio_events = self.audio_events.subscribe();
         let backend = Arc::clone(&self.backend);
+        let pairing = Arc::clone(&self.pairing);
         let signal_emitter = emitter.to_owned();
         let subscription_id = id.clone();
         let task = tokio::spawn(async move {
             if wants_changes {
                 emit_snapshot(&signal_emitter, &backend, &subscription_id, "subscribed").await;
+            }
+            if wants_audio {
+                emit_audio(&signal_emitter, &pairing, &subscription_id, "subscribed").await;
             }
             loop {
                 tokio::select! {
@@ -325,6 +349,14 @@ impl BluetoothDaemon {
                     result = operation_events.recv(), if wants_operations => match result {
                         Ok(event) => emit_operation(&signal_emitter, &subscription_id, event).await,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    result = audio_events.recv(), if wants_audio => match result {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            while audio_events.try_recv().is_ok() {}
+                            emit_audio(&signal_emitter, &pairing, &subscription_id, "changed").await;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -390,6 +422,37 @@ async fn emit_snapshot(
     }
 }
 
+async fn emit_audio(
+    emitter: &SignalEmitter<'_>,
+    pairing: &Arc<PairingBroker>,
+    subscription_id: &str,
+    event: &str,
+) {
+    let envelope = BluetoothDaemon::audio_snapshot_for(Arc::clone(pairing)).await;
+    let value = if envelope["ok"].as_bool().unwrap_or(false) {
+        json!({
+            "protocol": api::PROTOCOL,
+            "version": api::VERSION,
+            "stream": AUDIO_STREAM,
+            "event": event,
+            "subscription_id": subscription_id,
+            "data": { "audio_devices": envelope["data"]["audio_devices"].clone() }
+        })
+    } else {
+        json!({
+            "protocol": api::PROTOCOL,
+            "version": api::VERSION,
+            "stream": AUDIO_STREAM,
+            "event": "unavailable",
+            "subscription_id": subscription_id,
+            "error": envelope["error"].clone()
+        })
+    };
+    if let Err(error) = BluetoothDaemon::event(emitter, AUDIO_STREAM, &value.to_string()).await {
+        tracing::debug!(%error, "could not emit Bluetooth audio event");
+    }
+}
+
 async fn emit_operation(emitter: &SignalEmitter<'_>, subscription_id: &str, event: OperationEvent) {
     let value = json!({
         "protocol": api::PROTOCOL,
@@ -421,6 +484,20 @@ async fn emit_pairing(emitter: &SignalEmitter<'_>, subscription_id: &str, event:
 
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
     let (operation_events, _) = broadcast::channel(32);
+    let (audio_events, _) = broadcast::channel(32);
+    let monitor_events = audio_events.clone();
+    std::thread::spawn(move || {
+        loop {
+            let events = monitor_events.clone();
+            let notify = Arc::new(move || {
+                let _ = events.send(());
+            });
+            if let Err(error) = audio::monitor(notify) {
+                tracing::warn!(%error, "PipeWire audio monitor is retrying");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
     let _connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
@@ -434,6 +511,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
                 operations: Arc::new(Mutex::new(HashMap::new())),
                 operation_events,
+                audio_events,
             },
         )
         .context("export bt-daemon D-Bus interface")?
@@ -531,6 +609,7 @@ mod tests {
 
     fn daemon(complete: bool) -> (BluetoothDaemon, broadcast::Receiver<OperationEvent>) {
         let (operation_events, receiver) = broadcast::channel(8);
+        let (audio_events, _) = broadcast::channel(8);
         (
             BluetoothDaemon {
                 backend: Arc::new(TestBackend { complete }),
@@ -539,6 +618,7 @@ mod tests {
                 subscriptions: Arc::new(Mutex::new(Default::default())),
                 operations: Arc::new(Mutex::new(Default::default())),
                 operation_events,
+                audio_events,
             },
             receiver,
         )

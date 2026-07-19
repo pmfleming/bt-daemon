@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Cursor,
     rc::Rc,
     sync::Once,
@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use pipewire as pw;
 use pw::{
     device::Device,
+    metadata::Metadata,
+    node::{Node, NodeState},
     proxy::{Listener, ProxyT},
     types::ObjectType,
 };
@@ -25,6 +27,15 @@ pub struct AudioDevice {
     pub name: String,
     pub active_profile: Option<u32>,
     pub profiles: Vec<AudioProfile>,
+    pub sink: Option<AudioEndpoint>,
+    pub source: Option<AudioEndpoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioEndpoint {
+    pub name: String,
+    pub state: String,
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,9 +55,119 @@ struct Objects {
     listeners: Vec<Box<dyn Listener>>,
 }
 
+#[derive(Default)]
+struct Defaults {
+    sink: String,
+    source: String,
+}
+
+#[derive(Default)]
+struct DeviceEndpoints {
+    sink: Option<AudioEndpoint>,
+    source: Option<AudioEndpoint>,
+}
+
 fn initialize() {
     static INITIALIZE: Once = Once::new();
     INITIALIZE.call_once(pw::init);
+}
+
+pub fn monitor(on_change: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<()> {
+    initialize();
+    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire monitor loop")?;
+    let context =
+        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire monitor context")?;
+    let core = context
+        .connect_rc(None)
+        .context("connect PipeWire monitor")?;
+    let registry = core
+        .get_registry_rc()
+        .context("open PipeWire monitor registry")?;
+    let registry_weak = registry.downgrade();
+    let objects = Rc::new(RefCell::new(Objects::default()));
+    let objects_for_registry = Rc::clone(&objects);
+    let relevant_ids = Rc::new(RefCell::new(HashSet::new()));
+    let relevant_for_global = Rc::clone(&relevant_ids);
+    let relevant_for_remove = Rc::clone(&relevant_ids);
+    let changes_for_global = std::sync::Arc::clone(&on_change);
+    let changes_for_remove = std::sync::Arc::clone(&on_change);
+    let _listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            let relevant = match global.type_ {
+                ObjectType::Device => global
+                    .props
+                    .is_some_and(|properties| properties.get("device.api") == Some("bluez5")),
+                ObjectType::Node => global.props.is_some_and(|properties| {
+                    properties.get("device.api") == Some("bluez5")
+                        || properties
+                            .get("node.name")
+                            .is_some_and(|name| name.starts_with("bluez_"))
+                }),
+                ObjectType::Metadata => global
+                    .props
+                    .is_some_and(|properties| properties.get("metadata.name") == Some("default")),
+                _ => false,
+            };
+            if !relevant {
+                return;
+            }
+            relevant_for_global.borrow_mut().insert(global.id);
+            changes_for_global();
+            let Some(registry) = registry_weak.upgrade() else {
+                return;
+            };
+            let event = std::sync::Arc::clone(&changes_for_global);
+            let value: Option<(Box<dyn ProxyT>, Box<dyn Listener>)> = match global.type_ {
+                ObjectType::Device => registry.bind::<Device, _>(global).ok().map(|device| {
+                    let info_event = std::sync::Arc::clone(&event);
+                    let param_event = std::sync::Arc::clone(&event);
+                    let listener = device
+                        .add_listener_local()
+                        .info(move |_| info_event())
+                        .param(move |_, _, _, _, _| param_event())
+                        .register();
+                    (
+                        Box::new(device) as Box<dyn ProxyT>,
+                        Box::new(listener) as Box<dyn Listener>,
+                    )
+                }),
+                ObjectType::Node => registry.bind::<Node, _>(global).ok().map(|node| {
+                    let listener = node.add_listener_local().info(move |_| event()).register();
+                    (
+                        Box::new(node) as Box<dyn ProxyT>,
+                        Box::new(listener) as Box<dyn Listener>,
+                    )
+                }),
+                ObjectType::Metadata => registry.bind::<Metadata, _>(global).ok().map(|metadata| {
+                    let listener = metadata
+                        .add_listener_local()
+                        .property(move |_, _, _, _| {
+                            event();
+                            0
+                        })
+                        .register();
+                    (
+                        Box::new(metadata) as Box<dyn ProxyT>,
+                        Box::new(listener) as Box<dyn Listener>,
+                    )
+                }),
+                _ => None,
+            };
+            if let Some((proxy, listener)) = value {
+                let mut objects = objects_for_registry.borrow_mut();
+                objects.proxies.push(proxy);
+                objects.listeners.push(listener);
+            }
+        })
+        .global_remove(move |id| {
+            if relevant_for_remove.borrow_mut().remove(&id) {
+                changes_for_remove();
+            }
+        })
+        .register();
+    main_loop.run();
+    anyhow::bail!("PipeWire monitor loop ended")
 }
 
 pub fn probe() -> Result<Vec<AudioDevice>> {
@@ -131,99 +252,166 @@ fn probe_inner() -> Result<Vec<AudioDevice>> {
     let core = context.connect_rc(None).context("connect to PipeWire")?;
     let registry = core.get_registry_rc().context("open PipeWire registry")?;
     let devices = Rc::new(RefCell::new(HashMap::<u32, AudioDevice>::new()));
+    let endpoints = Rc::new(RefCell::new(HashMap::<u32, DeviceEndpoints>::new()));
+    let defaults = Rc::new(RefCell::new(Defaults::default()));
     let objects = Rc::new(RefCell::new(Objects::default()));
     let registry_weak = registry.downgrade();
     let devices_for_registry = Rc::clone(&devices);
+    let endpoints_for_registry = Rc::clone(&endpoints);
+    let defaults_for_registry = Rc::clone(&defaults);
     let objects_for_registry = Rc::clone(&objects);
 
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
-            if global.type_ != ObjectType::Device {
-                return;
-            }
             let Some(properties) = global.props else {
                 return;
             };
-            if properties.get("device.api") != Some("bluez5") {
-                return;
-            }
             let Some(registry) = registry_weak.upgrade() else {
                 return;
             };
-            let Ok(device) = registry.bind::<Device, _>(global) else {
-                return;
-            };
-            devices_for_registry.borrow_mut().insert(
-                global.id,
-                AudioDevice {
-                    pipewire_id: global.id,
-                    address: properties
-                        .get("api.bluez5.address")
-                        .unwrap_or_default()
-                        .to_string(),
-                    adapter: String::new(),
-                    name: properties
-                        .get("device.description")
-                        .or_else(|| properties.get("device.alias"))
-                        .unwrap_or("Bluetooth audio device")
-                        .to_string(),
-                    active_profile: None,
-                    profiles: Vec::new(),
-                },
-            );
-            let devices_for_info = Rc::clone(&devices_for_registry);
-            let devices_for_params = Rc::clone(&devices_for_registry);
-            let device_id = global.id;
-            let listener = device
-                .add_listener_local()
-                .info(move |info| {
-                    let Some(properties) = info.props() else {
-                        return;
-                    };
-                    let mut devices = devices_for_info.borrow_mut();
-                    let Some(audio_device) = devices.get_mut(&device_id) else {
-                        return;
-                    };
-                    if let Some(address) = properties.get("api.bluez5.address") {
-                        audio_device.address = address.to_string();
-                    }
-                    if let Some(path) = properties.get("api.bluez5.path") {
-                        audio_device.adapter = adapter_from_bluez_path(path).unwrap_or_default();
-                    }
-                    if let Some(name) = properties
-                        .get("device.description")
-                        .or_else(|| properties.get("device.alias"))
-                    {
-                        audio_device.name = name.to_string();
-                    }
-                })
-                .param(move |_sequence, parameter, _index, _next, pod| {
-                    let Some(pod) = pod else { return };
-                    let Some(profile) = parse_profile(pod) else {
-                        return;
-                    };
-                    let mut devices = devices_for_params.borrow_mut();
-                    let Some(audio_device) = devices.get_mut(&device_id) else {
-                        return;
-                    };
-                    if parameter == pw::spa::param::ParamType::Profile {
-                        audio_device.active_profile = Some(profile.index);
-                    } else if parameter == pw::spa::param::ParamType::EnumProfile
-                        && !audio_device
-                            .profiles
-                            .iter()
-                            .any(|item| item.index == profile.index)
-                    {
-                        audio_device.profiles.push(profile);
-                    }
-                })
-                .register();
-            device.enum_params(1, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
-            device.enum_params(2, Some(pw::spa::param::ParamType::Profile), 0, 1);
-            let mut objects = objects_for_registry.borrow_mut();
-            objects.proxies.push(Box::new(device));
-            objects.listeners.push(Box::new(listener));
+            if global.type_ == ObjectType::Device && properties.get("device.api") == Some("bluez5")
+            {
+                let Ok(device) = registry.bind::<Device, _>(global) else {
+                    return;
+                };
+                devices_for_registry.borrow_mut().insert(
+                    global.id,
+                    AudioDevice {
+                        pipewire_id: global.id,
+                        address: properties
+                            .get("api.bluez5.address")
+                            .unwrap_or_default()
+                            .to_string(),
+                        adapter: String::new(),
+                        name: properties
+                            .get("device.description")
+                            .or_else(|| properties.get("device.alias"))
+                            .unwrap_or("Bluetooth audio device")
+                            .to_string(),
+                        active_profile: None,
+                        profiles: Vec::new(),
+                        sink: None,
+                        source: None,
+                    },
+                );
+                let devices_for_info = Rc::clone(&devices_for_registry);
+                let devices_for_params = Rc::clone(&devices_for_registry);
+                let device_id = global.id;
+                let listener = device
+                    .add_listener_local()
+                    .info(move |info| {
+                        let Some(properties) = info.props() else {
+                            return;
+                        };
+                        let mut devices = devices_for_info.borrow_mut();
+                        let Some(audio_device) = devices.get_mut(&device_id) else {
+                            return;
+                        };
+                        if let Some(address) = properties.get("api.bluez5.address") {
+                            audio_device.address = address.to_string();
+                        }
+                        if let Some(path) = properties.get("api.bluez5.path") {
+                            audio_device.adapter =
+                                adapter_from_bluez_path(path).unwrap_or_default();
+                        }
+                        if let Some(name) = properties
+                            .get("device.description")
+                            .or_else(|| properties.get("device.alias"))
+                        {
+                            audio_device.name = name.to_string();
+                        }
+                    })
+                    .param(move |_sequence, parameter, _index, _next, pod| {
+                        let Some(profile) = pod.and_then(parse_profile) else {
+                            return;
+                        };
+                        let mut devices = devices_for_params.borrow_mut();
+                        let Some(audio_device) = devices.get_mut(&device_id) else {
+                            return;
+                        };
+                        if parameter == pw::spa::param::ParamType::Profile {
+                            audio_device.active_profile = Some(profile.index);
+                        } else if parameter == pw::spa::param::ParamType::EnumProfile
+                            && !audio_device
+                                .profiles
+                                .iter()
+                                .any(|item| item.index == profile.index)
+                        {
+                            audio_device.profiles.push(profile);
+                        }
+                    })
+                    .register();
+                device.enum_params(1, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
+                device.enum_params(2, Some(pw::spa::param::ParamType::Profile), 0, 1);
+                let mut objects = objects_for_registry.borrow_mut();
+                objects.proxies.push(Box::new(device));
+                objects.listeners.push(Box::new(listener));
+            } else if global.type_ == ObjectType::Node {
+                let Some(device_id) = properties
+                    .get("device.id")
+                    .and_then(|value| value.parse::<u32>().ok())
+                else {
+                    return;
+                };
+                let Some(kind) = endpoint_kind(properties.get("media.class")) else {
+                    return;
+                };
+                let name = properties.get("node.name").unwrap_or_default().to_string();
+                set_endpoint(
+                    &mut endpoints_for_registry.borrow_mut(),
+                    device_id,
+                    kind,
+                    AudioEndpoint {
+                        name,
+                        state: "creating".to_string(),
+                        is_default: false,
+                    },
+                );
+                let Ok(node) = registry.bind::<Node, _>(global) else {
+                    return;
+                };
+                let endpoints_for_info = Rc::clone(&endpoints_for_registry);
+                let listener = node
+                    .add_listener_local()
+                    .info(move |info| {
+                        let mut endpoints = endpoints_for_info.borrow_mut();
+                        let Some(endpoint) = endpoint_mut(&mut endpoints, device_id, kind) else {
+                            return;
+                        };
+                        endpoint.state = node_state(info.state()).to_string();
+                    })
+                    .register();
+                let mut objects = objects_for_registry.borrow_mut();
+                objects.proxies.push(Box::new(node));
+                objects.listeners.push(Box::new(listener));
+            } else if global.type_ == ObjectType::Metadata
+                && properties.get("metadata.name") == Some("default")
+            {
+                let Ok(metadata) = registry.bind::<Metadata, _>(global) else {
+                    return;
+                };
+                let defaults_for_events = Rc::clone(&defaults_for_registry);
+                let listener = metadata
+                    .add_listener_local()
+                    .property(move |_subject, key, _type, value| {
+                        let Some(key) = key else { return 0 };
+                        let Some(value) = value.and_then(default_node_name) else {
+                            return 0;
+                        };
+                        let mut defaults = defaults_for_events.borrow_mut();
+                        if key == "default.audio.sink" {
+                            defaults.sink = value;
+                        } else if key == "default.audio.source" {
+                            defaults.source = value;
+                        }
+                        0
+                    })
+                    .register();
+                let mut objects = objects_for_registry.borrow_mut();
+                objects.proxies.push(Box::new(metadata));
+                objects.listeners.push(Box::new(listener));
+            }
         })
         .register();
 
@@ -237,12 +425,81 @@ fn probe_inner() -> Result<Vec<AudioDevice>> {
         .context("arm PipeWire probe timer")?;
     main_loop.run();
 
+    let defaults = defaults.borrow();
+    let endpoints = endpoints.borrow();
     let mut result = devices.borrow().values().cloned().collect::<Vec<_>>();
     for device in &mut result {
         device.profiles.sort_by_key(|profile| -profile.priority);
+        if let Some(device_endpoints) = endpoints.get(&device.pipewire_id) {
+            device.sink = device_endpoints.sink.clone();
+            device.source = device_endpoints.source.clone();
+        }
+        if let Some(sink) = &mut device.sink {
+            sink.is_default = sink.name == defaults.sink;
+        }
+        if let Some(source) = &mut device.source {
+            source.is_default = source.name == defaults.source;
+        }
     }
     result.sort_by_key(|device| device.name.to_lowercase());
     Ok(result)
+}
+
+#[derive(Clone, Copy)]
+enum EndpointKind {
+    Sink,
+    Source,
+}
+
+fn endpoint_kind(media_class: Option<&str>) -> Option<EndpointKind> {
+    match media_class {
+        Some("Audio/Sink") => Some(EndpointKind::Sink),
+        Some("Audio/Source") => Some(EndpointKind::Source),
+        _ => None,
+    }
+}
+
+fn set_endpoint(
+    endpoints: &mut HashMap<u32, DeviceEndpoints>,
+    device_id: u32,
+    kind: EndpointKind,
+    endpoint: AudioEndpoint,
+) {
+    let device = endpoints.entry(device_id).or_default();
+    match kind {
+        EndpointKind::Sink => device.sink = Some(endpoint),
+        EndpointKind::Source => device.source = Some(endpoint),
+    }
+}
+
+fn endpoint_mut(
+    endpoints: &mut HashMap<u32, DeviceEndpoints>,
+    device_id: u32,
+    kind: EndpointKind,
+) -> Option<&mut AudioEndpoint> {
+    let device = endpoints.get_mut(&device_id)?;
+    match kind {
+        EndpointKind::Sink => device.sink.as_mut(),
+        EndpointKind::Source => device.source.as_mut(),
+    }
+}
+
+fn node_state(state: NodeState<'_>) -> &'static str {
+    match state {
+        NodeState::Error(_) => "error",
+        NodeState::Creating => "creating",
+        NodeState::Suspended => "suspended",
+        NodeState::Idle => "idle",
+        NodeState::Running => "running",
+    }
+}
+
+fn default_node_name(value: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn profile_key(device_key: &str, profile_name: &str) -> String {
@@ -323,7 +580,10 @@ fn profile_codec(description: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{adapter_from_bluez_path, profile_codec, profile_key, profile_mode};
+    use super::{
+        adapter_from_bluez_path, default_node_name, endpoint_kind, node_state, profile_codec,
+        profile_key, profile_mode,
+    };
 
     #[test]
     fn classifies_bluetooth_audio_profiles() {
@@ -341,5 +601,11 @@ mod tests {
         let key = profile_key("device-opaque", "a2dp-sink");
         assert!(key.starts_with("audio-profile-"));
         assert!(!key.contains("a2dp"));
+        assert!(endpoint_kind(Some("Audio/Sink")).is_some());
+        assert_eq!(node_state(pipewire::node::NodeState::Idle), "idle");
+        assert_eq!(
+            default_node_name(r#"{"name":"bluez_output.opaque"}"#).as_deref(),
+            Some("bluez_output.opaque")
+        );
     }
 }

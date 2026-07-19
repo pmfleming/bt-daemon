@@ -50,6 +50,10 @@ pub const STREAMS: &[(&str, &[&str])] = &[
         "bluetooth.operation",
         &["started", "completed", "failed", "cancelled"],
     ),
+    (
+        "bluetooth.audio.changed",
+        &["subscribed", "changed", "unavailable"],
+    ),
 ];
 
 pub fn registry() -> Value {
@@ -123,6 +127,8 @@ pub fn contract_fixture() -> Value {
                 "audio_devices": [{
                     "device_key": "device-opaque",
                     "active_profile_key": "audio-profile-active",
+                    "sink": { "ready": true, "state": "idle", "is_default": true },
+                    "source": null,
                     "profiles": [{
                         "key": "audio-profile-active",
                         "label": "High Fidelity Playback (codec AAC)",

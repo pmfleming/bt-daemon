@@ -14,7 +14,13 @@
               "mode": "high-fidelity",
               "priority": 100
             }
-          ]
+          ],
+          "sink": {
+            "is_default": true,
+            "ready": true,
+            "state": "idle"
+          },
+          "source": null
         }
       ]
     },
@@ -139,6 +145,14 @@
           "cancelled"
         ],
         "name": "bluetooth.operation"
+      },
+      {
+        "events": [
+          "subscribed",
+          "changed",
+          "unavailable"
+        ],
+        "name": "bluetooth.audio.changed"
       }
     ],
     "version": 1
