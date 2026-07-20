@@ -31,7 +31,9 @@ Follow-up acceptance on the same machine:
 - Sony WF-1000XM5 connect/disconnect: **pass**.
 - Sony WF-1000XM5 pair and remove pairing: **pass**.
 - Sony WF-1000XM5 standard aggregate battery report: **pass**. BlueZ exposes one correct figure.
-- Sony WF-1000XM5 Fast Pair Message Stream component battery report: **pass**. The authenticated RFCOMM stream reported left `100%`, right `100%`, and case `78%`; the case value was not inferred from BlueZ's aggregate `100%`. BlueZ resolved the documented profile UUID to SDP channel 23 during this run.
+- Sony WF-1000XM5 Fast Pair RFCOMM Message Stream component battery report: **pass**. The authenticated stream reported left `100%`, right `100%`, and case `78%`; the case value was not inferred from BlueZ's aggregate `100%`. BlueZ resolved the documented profile UUID to SDP channel 23 during this run.
+- Pixel Buds Fast Pair RFCOMM Message Stream component battery report: **partial**. The device reported left `100%`, right `100%`, and case `unknown` as the standards-defined `0xFF`; the daemon correctly omitted the unknown case percentage.
+- Fast Pair BLE L2CAP Message Stream: **implementation complete; compatible hardware pending**. GATT PSM state/range parsing and the secure LE credit-based socket path are automated, but neither connected acceptance device selects the BLE-only transport because both expose the RFCOMM Message Stream UUID.
 - The alternate no-trust pairing policy, audio playback/profile readiness, component-update behavior as batteries discharge, and reconnect behavior remain to be checked separately.
 
 ## Interactive Rofi-replacement gate

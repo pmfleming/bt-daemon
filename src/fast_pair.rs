@@ -6,12 +6,16 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bluer::{
-    Address, Device, Session,
-    rfcomm::{Profile, ProfileHandle, ReqError, Role, Stream},
+    Address, AddressType, Device, Session,
+    l2cap::{
+        PSM_LE_DYN_START, PSM_LE_MAX, Security, SecurityLevel, Socket as L2capSocket,
+        SocketAddr as L2capSocketAddr, Stream as L2capStream,
+    },
+    rfcomm::{Profile, ProfileHandle, ReqError, Role},
 };
 use futures::StreamExt;
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt},
     sync::{Mutex, RwLock, broadcast},
 };
 use uuid::Uuid;
@@ -19,6 +23,8 @@ use uuid::Uuid;
 use crate::model::Battery;
 
 pub const MESSAGE_STREAM_UUID: &str = "df21fe2c-2515-4fdb-8886-f12c4d67927c";
+pub const FAST_PAIR_SERVICE_UUID: &str = "0000fe2c-0000-1000-8000-00805f9b34fb";
+pub const MESSAGE_STREAM_PSM_UUID: &str = "fe2c1239-8366-4814-8eb0-01de32100bea";
 const DEVICE_INFORMATION_GROUP: u8 = 0x03;
 const BATTERY_UPDATED_CODE: u8 = 0x03;
 const MAX_FRAME_PAYLOAD: usize = 4096;
@@ -89,6 +95,34 @@ fn decode_component(value: u8) -> Result<Option<ComponentReading>> {
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsmAvailability {
+    Unknown,
+    Ready(u16),
+    Unavailable,
+}
+
+fn decode_message_stream_psm(value: &[u8]) -> Result<PsmAvailability> {
+    if value.len() != 3 {
+        bail!(
+            "Fast Pair Message Stream PSM value has {} bytes instead of 3",
+            value.len()
+        );
+    }
+    match value[0] {
+        0x00 => Ok(PsmAvailability::Unknown),
+        0x01 => {
+            let psm = u16::from_le_bytes([value[1], value[2]]);
+            if !(PSM_LE_DYN_START..=PSM_LE_MAX).contains(&psm) {
+                bail!("Fast Pair Message Stream PSM is out of range: 0x{psm:04x}");
+            }
+            Ok(PsmAvailability::Ready(psm))
+        }
+        0x02 => Ok(PsmAvailability::Unavailable),
+        state => bail!("invalid Fast Pair Message Stream PSM state: 0x{state:02x}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Frame {
     group: u8,
@@ -130,6 +164,26 @@ impl FrameDecoder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageStreamTransport {
+    Rfcomm,
+    L2cap,
+}
+
+fn select_transport(
+    rfcomm_available: bool,
+    supports_rfcomm: bool,
+    supports_l2cap: bool,
+) -> Option<MessageStreamTransport> {
+    if rfcomm_available && supports_rfcomm {
+        Some(MessageStreamTransport::Rfcomm)
+    } else if supports_l2cap {
+        Some(MessageStreamTransport::L2cap)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkState {
     Connecting,
     Connected,
@@ -146,14 +200,22 @@ pub struct FastPairBatteryProvider {
     reports: RwLock<HashMap<Address, BatteryReport>>,
     connections: Mutex<ConnectionState>,
     changes: broadcast::Sender<()>,
-    uuid: Uuid,
+    message_stream_uuid: Uuid,
+    fast_pair_service_uuid: Uuid,
+    message_stream_psm_uuid: Uuid,
+    rfcomm_available: bool,
 }
 
 impl FastPairBatteryProvider {
     pub async fn start(session: Session, changes: broadcast::Sender<()>) -> Result<Arc<Self>> {
-        let uuid = Uuid::parse_str(MESSAGE_STREAM_UUID).expect("fixed Fast Pair UUID is valid");
+        let message_stream_uuid =
+            Uuid::parse_str(MESSAGE_STREAM_UUID).expect("fixed Fast Pair UUID is valid");
+        let fast_pair_service_uuid =
+            Uuid::parse_str(FAST_PAIR_SERVICE_UUID).expect("fixed Fast Pair service UUID is valid");
+        let message_stream_psm_uuid = Uuid::parse_str(MESSAGE_STREAM_PSM_UUID)
+            .expect("fixed Fast Pair PSM characteristic UUID is valid");
         let profile = Profile {
-            uuid,
+            uuid: message_stream_uuid,
             name: Some("Shelllist Fast Pair battery provider".to_string()),
             role: Some(Role::Client),
             require_authentication: Some(true),
@@ -161,18 +223,26 @@ impl FastPairBatteryProvider {
             auto_connect: Some(false),
             ..Default::default()
         };
-        let requests = session
-            .register_profile(profile)
-            .await
-            .context("register Fast Pair Message Stream profile")?;
+        let requests = match session.register_profile(profile).await {
+            Ok(requests) => Some(requests),
+            Err(error) => {
+                tracing::warn!(%error, "Fast Pair RFCOMM transport is unavailable; BLE L2CAP remains enabled");
+                None
+            }
+        };
         let provider = Arc::new(Self {
             session,
             reports: RwLock::new(HashMap::new()),
             connections: Mutex::new(ConnectionState::default()),
             changes,
-            uuid,
+            message_stream_uuid,
+            fast_pair_service_uuid,
+            message_stream_psm_uuid,
+            rfcomm_available: requests.is_some(),
         });
-        Self::spawn_request_handler(Arc::clone(&provider), requests);
+        if let Some(requests) = requests {
+            Self::spawn_request_handler(Arc::clone(&provider), requests);
+        }
         Self::spawn_reconciler(Arc::clone(&provider));
         Ok(provider)
     }
@@ -191,24 +261,14 @@ impl FastPairBatteryProvider {
         tokio::spawn(async move {
             while let Some(request) = requests.next().await {
                 let address = request.device();
-                let duplicate = {
-                    let mut state = provider.connections.lock().await;
-                    if state.links.get(&address) == Some(&LinkState::Connected) {
-                        true
-                    } else {
-                        state.links.insert(address, LinkState::Connected);
-                        state.retry_after.remove(&address);
-                        false
-                    }
-                };
-                if duplicate {
+                if !provider.mark_connected(address).await {
                     request.reject(ReqError::Rejected);
                     continue;
                 }
                 match request.accept() {
                     Ok(stream) => {
-                        tracing::debug!(%address, "Fast Pair Message Stream connected");
-                        Self::spawn_reader(Arc::clone(&provider), address, stream);
+                        tracing::debug!(%address, transport = "RFCOMM", "Fast Pair Message Stream connected");
+                        Self::spawn_reader(Arc::clone(&provider), address, "RFCOMM", stream);
                     }
                     Err(error) => {
                         tracing::warn!(%address, %error, "could not accept Fast Pair Message Stream");
@@ -220,7 +280,14 @@ impl FastPairBatteryProvider {
         });
     }
 
-    fn spawn_reader(provider: Arc<Self>, address: Address, mut stream: Stream) {
+    fn spawn_reader<R>(
+        provider: Arc<Self>,
+        address: Address,
+        transport: &'static str,
+        mut stream: R,
+    ) where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
         tokio::spawn(async move {
             let result = async {
                 let mut decoder = FrameDecoder::default();
@@ -246,9 +313,9 @@ impl FastPairBatteryProvider {
             }
             .await;
             if let Err(error) = result {
-                tracing::warn!(%address, error = %error, "Fast Pair battery stream ended with an error");
+                tracing::warn!(%address, %transport, error = %error, "Fast Pair battery stream ended with an error");
             } else {
-                tracing::debug!(%address, "Fast Pair battery stream closed");
+                tracing::debug!(%address, %transport, "Fast Pair battery stream closed");
             }
             provider.connection_ended(address).await;
         });
@@ -299,42 +366,38 @@ impl FastPairBatteryProvider {
                     self.remove_report(address).await;
                     continue;
                 }
-                let supports_fast_pair = device
-                    .uuids()
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|uuids| uuids.contains(&self.uuid));
-                if supports_fast_pair {
-                    self.ensure_connected(device).await;
+                let Some(uuids) = device.uuids().await.ok().flatten() else {
+                    continue;
+                };
+                match select_transport(
+                    self.rfcomm_available,
+                    uuids.contains(&self.message_stream_uuid),
+                    uuids.contains(&self.fast_pair_service_uuid),
+                ) {
+                    Some(MessageStreamTransport::Rfcomm) => {
+                        self.ensure_rfcomm_connected(device).await
+                    }
+                    Some(MessageStreamTransport::L2cap) => {
+                        self.ensure_l2cap_connected(device).await
+                    }
+                    None => {}
                 }
             }
         }
     }
 
-    async fn ensure_connected(self: &Arc<Self>, device: Device) {
+    async fn ensure_rfcomm_connected(self: &Arc<Self>, device: Device) {
         let address = device.address();
-        let should_connect = {
-            let mut state = self.connections.lock().await;
-            if state.links.contains_key(&address)
-                || state
-                    .retry_after
-                    .get(&address)
-                    .is_some_and(|retry| *retry > Instant::now())
-            {
-                false
-            } else {
-                state.links.insert(address, LinkState::Connecting);
-                true
-            }
-        };
-        if !should_connect {
+        if !self.begin_connection(address).await {
             return;
         }
         let provider = Arc::clone(self);
         tokio::spawn(async move {
-            let result =
-                tokio::time::timeout(CONNECT_TIMEOUT, device.connect_profile(&provider.uuid)).await;
+            let result = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                device.connect_profile(&provider.message_stream_uuid),
+            )
+            .await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -347,6 +410,140 @@ impl FastPairBatteryProvider {
                 }
             }
         });
+    }
+
+    async fn ensure_l2cap_connected(self: &Arc<Self>, device: Device) {
+        let address = device.address();
+        if !self.begin_connection(address).await {
+            return;
+        }
+        let provider = Arc::clone(self);
+        tokio::spawn(async move {
+            let result =
+                tokio::time::timeout(CONNECT_TIMEOUT, provider.connect_l2cap(&device)).await;
+            match result {
+                Ok(Ok(stream)) => {
+                    if provider.mark_connected(address).await {
+                        tracing::debug!(%address, transport = "BLE L2CAP", "Fast Pair Message Stream connected");
+                        Self::spawn_reader(Arc::clone(&provider), address, "BLE L2CAP", stream);
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(%address, %error, "Fast Pair BLE L2CAP connection failed");
+                    provider.connection_failed(address).await;
+                }
+                Err(_) => {
+                    tracing::debug!(%address, "Fast Pair BLE L2CAP connection timed out");
+                    provider.connection_failed(address).await;
+                }
+            }
+        });
+    }
+
+    async fn connect_l2cap(&self, device: &Device) -> Result<L2capStream> {
+        let psm = match self.read_message_stream_psm(device).await? {
+            PsmAvailability::Ready(psm) => psm,
+            PsmAvailability::Unknown => bail!("Fast Pair Message Stream PSM is not ready"),
+            PsmAvailability::Unavailable => {
+                bail!("Fast Pair Message Stream PSM is unavailable")
+            }
+        };
+        let address_type = device
+            .address_type()
+            .await
+            .context("read Fast Pair BLE address type")?;
+        if address_type == AddressType::BrEdr {
+            bail!("Fast Pair L2CAP requires a Bluetooth LE address");
+        }
+        let adapter = self
+            .session
+            .adapter(device.adapter_name())
+            .context("open Fast Pair BLE adapter")?;
+        let local_address = adapter
+            .address()
+            .await
+            .context("read Fast Pair BLE adapter address")?;
+        let socket = L2capSocket::<L2capStream>::new_stream()
+            .context("create Fast Pair BLE L2CAP socket")?;
+        socket
+            .set_security(Security {
+                level: SecurityLevel::Medium,
+                key_size: 0,
+            })
+            .context("secure Fast Pair BLE L2CAP socket")?;
+        socket
+            .bind(L2capSocketAddr::new(
+                local_address,
+                AddressType::LePublic,
+                0,
+            ))
+            .context("bind Fast Pair BLE L2CAP socket")?;
+        socket
+            .connect(L2capSocketAddr::new(device.address(), address_type, psm))
+            .await
+            .context("connect Fast Pair BLE L2CAP socket")
+    }
+
+    async fn read_message_stream_psm(&self, device: &Device) -> Result<PsmAvailability> {
+        for service in device
+            .services()
+            .await
+            .context("list Fast Pair GATT services")?
+        {
+            if service
+                .uuid()
+                .await
+                .context("read Fast Pair service UUID")?
+                != self.fast_pair_service_uuid
+            {
+                continue;
+            }
+            for characteristic in service
+                .characteristics()
+                .await
+                .context("list Fast Pair GATT characteristics")?
+            {
+                if characteristic
+                    .uuid()
+                    .await
+                    .context("read Fast Pair characteristic UUID")?
+                    == self.message_stream_psm_uuid
+                {
+                    let value = characteristic
+                        .read()
+                        .await
+                        .context("read Fast Pair Message Stream PSM")?;
+                    return decode_message_stream_psm(&value);
+                }
+            }
+        }
+        bail!("Fast Pair Message Stream PSM characteristic is unavailable")
+    }
+
+    async fn begin_connection(&self, address: Address) -> bool {
+        let mut state = self.connections.lock().await;
+        if state.links.contains_key(&address)
+            || state
+                .retry_after
+                .get(&address)
+                .is_some_and(|retry| *retry > Instant::now())
+        {
+            false
+        } else {
+            state.links.insert(address, LinkState::Connecting);
+            true
+        }
+    }
+
+    async fn mark_connected(&self, address: Address) -> bool {
+        let mut state = self.connections.lock().await;
+        if state.links.get(&address) == Some(&LinkState::Connected) {
+            false
+        } else {
+            state.links.insert(address, LinkState::Connected);
+            state.retry_after.remove(&address);
+            true
+        }
     }
 
     async fn update_report(&self, address: Address, report: BatteryReport) {
@@ -395,8 +592,45 @@ impl FastPairBatteryProvider {
 mod tests {
     use super::{
         BATTERY_UPDATED_CODE, BatteryReport, ComponentReading, DEVICE_INFORMATION_GROUP,
-        FrameDecoder, MAX_FRAME_PAYLOAD, decode_component,
+        FrameDecoder, MAX_FRAME_PAYLOAD, MessageStreamTransport, PsmAvailability, decode_component,
+        decode_message_stream_psm, select_transport,
     };
+
+    #[test]
+    fn transport_selection_prefers_rfcomm_and_supports_ble_only_devices() {
+        assert_eq!(
+            select_transport(true, true, true),
+            Some(MessageStreamTransport::Rfcomm)
+        );
+        assert_eq!(
+            select_transport(true, false, true),
+            Some(MessageStreamTransport::L2cap)
+        );
+        assert_eq!(
+            select_transport(false, true, true),
+            Some(MessageStreamTransport::L2cap)
+        );
+        assert_eq!(select_transport(true, false, false), None);
+    }
+
+    #[test]
+    fn psm_characteristic_decodes_state_and_little_endian_value() {
+        assert_eq!(
+            decode_message_stream_psm(&[0x01, 0x80, 0x00]).unwrap(),
+            PsmAvailability::Ready(0x80)
+        );
+        assert_eq!(
+            decode_message_stream_psm(&[0x00, 0x00, 0x00]).unwrap(),
+            PsmAvailability::Unknown
+        );
+        assert_eq!(
+            decode_message_stream_psm(&[0x02, 0x00, 0x00]).unwrap(),
+            PsmAvailability::Unavailable
+        );
+        assert!(decode_message_stream_psm(&[0x01, 0x7f, 0x00]).is_err());
+        assert!(decode_message_stream_psm(&[0x01, 0x00]).is_err());
+        assert!(decode_message_stream_psm(&[0x03, 0x80, 0x00]).is_err());
+    }
 
     #[test]
     fn decoder_handles_fragmented_and_coalesced_frames() {

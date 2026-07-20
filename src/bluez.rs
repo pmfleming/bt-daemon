@@ -19,7 +19,7 @@ use tokio::{
 
 use crate::{
     backend::{BackendError, BackendErrorKind, BluetoothBackend, ObexRemote, ObexTarget},
-    fast_pair::{FastPairBatteryProvider, MESSAGE_STREAM_UUID},
+    fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
     params::Params,
@@ -738,7 +738,7 @@ fn service_label(uuid: &str) -> &'static str {
     if uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID) {
         return "Fast Pair Message Stream";
     }
-    if uuid.eq_ignore_ascii_case("0000fe2c-0000-1000-8000-00805f9b34fb") {
+    if uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID) {
         return "Fast Pair Service";
     }
     match uuid
