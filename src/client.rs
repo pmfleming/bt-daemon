@@ -63,43 +63,55 @@ pub async fn run() -> Result<()> {
                 continue;
             }
         };
-        match request {
-            Request::Call { id, method, params } => {
-                let connection = dbus.clone();
-                let output = Arc::clone(&output);
-                calls.spawn(async move {
-                    let response = dispatch(&connection, &method, params).await;
-                    let _ = emit(
-                        &output,
-                        &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
-                    )
-                    .await;
-                });
-            }
-            Request::Subscribe { id, streams } => {
-                let response = call_subscribe(dbus.as_ref(), streams).await;
-                emit_transport_response(&output, &id, response).await?;
-            }
-            Request::Cancel { id, request_id } => {
-                let response = call_cancel(dbus.as_ref(), &request_id).await;
-                emit_transport_response(&output, &id, response).await?;
-            }
-            Request::Shutdown { id } => {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    while calls.join_next().await.is_some() {}
-                })
-                .await;
-                calls.abort_all();
-                emit(
-                    &output,
-                    &json!({ "kind": "response", "id": id, "ok": true, "response": { "shutdown": true } }),
-                )
-                .await?;
-                break;
-            }
+        if !handle_request(request, &dbus, &output, &mut calls).await? {
+            break;
         }
     }
     Ok(())
+}
+
+async fn handle_request(
+    request: Request,
+    dbus: &Option<zbus::Connection>,
+    output: &Output,
+    calls: &mut JoinSet<()>,
+) -> Result<bool> {
+    match request {
+        Request::Call { id, method, params } => {
+            let connection = dbus.clone();
+            let output = Arc::clone(output);
+            calls.spawn(async move {
+                let response = dispatch(&connection, &method, params).await;
+                let _ = emit(
+                    &output,
+                    &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
+                )
+                .await;
+            });
+        }
+        Request::Subscribe { id, streams } => {
+            let response = call_subscribe(dbus.as_ref(), streams).await;
+            emit_transport_response(output, &id, response).await?;
+        }
+        Request::Cancel { id, request_id } => {
+            let response = call_cancel(dbus.as_ref(), &request_id).await;
+            emit_transport_response(output, &id, response).await?;
+        }
+        Request::Shutdown { id } => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while calls.join_next().await.is_some() {}
+            })
+            .await;
+            calls.abort_all();
+            emit(
+                output,
+                &json!({ "kind": "response", "id": id, "ok": true, "response": { "shutdown": true } }),
+            )
+            .await?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn dispatch(connection: &Option<zbus::Connection>, method: &str, params: Value) -> Value {
@@ -144,59 +156,56 @@ async fn call_cancel(
 }
 
 fn spawn_owner_watcher(connection: zbus::Connection, output: Output) {
-    tokio::spawn(async move {
-        let result = async {
-            let proxy = zbus::Proxy::new(
-                &connection,
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-            )
-            .await?;
-            let mut changes = proxy.receive_signal("NameOwnerChanged").await?;
-            while let Some(message) = changes.next().await {
-                let (name, old_owner, new_owner): (String, String, String) =
-                    message.body().deserialize()?;
-                if name == BUS_NAME && !old_owner.is_empty() && old_owner != new_owner {
-                    emit(
-                        &output,
-                        &json!({ "kind": "transport-error", "error": "bt-daemon restarted; reconnecting" }),
-                    )
-                    .await?;
-                    break;
-                }
+    let task_output = Arc::clone(&output);
+    spawn_transport_task(output, async move {
+        let proxy = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .await?;
+        let mut changes = proxy.receive_signal("NameOwnerChanged").await?;
+        while let Some(message) = changes.next().await {
+            let (name, old_owner, new_owner): (String, String, String) =
+                message.body().deserialize()?;
+            if name == BUS_NAME && !old_owner.is_empty() && old_owner != new_owner {
+                emit(
+                    &task_output,
+                    &json!({ "kind": "transport-error", "error": "bt-daemon restarted; reconnecting" }),
+                )
+                .await?;
+                break;
             }
-            Ok::<(), anyhow::Error>(())
         }
-        .await;
-        if let Err(error) = result {
-            let _ = emit(
-                &output,
-                &json!({ "kind": "transport-error", "error": error.to_string() }),
-            )
-            .await;
-        }
+        Ok(())
     });
 }
 
 fn spawn_event_forwarder(connection: zbus::Connection, output: Output) {
-    tokio::spawn(async move {
-        let result = async {
-            let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
-            let mut signals = proxy.receive_signal("Event").await?;
-            while let Some(message) = signals.next().await {
-                let (stream, event_json): (String, String) = message.body().deserialize()?;
-                let event = decode_event(&event_json);
-                emit(
-                    &output,
-                    &json!({ "kind": "event", "stream": stream, "event": event }),
-                )
-                .await?;
-            }
-            Ok::<(), anyhow::Error>(())
+    let task_output = Arc::clone(&output);
+    spawn_transport_task(output, async move {
+        let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
+        let mut signals = proxy.receive_signal("Event").await?;
+        while let Some(message) = signals.next().await {
+            let (stream, event_json): (String, String) = message.body().deserialize()?;
+            let event = decode_event(&event_json);
+            emit(
+                &task_output,
+                &json!({ "kind": "event", "stream": stream, "event": event }),
+            )
+            .await?;
         }
-        .await;
-        if let Err(error) = result {
+        Ok(())
+    });
+}
+
+fn spawn_transport_task(
+    output: Output,
+    task: impl std::future::Future<Output = Result<()>> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = task.await {
             let _ = emit(
                 &output,
                 &json!({ "kind": "transport-error", "error": error.to_string() }),

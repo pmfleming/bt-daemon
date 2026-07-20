@@ -18,7 +18,7 @@ use zbus::{connection, object_server::SignalEmitter};
 
 use crate::{
     api, audio as pipewire_audio, backend::BluetoothBackend, obex as bluez_obex,
-    pairing::PairingBroker, params::Params, protocol,
+    pairing::PairingBroker, protocol,
 };
 
 pub const BUS_NAME: &str = "org.laufan.BluetoothDaemon";
@@ -53,58 +53,13 @@ impl BluetoothDaemon {
     fn next_id(&self, prefix: &str) -> String {
         format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
     }
-}
 
-#[zbus::interface(name = "org.laufan.BluetoothDaemon1")]
-impl BluetoothDaemon {
-    async fn call(&self, method: &str, params_json: &str) -> String {
-        let params = match serde_json::from_str::<Value>(params_json) {
-            Ok(params) => params,
-            Err(error) => {
-                return api::error("validation-error", format!("invalid params JSON: {error}"))
-                    .to_string();
-            }
-        };
-        let response = match method {
+    async fn dispatch_call(&self, method: &str, params: Value) -> Value {
+        match method {
             "bluetooth.scan" => self.scans.start(&params).await,
             "bluetooth.obex.send" => self.outgoing_obex.start(&params).await,
-            "bluetooth.obex.respond" => {
-                let request = match (
-                    params.require_string("request_id"),
-                    params.require_bool("accept"),
-                ) {
-                    (Ok(request_id), Ok(accept)) => Ok((request_id, accept)),
-                    (Err(error), _) | (_, Err(error)) => Err(error),
-                };
-                match request {
-                    Ok((request_id, accept)) => {
-                        match self.incoming_obex.respond(request_id, accept).await {
-                            Ok(()) => api::success(json!({
-                                "authorization": { "request_id": request_id, "accepted": accept }
-                            })),
-                            Err(error) => {
-                                api::error("obex-response-rejected", format!("{error:#}"))
-                            }
-                        }
-                    }
-                    Err(error) => api::error("validation-error", error.to_string()),
-                }
-            }
-            "bluetooth.obex.snapshot" => {
-                match bluez_obex::probe(self.incoming_obex.is_available()).await {
-                    Ok(capabilities) => api::success(json!({ "obex": capabilities })),
-                    Err(error) => api::success(json!({
-                        "obex": {
-                            "available": false,
-                            "outgoing_object_push": false,
-                            "incoming_authorization": false,
-                            "transfer_progress": false,
-                            "cancellation": false,
-                            "reason": format!("{error:#}"),
-                        }
-                    })),
-                }
-            }
+            "bluetooth.obex.respond" => obex::respond(&self.incoming_obex, &params).await,
+            "bluetooth.obex.snapshot" => self.obex_snapshot().await,
             "bluetooth.audio.snapshot" => audio::snapshot(Arc::clone(&self.pairing)).await,
             "bluetooth.audio.setProfile" => audio::set_profile(&self.pairing, &params).await,
             "bluetooth.device.operation" => self.operations.start(params).await,
@@ -113,8 +68,35 @@ impl BluetoothDaemon {
                 Err(error) => api::error("pairing-response-rejected", format!("{error:#}")),
             },
             _ => api::dispatch(Arc::clone(&self.backend), method, params).await,
+        }
+    }
+
+    async fn obex_snapshot(&self) -> Value {
+        match bluez_obex::probe(self.incoming_obex.is_available()).await {
+            Ok(capabilities) => api::success(json!({ "obex": capabilities })),
+            Err(error) => api::success(json!({ "obex": {
+                "available": false,
+                "outgoing_object_push": false,
+                "incoming_authorization": false,
+                "transfer_progress": false,
+                "cancellation": false,
+                "reason": format!("{error:#}"),
+            }})),
+        }
+    }
+}
+
+#[zbus::interface(name = "org.laufan.BluetoothDaemon1")]
+impl BluetoothDaemon {
+    async fn call(&self, method: &str, params_json: &str) -> String {
+        let params = match serde_json::from_str(params_json) {
+            Ok(params) => params,
+            Err(error) => {
+                return api::error("validation-error", format!("invalid params JSON: {error}"))
+                    .to_string();
+            }
         };
-        response.to_string()
+        self.dispatch_call(method, params).await.to_string()
     }
 
     async fn subscribe(

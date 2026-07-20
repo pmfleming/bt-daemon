@@ -55,6 +55,13 @@ struct Objects {
     listeners: Vec<Box<dyn Listener>>,
 }
 
+impl Objects {
+    fn retain(&mut self, proxy: impl ProxyT + 'static, listener: impl Listener + 'static) {
+        self.proxies.push(Box::new(proxy));
+        self.listeners.push(Box::new(listener));
+    }
+}
+
 #[derive(Default)]
 struct Defaults {
     sink: String,
@@ -118,26 +125,20 @@ pub fn monitor(on_change: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<()> 
                 return;
             };
             let event = std::sync::Arc::clone(&changes_for_global);
-            let value: Option<(Box<dyn ProxyT>, Box<dyn Listener>)> = match global.type_ {
+            let objects = &objects_for_registry;
+            let _ = match global.type_ {
                 ObjectType::Device => registry.bind::<Device, _>(global).ok().map(|device| {
                     let info_event = std::sync::Arc::clone(&event);
-                    let param_event = std::sync::Arc::clone(&event);
                     let listener = device
                         .add_listener_local()
                         .info(move |_| info_event())
-                        .param(move |_, _, _, _, _| param_event())
+                        .param(move |_, _, _, _, _| event())
                         .register();
-                    (
-                        Box::new(device) as Box<dyn ProxyT>,
-                        Box::new(listener) as Box<dyn Listener>,
-                    )
+                    objects.borrow_mut().retain(device, listener);
                 }),
                 ObjectType::Node => registry.bind::<Node, _>(global).ok().map(|node| {
                     let listener = node.add_listener_local().info(move |_| event()).register();
-                    (
-                        Box::new(node) as Box<dyn ProxyT>,
-                        Box::new(listener) as Box<dyn Listener>,
-                    )
+                    objects.borrow_mut().retain(node, listener);
                 }),
                 ObjectType::Metadata => registry.bind::<Metadata, _>(global).ok().map(|metadata| {
                     let listener = metadata
@@ -147,18 +148,10 @@ pub fn monitor(on_change: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<()> 
                             0
                         })
                         .register();
-                    (
-                        Box::new(metadata) as Box<dyn ProxyT>,
-                        Box::new(listener) as Box<dyn Listener>,
-                    )
+                    objects.borrow_mut().retain(metadata, listener);
                 }),
                 _ => None,
             };
-            if let Some((proxy, listener)) = value {
-                let mut objects = objects_for_registry.borrow_mut();
-                objects.proxies.push(proxy);
-                objects.listeners.push(listener);
-            }
         })
         .global_remove(move |id| {
             if relevant_for_remove.borrow_mut().remove(&id) {
@@ -428,9 +421,7 @@ impl ProbeState {
     }
 
     fn retain(&self, proxy: impl ProxyT + 'static, listener: impl Listener + 'static) {
-        let mut objects = self.objects.borrow_mut();
-        objects.proxies.push(Box::new(proxy));
-        objects.listeners.push(Box::new(listener));
+        self.objects.borrow_mut().retain(proxy, listener);
     }
 
     fn finish(&self) -> Vec<AudioDevice> {

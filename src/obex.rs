@@ -57,6 +57,42 @@ pub struct ObexEvent {
     pub error: Option<JsonValue>,
 }
 
+impl ObexEvent {
+    pub(crate) fn outgoing(request_id: &str, device_key: &str, file_name: &str, size: u64) -> Self {
+        Self {
+            event: "queued".into(),
+            request_id: request_id.into(),
+            direction: "outgoing".into(),
+            device_key: device_key.into(),
+            device_name: None,
+            file_name: file_name.into(),
+            media_type: None,
+            status: "queued".into(),
+            transferred: 0,
+            size,
+            timeout_ms: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn updated(&self, update: TransferUpdate) -> Self {
+        Self {
+            event: lifecycle_event(&update.status).into(),
+            status: update.status,
+            transferred: update.transferred,
+            size: update.size,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn failed(mut self, error: JsonValue) -> Self {
+        self.event = "failed".into();
+        self.status = "error".into();
+        self.error = Some(error);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferUpdate {
     pub status: String,
@@ -312,14 +348,11 @@ impl IncomingBroker {
             .await;
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
-                let mut failed = event;
-                failed.event = "failed".into();
-                failed.status = "error".into();
-                failed.error = Some(serde_json::json!({
+                let error = serde_json::json!({
                     "code": "obex-transfer-failed",
                     "message": format!("{error:#}"),
-                }));
-                let _ = events.send(failed);
+                });
+                let _ = events.send(event.failed(error));
             }
         });
         destination

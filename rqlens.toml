@@ -1,0 +1,11 @@
+project_name = "bt-daemon"
+project_root = "."
+source_roots = ["src"]
+output_dir = "target/analysis"
+
+[rust]
+helper_manifest = "../rust-quality-lens/rust_helpers/Cargo.toml"
+identity_resolution = "auto"
+rust_analyzer = "rust-analyzer"
+identity_timeout_seconds = 60
+identity_offline = true

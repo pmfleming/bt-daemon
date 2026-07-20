@@ -28,6 +28,43 @@ pub(super) struct OperationEvent {
     error: Option<Value>,
 }
 
+impl OperationEvent {
+    fn queued(request_id: String, device_key: String, operation: String) -> Self {
+        Self {
+            event: "queued".into(),
+            request_id,
+            device_key,
+            operation,
+            state: "queued".into(),
+            snapshot: None,
+            error: None,
+        }
+    }
+
+    fn with_state(&self, event: &str, state: &str) -> Self {
+        Self {
+            event: event.into(),
+            state: state.into(),
+            ..self.clone()
+        }
+    }
+
+    fn finished(mut self, result: anyhow::Result<crate::model::Snapshot>) -> Self {
+        match result {
+            Ok(snapshot) => self.snapshot = Some(snapshot),
+            Err(error) => self.error = Some(api::error_value(&error)),
+        }
+        self.event = if self.error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        }
+        .into();
+        self.state.clone_from(&self.event);
+        self
+    }
+}
+
 struct OperationTask {
     handle: JoinHandle<()>,
     event: OperationEvent,
@@ -94,57 +131,28 @@ impl OperationCoordinator {
             "operation-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
-        let queued = OperationEvent {
-            event: "queued".into(),
-            request_id: request_id.clone(),
-            device_key: device_key.clone(),
-            operation: operation.clone(),
-            state: "queued".into(),
-            snapshot: None,
-            error: None,
-        };
+        let queued =
+            OperationEvent::queued(request_id.clone(), device_key.clone(), operation.clone());
         let backend = Arc::clone(&self.backend);
         let operation_state = Arc::clone(&self.state);
         let events = self.events.clone();
-        let task_id = request_id.clone();
-        let task_key = device_key.clone();
-        let task_operation = operation.clone();
+        let task_event = queued.clone();
         let (start_sender, start_receiver) = oneshot::channel();
         let handle = tokio::spawn(async move {
             if start_receiver.await.is_err() {
                 return;
             }
-            let _ = events.send(OperationEvent {
-                event: "started".into(),
-                request_id: task_id.clone(),
-                device_key: task_key.clone(),
-                operation: task_operation.clone(),
-                state: "running".into(),
-                snapshot: None,
-                error: None,
-            });
+            let _ = events.send(task_event.with_state("started", "running"));
             let result = backend
-                .device_operation(&task_key, &task_operation, &params)
+                .device_operation(&task_event.device_key, &task_event.operation, &params)
                 .await;
             let mut state = operation_state.lock().await;
-            state.tasks.remove(&task_id);
-            if state.active_devices.get(&task_key) == Some(&task_id) {
-                state.active_devices.remove(&task_key);
+            state.tasks.remove(&task_event.request_id);
+            if state.active_devices.get(&task_event.device_key) == Some(&task_event.request_id) {
+                state.active_devices.remove(&task_event.device_key);
             }
             drop(state);
-            let (event, snapshot, error) = match result {
-                Ok(snapshot) => ("completed", Some(snapshot), None),
-                Err(error) => ("failed", None, Some(api::error_value(&error))),
-            };
-            let _ = events.send(OperationEvent {
-                event: event.into(),
-                request_id: task_id,
-                device_key: task_key,
-                operation: task_operation,
-                state: event.into(),
-                snapshot,
-                error,
-            });
+            let _ = events.send(task_event.finished(result));
         });
         state.tasks.insert(
             request_id.clone(),
@@ -177,10 +185,9 @@ impl OperationCoordinator {
             return false;
         };
         task.handle.abort();
-        let mut event = task.event;
-        event.event = "cancelled".into();
-        event.state = "cancelled".into();
-        let _ = self.events.send(event);
+        let _ = self
+            .events
+            .send(task.event.with_state("cancelled", "cancelled"));
         true
     }
 

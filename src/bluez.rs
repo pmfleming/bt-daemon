@@ -206,75 +206,24 @@ impl BluetoothBackend for BluezBackend {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
-        let mut adapters_out = Vec::new();
-        let mut devices_out = Vec::new();
+        let mut snapshot = Snapshot::default();
         for adapter in self.adapters().await? {
             let adapter_key = adapter_key(&adapter).await?;
-            adapters_out.push(Adapter {
-                key: adapter_key.clone(),
-                name: adapter.name().to_string(),
-                alias: bluez_result(adapter.alias().await, "read adapter alias")?,
-                address: bluez_result(adapter.address().await, "read adapter address")?.to_string(),
-                address_type: bluez_result(
-                    adapter.address_type().await,
-                    "read adapter address type",
-                )?
-                .to_string(),
-                powered: bluez_result(adapter.is_powered().await, "read adapter power")?,
-                discovering: bluez_result(
-                    adapter.is_discovering().await,
-                    "read adapter discovery state",
-                )?,
-                discoverable: bluez_result(
-                    adapter.is_discoverable().await,
-                    "read adapter discoverable state",
-                )?,
-                pairable: bluez_result(adapter.is_pairable().await, "read adapter pairable state")?,
-                discoverable_timeout: bluez_result(
-                    adapter.discoverable_timeout().await,
-                    "read adapter discoverable timeout",
-                )?,
-                pairable_timeout: bluez_result(
-                    adapter.pairable_timeout().await,
-                    "read adapter pairable timeout",
-                )?,
-                modalias: bluez_result(adapter.modalias().await, "read adapter modalias")?
-                    .map(modalias_string),
-            });
-            for address in adapter
-                .device_addresses()
-                .await
-                .backend_context("list adapter devices")?
-            {
-                let device = adapter
-                    .device(address)
-                    .backend_context("open BlueZ device")?;
-                if let Some(value) = device_snapshot(
-                    &adapter,
-                    &device,
-                    &adapter_key,
-                    &self.identities,
-                    &self.last_seen,
-                    &self.system_bus,
-                    self.fast_pair.as_deref(),
-                )
-                .await?
-                {
-                    devices_out.push(value);
-                }
-            }
+            snapshot
+                .adapters
+                .push(adapter_snapshot(&adapter, &adapter_key).await?);
+            snapshot
+                .devices
+                .extend(adapter_devices(self, &adapter, &adapter_key).await?);
         }
-        devices_out.sort_by_key(|device| {
+        snapshot.devices.sort_by_key(|device| {
             (
                 !device.connected,
                 !device.paired,
                 device.name.to_lowercase(),
             )
         });
-        Ok(Snapshot {
-            adapters: adapters_out,
-            devices: devices_out,
-        })
+        Ok(snapshot)
     }
 
     async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot> {
@@ -300,20 +249,10 @@ impl BluetoothBackend for BluezBackend {
 
     async fn set_scanning(&self, adapter_key: Option<&str>, enabled: bool) -> Result<Snapshot> {
         if let Some(key) = adapter_key {
-            let adapter = self.find_adapter(key).await?;
-            let name = adapter.name().to_string();
-            if enabled {
-                if bluez_result(adapter.is_powered().await, "read adapter power")? {
-                    self.start_discovery(adapter).await?;
-                }
-            } else {
-                self.stop_discovery(Some(&name)).await;
-            }
+            set_adapter_scanning(self, self.find_adapter(key).await?, enabled).await?;
         } else if enabled {
             for adapter in self.adapters().await? {
-                if bluez_result(adapter.is_powered().await, "read adapter power")? {
-                    self.start_discovery(adapter).await?;
-                }
+                set_adapter_scanning(self, adapter, true).await?;
             }
         } else {
             self.stop_discovery(None).await;
@@ -349,13 +288,7 @@ impl BluetoothBackend for BluezBackend {
                 .set_pairable_timeout(params.require_u32("timeout")?)
                 .await
                 .backend_context("set adapter pairable timeout")?,
-            _ => {
-                return Err(BackendError::new(
-                    BackendErrorKind::InvalidInput,
-                    format!("unsupported Bluetooth adapter operation: {operation}"),
-                )
-                .into());
-            }
+            _ => return Err(unsupported_operation("adapter", operation)),
         }
         self.snapshot().await
     }
@@ -430,89 +363,167 @@ impl BluetoothBackend for BluezBackend {
         params: &Value,
     ) -> Result<Snapshot> {
         let (adapter, device) = self.find_device(device_key).await?;
-        match operation {
-            "pair" => {
-                operation_timeout(
-                    Duration::from_secs(75),
-                    "pair Bluetooth device",
-                    device.pair(),
-                )
-                .await?;
-                if params
-                    .get("trust_after_pair")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true)
-                {
-                    device
-                        .set_trusted(true)
-                        .await
-                        .backend_context("trust paired Bluetooth device")?;
-                }
-                if !bluez_result(device.is_connected().await, "read device connected state")? {
-                    operation_timeout(
-                        Duration::from_secs(25),
-                        "connect paired Bluetooth device",
-                        device.connect(),
-                    )
-                    .await?;
-                }
-            }
-            "connect" => {
-                operation_timeout(
-                    Duration::from_secs(25),
-                    "connect Bluetooth device",
-                    device.connect(),
-                )
-                .await?
-            }
-            "disconnect" => {
-                operation_timeout(
-                    Duration::from_secs(12),
-                    "disconnect Bluetooth device",
-                    device.disconnect(),
-                )
-                .await?
-            }
-            "remove" => {
-                if bluez_result(device.is_connected().await, "read device connected state")? {
-                    operation_timeout(
-                        Duration::from_secs(12),
-                        "disconnect Bluetooth device before removal",
-                        device.disconnect(),
-                    )
-                    .await?;
-                }
-                adapter
-                    .remove_device(device.address())
-                    .await
-                    .backend_context("remove Bluetooth device")?;
-            }
-            "set-trusted" => device
-                .set_trusted(params.require_bool("trusted")?)
-                .await
-                .backend_context("set trusted state")?,
-            "set-blocked" => device
-                .set_blocked(params.require_bool("blocked")?)
-                .await
-                .backend_context("set blocked state")?,
-            "set-wake-allowed" => device
-                .set_wake_allowed(params.require_bool("wake_allowed")?)
-                .await
-                .backend_context("set wake permission")?,
-            "set-alias" => device
-                .set_alias(params.require_string("alias")?.to_string())
-                .await
-                .backend_context("set device alias")?,
-            _ => {
-                return Err(BackendError::new(
-                    BackendErrorKind::InvalidInput,
-                    format!("unsupported Bluetooth device operation: {operation}"),
-                )
-                .into());
-            }
-        }
+        run_device_operation(&adapter, &device, operation, params).await?;
         self.snapshot().await
     }
+}
+
+async fn set_adapter_scanning(
+    backend: &BluezBackend,
+    adapter: BluezAdapter,
+    enabled: bool,
+) -> Result<()> {
+    if enabled {
+        if bluez_result(adapter.is_powered().await, "read adapter power")? {
+            backend.start_discovery(adapter).await?;
+        }
+    } else {
+        backend.stop_discovery(Some(adapter.name())).await;
+    }
+    Ok(())
+}
+
+async fn adapter_devices(
+    backend: &BluezBackend,
+    adapter: &BluezAdapter,
+    adapter_key: &str,
+) -> Result<Vec<Device>> {
+    let mut devices = Vec::new();
+    for address in adapter
+        .device_addresses()
+        .await
+        .backend_context("list adapter devices")?
+    {
+        let device = adapter
+            .device(address)
+            .backend_context("open BlueZ device")?;
+        if let Some(snapshot) = device_snapshot(
+            adapter,
+            &device,
+            adapter_key,
+            &backend.identities,
+            &backend.last_seen,
+            &backend.system_bus,
+            backend.fast_pair.as_deref(),
+        )
+        .await?
+        {
+            devices.push(snapshot);
+        }
+    }
+    Ok(devices)
+}
+
+async fn adapter_snapshot(adapter: &BluezAdapter, key: &str) -> Result<Adapter> {
+    Ok(Adapter {
+        key: key.to_string(),
+        name: adapter.name().to_string(),
+        alias: bluez_result(adapter.alias().await, "read adapter alias")?,
+        address: bluez_result(adapter.address().await, "read adapter address")?.to_string(),
+        address_type: bluez_result(adapter.address_type().await, "read adapter address type")?
+            .to_string(),
+        powered: bluez_result(adapter.is_powered().await, "read adapter power")?,
+        discovering: bluez_result(
+            adapter.is_discovering().await,
+            "read adapter discovery state",
+        )?,
+        discoverable: bluez_result(
+            adapter.is_discoverable().await,
+            "read adapter discoverable state",
+        )?,
+        pairable: bluez_result(adapter.is_pairable().await, "read adapter pairable state")?,
+        discoverable_timeout: bluez_result(
+            adapter.discoverable_timeout().await,
+            "read adapter discoverable timeout",
+        )?,
+        pairable_timeout: bluez_result(
+            adapter.pairable_timeout().await,
+            "read adapter pairable timeout",
+        )?,
+        modalias: bluez_result(adapter.modalias().await, "read adapter modalias")?
+            .map(modalias_string),
+    })
+}
+
+async fn run_device_operation(
+    adapter: &BluezAdapter,
+    device: &BluezDevice,
+    operation: &str,
+    params: &Value,
+) -> Result<()> {
+    match operation {
+        "pair" => pair_device(device, params).await?,
+        "connect" => connect_device(device, "connect Bluetooth device").await?,
+        "disconnect" => disconnect_device(device, "disconnect Bluetooth device").await?,
+        "remove" => remove_device(adapter, device).await?,
+        "set-trusted" => device
+            .set_trusted(params.require_bool("trusted")?)
+            .await
+            .backend_context("set trusted state")?,
+        "set-blocked" => device
+            .set_blocked(params.require_bool("blocked")?)
+            .await
+            .backend_context("set blocked state")?,
+        "set-wake-allowed" => device
+            .set_wake_allowed(params.require_bool("wake_allowed")?)
+            .await
+            .backend_context("set wake permission")?,
+        "set-alias" => device
+            .set_alias(params.require_string("alias")?.to_string())
+            .await
+            .backend_context("set device alias")?,
+        _ => return Err(unsupported_operation("device", operation)),
+    }
+    Ok(())
+}
+
+async fn pair_device(device: &BluezDevice, params: &Value) -> Result<()> {
+    operation_timeout(
+        Duration::from_secs(75),
+        "pair Bluetooth device",
+        device.pair(),
+    )
+    .await?;
+    if params
+        .get("trust_after_pair")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        device
+            .set_trusted(true)
+            .await
+            .backend_context("trust paired Bluetooth device")?;
+    }
+    if !bluez_result(device.is_connected().await, "read device connected state")? {
+        connect_device(device, "connect paired Bluetooth device").await?;
+    }
+    Ok(())
+}
+
+async fn connect_device(device: &BluezDevice, operation: &'static str) -> Result<()> {
+    operation_timeout(Duration::from_secs(25), operation, device.connect()).await
+}
+
+async fn disconnect_device(device: &BluezDevice, operation: &'static str) -> Result<()> {
+    operation_timeout(Duration::from_secs(12), operation, device.disconnect()).await
+}
+
+async fn remove_device(adapter: &BluezAdapter, device: &BluezDevice) -> Result<()> {
+    if bluez_result(device.is_connected().await, "read device connected state")? {
+        disconnect_device(device, "disconnect Bluetooth device before removal").await?;
+    }
+    adapter
+        .remove_device(device.address())
+        .await
+        .backend_context("remove Bluetooth device")
+}
+
+fn unsupported_operation(target: &str, operation: &str) -> anyhow::Error {
+    BackendError::new(
+        BackendErrorKind::InvalidInput,
+        format!("unsupported Bluetooth {target} operation: {operation}"),
+    )
+    .into()
 }
 
 async fn adapter_key(adapter: &BluezAdapter) -> Result<String> {
@@ -531,6 +542,44 @@ fn opaque_key(kind: &str, identity: &str) -> String {
     format!("{kind}-{}", hex::encode(&digest[..12]))
 }
 
+struct DeviceMetadata {
+    alias: String,
+    address_type: String,
+    icon: Option<String>,
+    services_resolved: bool,
+    legacy_pairing: bool,
+    modalias: Option<String>,
+    uuids: Vec<String>,
+}
+
+impl DeviceMetadata {
+    async fn read(device: &BluezDevice) -> Result<Self> {
+        let mut uuids = bluez_result(device.uuids().await, "read device UUIDs")?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|uuid| uuid.to_string())
+            .collect::<Vec<_>>();
+        uuids.sort();
+        Ok(Self {
+            alias: bluez_result(device.alias().await, "read device alias")?,
+            address_type: bluez_result(device.address_type().await, "read device address type")?
+                .to_string(),
+            icon: bluez_result(device.icon().await, "read device icon")?,
+            services_resolved: bluez_result(
+                device.is_services_resolved().await,
+                "read device services state",
+            )?,
+            legacy_pairing: bluez_result(
+                device.is_legacy_pairing().await,
+                "read device legacy-pairing state",
+            )?,
+            modalias: bluez_result(device.modalias().await, "read device modalias")?
+                .map(modalias_string),
+            uuids,
+        })
+    }
+}
+
 async fn device_snapshot(
     adapter: &BluezAdapter,
     device: &BluezDevice,
@@ -540,11 +589,11 @@ async fn device_snapshot(
     system_bus: &zbus::Connection,
     fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<Option<Device>> {
-    let identity = device.address();
     let paired = bluez_result(device.is_paired().await, "read device paired state")?;
     let connected = bluez_result(device.is_connected().await, "read device connected state")?;
     let rssi = bluez_result(device.rssi().await, "read device signal strength")?;
-    if !paired && !connected && rssi.is_none() {
+    let present = rssi.is_some() || connected;
+    if !paired && !present {
         return Ok(None);
     }
     let trusted = bluez_result(device.is_trusted().await, "read device trusted state")?;
@@ -553,93 +602,95 @@ async fn device_snapshot(
         device.is_wake_allowed().await,
         "read device wake permission",
     )?;
-    let alias = bluez_result(device.alias().await, "read device alias")?;
-    let mut uuids = bluez_result(device.uuids().await, "read device UUIDs")?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>();
-    uuids.sort();
-    let services = uuids
+    let identity = device.address();
+    let metadata = DeviceMetadata::read(device).await?;
+    let key = identities.device_key(adapter.name(), identity);
+    let services = metadata
+        .uuids
         .iter()
         .map(|uuid| Service {
             uuid: uuid.clone(),
             label: service_label(uuid).to_string(),
         })
         .collect();
-    let key = identities.device_key(adapter.name(), identity);
-    let last_seen_ms = {
-        let mut seen = last_seen.lock().await;
-        if rssi.is_some() || connected {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            seen.insert(key.clone(), now);
-            Some(now)
-        } else {
-            seen.get(&key).copied()
-        }
-    };
-    let component_battery = if connected {
-        match fast_pair {
-            Some(provider) => provider.batteries(identity).await,
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-    let battery = if component_battery.is_empty() {
-        bluez_result(device.battery_percentage().await, "read device battery")?
-            .map(|percentage| {
-                vec![Battery {
-                    id: "aggregate".to_string(),
-                    label: "Battery".to_string(),
-                    component: "main".to_string(),
-                    percentage,
-                    source: "bluez".to_string(),
-                    confidence: "standard".to_string(),
-                }]
-            })
-            .unwrap_or_default()
-    } else {
-        component_battery
-    };
+    let last_seen_ms = update_last_seen(last_seen, &key, present).await;
+    let battery = device_batteries(device, identity, connected, fast_pair).await?;
     let capabilities = device_capabilities(paired, connected, blocked, wake_allowed);
     Ok(Some(Device {
         key,
         adapter_key: adapter_key.to_string(),
-        name: alias.clone(),
-        alias,
+        name: metadata.alias.clone(),
+        alias: metadata.alias,
         address: identity.to_string(),
-        address_type: bluez_result(device.address_type().await, "read device address type")?
-            .to_string(),
-        icon: bluez_result(device.icon().await, "read device icon")?,
+        address_type: metadata.address_type,
+        icon: metadata.icon,
         paired,
         bonded: bonded_property(system_bus, adapter.name(), identity).await,
         connected,
-        services_resolved: bluez_result(
-            device.is_services_resolved().await,
-            "read device services state",
-        )?,
+        services_resolved: metadata.services_resolved,
         trusted,
         blocked,
         wake_allowed,
-        legacy_pairing: bluez_result(
-            device.is_legacy_pairing().await,
-            "read device legacy-pairing state",
-        )?,
-        modalias: bluez_result(device.modalias().await, "read device modalias")?
-            .map(modalias_string),
-        uuids,
+        legacy_pairing: metadata.legacy_pairing,
+        modalias: metadata.modalias,
+        uuids: metadata.uuids,
         services,
         battery,
         rssi,
         signal_strength: rssi.map(signal_strength),
-        present: rssi.is_some() || connected,
+        present,
         last_seen_ms,
         capabilities,
     }))
+}
+
+async fn update_last_seen(
+    last_seen: &Mutex<HashMap<String, u64>>,
+    key: &str,
+    present: bool,
+) -> Option<u64> {
+    let mut seen = last_seen.lock().await;
+    if !present {
+        return seen.get(key).copied();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    seen.insert(key.to_string(), now);
+    Some(now)
+}
+
+async fn device_batteries(
+    device: &BluezDevice,
+    identity: bluer::Address,
+    connected: bool,
+    fast_pair: Option<&FastPairBatteryProvider>,
+) -> Result<Vec<Battery>> {
+    let component_battery = match (connected, fast_pair) {
+        (true, Some(provider)) => provider.batteries(identity).await,
+        _ => Vec::new(),
+    };
+    if !component_battery.is_empty() {
+        return Ok(component_battery);
+    }
+    Ok(
+        bluez_result(device.battery_percentage().await, "read device battery")?
+            .map(aggregate_battery)
+            .into_iter()
+            .collect(),
+    )
+}
+
+fn aggregate_battery(percentage: u8) -> Battery {
+    Battery {
+        id: "aggregate".into(),
+        label: "Battery".into(),
+        component: "main".into(),
+        percentage,
+        source: "bluez".into(),
+        confidence: "standard".into(),
+    }
 }
 
 fn device_capabilities(

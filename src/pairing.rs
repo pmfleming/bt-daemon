@@ -47,6 +47,53 @@ enum PendingResponse {
     Unit(oneshot::Sender<ReqResult<()>>),
 }
 
+impl PendingResponse {
+    fn validate(&self, params: &Value) -> Result<()> {
+        match self {
+            Self::Pin(_) => pin_value(params).map(drop),
+            Self::Passkey(_) => passkey_value(params).map(drop),
+            Self::Unit(_) => Ok(()),
+        }
+    }
+
+    fn accept(self, params: &Value) -> Result<()> {
+        match self {
+            Self::Pin(sender) => {
+                let _ = sender.send(Ok(pin_value(params)?));
+            }
+            Self::Passkey(sender) => {
+                let _ = sender.send(Ok(passkey_value(params)?));
+            }
+            Self::Unit(sender) => {
+                let _ = sender.send(Ok(()));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pin_value(params: &Value) -> Result<String> {
+    let value = params
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if value.is_empty() || value.chars().count() > 16 {
+        bail!("PIN must contain 1 to 16 characters");
+    }
+    Ok(value.to_string())
+}
+
+fn passkey_value(params: &Value) -> Result<u32> {
+    let value = params
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if value.is_empty() || value.len() > 6 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("passkey must contain 1 to 6 digits");
+    }
+    value.parse().context("parse pairing passkey")
+}
+
 struct PendingRequest {
     response: PendingResponse,
     event: PairingEvent,
@@ -104,61 +151,24 @@ impl PairingBroker {
     pub async fn respond(&self, params: &Value) -> Result<bool> {
         let request_id = params.require_string("request_id")?;
         let accept = params.require_bool("accept")?;
-        let pending = self
-            .pending
-            .lock()
-            .await
-            .remove(request_id)
+        let mut pending = self.pending.lock().await;
+        let request = pending
+            .get(request_id)
             .context("pairing request is no longer pending")?;
-        if !accept {
-            reject(pending.response);
-            return Ok(false);
+        if accept {
+            request.response.validate(params)?;
         }
-        let PendingRequest { response, event } = pending;
-        match response {
-            PendingResponse::Pin(sender) => {
-                let value = params
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if value.is_empty() || value.chars().count() > 16 {
-                    self.pending.lock().await.insert(
-                        request_id.to_string(),
-                        PendingRequest {
-                            response: PendingResponse::Pin(sender),
-                            event,
-                        },
-                    );
-                    bail!("PIN must contain 1 to 16 characters");
-                }
-                let _ = sender.send(Ok(value.to_string()));
-            }
-            PendingResponse::Passkey(sender) => {
-                let value = params
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if value.len() > 6
-                    || value.is_empty()
-                    || !value.chars().all(|char| char.is_ascii_digit())
-                {
-                    self.pending.lock().await.insert(
-                        request_id.to_string(),
-                        PendingRequest {
-                            response: PendingResponse::Passkey(sender),
-                            event,
-                        },
-                    );
-                    bail!("passkey must contain 1 to 6 digits");
-                }
-                let parsed = value.parse::<u32>().context("parse pairing passkey")?;
-                let _ = sender.send(Ok(parsed));
-            }
-            PendingResponse::Unit(sender) => {
-                let _ = sender.send(Ok(()));
-            }
+        let response = pending
+            .remove(request_id)
+            .context("pairing request is no longer pending")?
+            .response;
+        drop(pending);
+        if accept {
+            response.accept(params)?;
+        } else {
+            reject(response);
         }
-        Ok(true)
+        Ok(accept)
     }
 
     async fn request_pin(self: &Arc<Self>, adapter: String, device: Address) -> ReqResult<String> {
@@ -218,7 +228,7 @@ impl PairingBroker {
         pending: PendingResponse,
         value: Option<String>,
         service: Option<String>,
-    ) -> String {
+    ) {
         let id = format!("pairing-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
         let event = PairingEvent {
             event: "requested".to_string(),
@@ -240,8 +250,7 @@ impl PairingBroker {
             },
         );
         self.emit(event);
-        self.schedule_timeout(id.clone());
-        id
+        self.schedule_timeout(id);
     }
 
     fn schedule_timeout(self: &Arc<Self>, request_id: String) {
@@ -325,94 +334,45 @@ async fn wait_for_response<T>(receiver: oneshot::Receiver<ReqResult<T>>) -> ReqR
 }
 
 fn reject(pending: PendingResponse) {
-    match pending {
-        PendingResponse::Pin(sender) => {
-            let _ = sender.send(Err(ReqError::Rejected));
-        }
-        PendingResponse::Passkey(sender) => {
-            let _ = sender.send(Err(ReqError::Rejected));
-        }
-        PendingResponse::Unit(sender) => {
-            let _ = sender.send(Err(ReqError::Rejected));
-        }
-    }
+    finish(pending, ReqError::Rejected);
 }
 
 fn cancel(pending: PendingResponse) {
+    finish(pending, ReqError::Canceled);
+}
+
+fn finish(pending: PendingResponse, error: ReqError) {
     match pending {
-        PendingResponse::Pin(sender) => {
-            let _ = sender.send(Err(ReqError::Canceled));
-        }
-        PendingResponse::Passkey(sender) => {
-            let _ = sender.send(Err(ReqError::Canceled));
-        }
-        PendingResponse::Unit(sender) => {
-            let _ = sender.send(Err(ReqError::Canceled));
-        }
+        PendingResponse::Pin(sender) => drop(sender.send(Err(error))),
+        PendingResponse::Passkey(sender) => drop(sender.send(Err(error))),
+        PendingResponse::Unit(sender) => drop(sender.send(Err(error))),
     }
 }
 
-fn callback_pin(broker: Arc<PairingBroker>) -> bluer::agent::RequestPinCodeFn {
-    Box::new(move |request: RequestPinCode| {
-        let broker = Arc::clone(&broker);
-        Box::pin(async move { broker.request_pin(request.adapter, request.device).await })
-    })
+macro_rules! pairing_callbacks {
+    ($($name:ident($request_type:ty) -> $callback_type:ty |$broker:ident, $request:ident| $body:expr;)*) => {
+        $(fn $name($broker: Arc<PairingBroker>) -> $callback_type {
+            Box::new(move |$request: $request_type| {
+                let $broker = Arc::clone(&$broker);
+                Box::pin(async move { $body })
+            })
+        })*
+    };
 }
 
-fn callback_passkey(broker: Arc<PairingBroker>) -> bluer::agent::RequestPasskeyFn {
-    Box::new(move |request: RequestPasskey| {
-        let broker = Arc::clone(&broker);
-        Box::pin(async move {
-            broker
-                .request_passkey(request.adapter, request.device)
-                .await
-        })
-    })
-}
-
-fn callback_confirmation(broker: Arc<PairingBroker>) -> bluer::agent::RequestConfirmationFn {
-    Box::new(move |request: RequestConfirmation| {
-        let broker = Arc::clone(&broker);
-        Box::pin(async move {
-            broker
-                .request_unit(
-                    "confirmation",
-                    request.adapter,
-                    request.device,
-                    Some(format!("{:06}", request.passkey)),
-                    None,
-                )
-                .await
-        })
-    })
-}
-
-fn callback_authorization(broker: Arc<PairingBroker>) -> bluer::agent::RequestAuthorizationFn {
-    Box::new(move |request: RequestAuthorization| {
-        let broker = Arc::clone(&broker);
-        Box::pin(async move {
-            broker
-                .request_unit("authorization", request.adapter, request.device, None, None)
-                .await
-        })
-    })
-}
-
-fn callback_service(broker: Arc<PairingBroker>) -> bluer::agent::AuthorizeServiceFn {
-    Box::new(move |request: AuthorizeService| {
-        let broker = Arc::clone(&broker);
-        Box::pin(async move {
-            broker
-                .request_unit(
-                    "service-authorization",
-                    request.adapter,
-                    request.device,
-                    None,
-                    Some(request.service.to_string()),
-                )
-                .await
-        })
-    })
+pairing_callbacks! {
+    callback_pin(RequestPinCode) -> bluer::agent::RequestPinCodeFn |broker, request|
+        broker.request_pin(request.adapter, request.device).await;
+    callback_passkey(RequestPasskey) -> bluer::agent::RequestPasskeyFn |broker, request|
+        broker.request_passkey(request.adapter, request.device).await;
+    callback_confirmation(RequestConfirmation) -> bluer::agent::RequestConfirmationFn |broker, request|
+        broker.request_unit("confirmation", request.adapter, request.device,
+            Some(format!("{:06}", request.passkey)), None).await;
+    callback_authorization(RequestAuthorization) -> bluer::agent::RequestAuthorizationFn |broker, request|
+        broker.request_unit("authorization", request.adapter, request.device, None, None).await;
+    callback_service(AuthorizeService) -> bluer::agent::AuthorizeServiceFn |broker, request|
+        broker.request_unit("service-authorization", request.adapter, request.device,
+            None, Some(request.service.to_string())).await;
 }
 
 fn callback_display_pin(broker: Arc<PairingBroker>) -> bluer::agent::DisplayPinCodeFn {

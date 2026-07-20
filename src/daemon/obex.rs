@@ -11,6 +11,22 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::{api, backend::BluetoothBackend, obex, params::Params};
 
+pub(super) async fn respond(incoming: &obex::IncomingBroker, params: &Value) -> Value {
+    let request = params
+        .require_string("request_id")
+        .and_then(|id| params.require_bool("accept").map(|accept| (id, accept)));
+    let (request_id, accept) = match request {
+        Ok(request) => request,
+        Err(error) => return api::error("validation-error", error.to_string()),
+    };
+    match incoming.respond(request_id, accept).await {
+        Ok(()) => api::success(json!({
+            "authorization": { "request_id": request_id, "accepted": accept }
+        })),
+        Err(error) => api::error("obex-response-rejected", format!("{error:#}")),
+    }
+}
+
 pub(super) struct OutgoingTransfers {
     backend: Arc<dyn BluetoothBackend>,
     sequence: AtomicU64,
@@ -50,20 +66,7 @@ impl OutgoingTransfers {
         );
         let file_name = transfer.file_name.clone();
         let size = transfer.size;
-        let queued = obex::ObexEvent {
-            event: "queued".into(),
-            request_id: request_id.clone(),
-            direction: "outgoing".into(),
-            device_key: device_key.into(),
-            device_name: None,
-            file_name: file_name.clone(),
-            media_type: None,
-            status: "queued".into(),
-            transferred: 0,
-            size,
-            timeout_ms: None,
-            error: None,
-        };
+        let queued = obex::ObexEvent::outgoing(&request_id, device_key, &file_name, size);
         let (cancel_sender, cancel_receiver) = oneshot::channel();
         self.cancellations
             .lock()
@@ -72,47 +75,18 @@ impl OutgoingTransfers {
         let events = self.events.clone();
         let cancellations = Arc::clone(&self.cancellations);
         let task_id = request_id;
-        let task_device = device_key.to_string();
+        let task_event = queued.clone();
         tokio::spawn(async move {
             let update_events = events.clone();
-            let update_id = task_id.clone();
-            let update_device = task_device.clone();
-            let update_name = file_name.clone();
+            let update_event = task_event.clone();
             let result = transfer
                 .run(cancel_receiver, move |update| {
-                    let event = obex::lifecycle_event(&update.status);
-                    let _ = update_events.send(obex::ObexEvent {
-                        event: event.into(),
-                        request_id: update_id.clone(),
-                        direction: "outgoing".into(),
-                        device_key: update_device.clone(),
-                        device_name: None,
-                        file_name: update_name.clone(),
-                        media_type: None,
-                        status: update.status,
-                        transferred: update.transferred,
-                        size: update.size,
-                        timeout_ms: None,
-                        error: None,
-                    });
+                    let _ = update_events.send(update_event.updated(update));
                 })
                 .await;
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
-                let _ = events.send(obex::ObexEvent {
-                    event: "failed".into(),
-                    request_id: task_id,
-                    direction: "outgoing".into(),
-                    device_key: task_device,
-                    device_name: None,
-                    file_name,
-                    media_type: None,
-                    status: "error".into(),
-                    transferred: 0,
-                    size,
-                    timeout_ms: None,
-                    error: Some(api::error_value(&error)),
-                });
+                let _ = events.send(task_event.failed(api::error_value(&error)));
             }
         });
         api::success(json!({ "transfer": queued }))
