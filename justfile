@@ -22,5 +22,9 @@ check: fmt-check lint test coverage
 probe:
     cargo run -- probe-bluez
 
+hardware-smoke:
+    cargo build
+    bash scripts/hardware-smoke.sh target/debug/bt-daemon
+
 nix-check:
     nix flake check --show-trace

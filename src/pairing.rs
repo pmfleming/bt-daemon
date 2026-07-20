@@ -47,21 +47,35 @@ enum PendingResponse {
     Unit(oneshot::Sender<ReqResult<()>>),
 }
 
+struct PendingRequest {
+    response: PendingResponse,
+    event: PairingEvent,
+}
+
 pub struct PairingBroker {
     sequence: AtomicU64,
-    pending: Mutex<HashMap<String, PendingResponse>>,
+    pending: Mutex<HashMap<String, PendingRequest>>,
     events: broadcast::Sender<PairingEvent>,
     identities: Arc<DeviceIdentityRegistry>,
+    prompt_timeout: Duration,
 }
 
 impl PairingBroker {
     pub fn new(identities: Arc<DeviceIdentityRegistry>) -> Arc<Self> {
+        Self::with_timeout(identities, PROMPT_TIMEOUT)
+    }
+
+    fn with_timeout(
+        identities: Arc<DeviceIdentityRegistry>,
+        prompt_timeout: Duration,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(32);
         Arc::new(Self {
             sequence: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             events,
             identities,
+            prompt_timeout,
         })
     }
 
@@ -97,20 +111,24 @@ impl PairingBroker {
             .remove(request_id)
             .context("pairing request is no longer pending")?;
         if !accept {
-            reject(pending);
+            reject(pending.response);
             return Ok(false);
         }
-        match pending {
+        let PendingRequest { response, event } = pending;
+        match response {
             PendingResponse::Pin(sender) => {
                 let value = params
                     .get("value")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if value.is_empty() || value.chars().count() > 16 {
-                    self.pending
-                        .lock()
-                        .await
-                        .insert(request_id.to_string(), PendingResponse::Pin(sender));
+                    self.pending.lock().await.insert(
+                        request_id.to_string(),
+                        PendingRequest {
+                            response: PendingResponse::Pin(sender),
+                            event,
+                        },
+                    );
                     bail!("PIN must contain 1 to 16 characters");
                 }
                 let _ = sender.send(Ok(value.to_string()));
@@ -124,10 +142,13 @@ impl PairingBroker {
                     || value.is_empty()
                     || !value.chars().all(|char| char.is_ascii_digit())
                 {
-                    self.pending
-                        .lock()
-                        .await
-                        .insert(request_id.to_string(), PendingResponse::Passkey(sender));
+                    self.pending.lock().await.insert(
+                        request_id.to_string(),
+                        PendingRequest {
+                            response: PendingResponse::Passkey(sender),
+                            event,
+                        },
+                    );
                     bail!("passkey must contain 1 to 6 digits");
                 }
                 let parsed = value.parse::<u32>().context("parse pairing passkey")?;
@@ -140,38 +161,36 @@ impl PairingBroker {
         Ok(true)
     }
 
-    async fn request_pin(&self, adapter: String, device: Address) -> ReqResult<String> {
+    async fn request_pin(self: &Arc<Self>, adapter: String, device: Address) -> ReqResult<String> {
         let (sender, receiver) = oneshot::channel();
-        let id = self
-            .insert_request(
-                "pin-code",
-                &adapter,
-                device,
-                PendingResponse::Pin(sender),
-                None,
-                None,
-            )
-            .await;
-        wait_for_response(self, id, receiver).await
+        self.insert_request(
+            "pin-code",
+            &adapter,
+            device,
+            PendingResponse::Pin(sender),
+            None,
+            None,
+        )
+        .await;
+        wait_for_response(receiver).await
     }
 
-    async fn request_passkey(&self, adapter: String, device: Address) -> ReqResult<u32> {
+    async fn request_passkey(self: &Arc<Self>, adapter: String, device: Address) -> ReqResult<u32> {
         let (sender, receiver) = oneshot::channel();
-        let id = self
-            .insert_request(
-                "passkey",
-                &adapter,
-                device,
-                PendingResponse::Passkey(sender),
-                None,
-                None,
-            )
-            .await;
-        wait_for_response(self, id, receiver).await
+        self.insert_request(
+            "passkey",
+            &adapter,
+            device,
+            PendingResponse::Passkey(sender),
+            None,
+            None,
+        )
+        .await;
+        wait_for_response(receiver).await
     }
 
     async fn request_unit(
-        &self,
+        self: &Arc<Self>,
         kind: &str,
         adapter: String,
         device: Address,
@@ -179,21 +198,20 @@ impl PairingBroker {
         service: Option<String>,
     ) -> ReqResult<()> {
         let (sender, receiver) = oneshot::channel();
-        let id = self
-            .insert_request(
-                kind,
-                &adapter,
-                device,
-                PendingResponse::Unit(sender),
-                value,
-                service,
-            )
-            .await;
-        wait_for_response(self, id, receiver).await
+        self.insert_request(
+            kind,
+            &adapter,
+            device,
+            PendingResponse::Unit(sender),
+            value,
+            service,
+        )
+        .await;
+        wait_for_response(receiver).await
     }
 
     async fn insert_request(
-        &self,
+        self: &Arc<Self>,
         kind: &str,
         adapter: &str,
         device: Address,
@@ -202,8 +220,7 @@ impl PairingBroker {
         service: Option<String>,
     ) -> String {
         let id = format!("pairing-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
-        self.pending.lock().await.insert(id.clone(), pending);
-        self.emit(PairingEvent {
+        let event = PairingEvent {
             event: "requested".to_string(),
             request_id: id.clone(),
             kind: kind.to_string(),
@@ -213,9 +230,37 @@ impl PairingBroker {
             entered: None,
             service,
             reason: None,
-            timeout_ms: PROMPT_TIMEOUT.as_millis() as u64,
-        });
+            timeout_ms: self.prompt_timeout.as_millis() as u64,
+        };
+        self.pending.lock().await.insert(
+            id.clone(),
+            PendingRequest {
+                response: pending,
+                event: event.clone(),
+            },
+        );
+        self.emit(event);
+        self.schedule_timeout(id.clone());
         id
+    }
+
+    fn schedule_timeout(self: &Arc<Self>, request_id: String) {
+        let broker = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(broker.prompt_timeout).await;
+            let request = broker.pending.lock().await.remove(&request_id);
+            if let Some(request) = request {
+                cancel(request.response);
+                let mut event = request.event;
+                event.event = "cancelled".to_string();
+                event.response_required = false;
+                event.value = None;
+                event.service = None;
+                event.reason = Some("timeout".to_string());
+                event.timeout_ms = 0;
+                broker.emit(event);
+            }
+        });
     }
 
     fn display(
@@ -272,18 +317,10 @@ impl PairingBroker {
     }
 }
 
-async fn wait_for_response<T>(
-    broker: &PairingBroker,
-    id: String,
-    receiver: oneshot::Receiver<ReqResult<T>>,
-) -> ReqResult<T> {
-    match tokio::time::timeout(PROMPT_TIMEOUT, receiver).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(ReqError::Canceled),
-        Err(_) => {
-            broker.pending.lock().await.remove(&id);
-            Err(ReqError::Canceled)
-        }
+async fn wait_for_response<T>(receiver: oneshot::Receiver<ReqResult<T>>) -> ReqResult<T> {
+    match receiver.await {
+        Ok(result) => result,
+        Err(_) => Err(ReqError::Canceled),
     }
 }
 
@@ -297,6 +334,20 @@ fn reject(pending: PendingResponse) {
         }
         PendingResponse::Unit(sender) => {
             let _ = sender.send(Err(ReqError::Rejected));
+        }
+    }
+}
+
+fn cancel(pending: PendingResponse) {
+    match pending {
+        PendingResponse::Pin(sender) => {
+            let _ = sender.send(Err(ReqError::Canceled));
+        }
+        PendingResponse::Passkey(sender) => {
+            let _ = sender.send(Err(ReqError::Canceled));
+        }
+        PendingResponse::Unit(sender) => {
+            let _ = sender.send(Err(ReqError::Canceled));
         }
     }
 }
@@ -410,23 +461,30 @@ mod tests {
 
     use crate::identity::DeviceIdentityRegistry;
 
-    use super::{PairingBroker, PendingResponse};
+    use std::time::Duration;
+
+    use bluer::agent::ReqError;
+
+    use super::PairingBroker;
 
     #[tokio::test]
     async fn rejects_invalid_passkeys_without_answering_bluez() {
         let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
-        let (sender, mut receiver) = tokio::sync::oneshot::channel();
-        broker
-            .pending
-            .lock()
-            .await
-            .insert("request-1".into(), PendingResponse::Passkey(sender));
+        let mut events = broker.subscribe();
+        let request_broker = broker.clone();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let request =
+            tokio::spawn(
+                async move { request_broker.request_passkey("hci0".into(), address).await },
+            );
+        let event = events.recv().await.unwrap();
         let result = broker
-            .respond(&json!({ "request_id": "request-1", "accept": true, "value": "12x" }))
+            .respond(&json!({ "request_id": event.request_id, "accept": true, "value": "12x" }))
             .await;
         assert!(result.is_err());
-        assert!(receiver.try_recv().is_err());
-        assert!(broker.pending.lock().await.contains_key("request-1"));
+        assert!(!request.is_finished());
+        assert!(broker.pending.lock().await.contains_key(&event.request_id));
+        request.abort();
     }
 
     #[tokio::test]
@@ -463,16 +521,43 @@ mod tests {
     #[tokio::test]
     async fn confirmation_response_is_forwarded() {
         let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut events = broker.subscribe();
+        let request_broker = broker.clone();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let request = tokio::spawn(async move {
+            request_broker
+                .request_unit("confirmation", "hci0".into(), address, None, None)
+                .await
+        });
+        let event = events.recv().await.unwrap();
         broker
-            .pending
-            .lock()
-            .await
-            .insert("request-2".into(), PendingResponse::Unit(sender));
-        broker
-            .respond(&json!({ "request_id": "request-2", "accept": true }))
+            .respond(&json!({ "request_id": event.request_id, "accept": true }))
             .await
             .unwrap();
-        assert_eq!(receiver.await.unwrap(), Ok(()));
+        assert_eq!(request.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn timeout_cancels_request_and_emits_terminal_event() {
+        let broker = PairingBroker::with_timeout(
+            DeviceIdentityRegistry::in_memory(),
+            Duration::from_millis(10),
+        );
+        let mut events = broker.subscribe();
+        let request_broker = broker.clone();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let request = tokio::spawn(async move {
+            request_broker
+                .request_unit("confirmation", "hci0".into(), address, None, None)
+                .await
+        });
+        let requested = events.recv().await.unwrap();
+        let cancelled = events.recv().await.unwrap();
+        assert_eq!(cancelled.event, "cancelled");
+        assert_eq!(cancelled.request_id, requested.request_id);
+        assert_eq!(cancelled.reason.as_deref(), Some("timeout"));
+        assert!(!cancelled.response_required);
+        assert_eq!(request.await.unwrap(), Err(ReqError::Canceled));
+        assert!(broker.pending.lock().await.is_empty());
     }
 }

@@ -21,11 +21,14 @@ just check
 nix flake check
 ```
 
-Verify access to BlueZ and print the current adapter/device snapshot:
+Verify access to BlueZ and print the current adapter/device snapshot, or run the read-only live acceptance smoke test:
 
 ```sh
 just probe
+just hardware-smoke
 ```
+
+The tracked interactive hardware matrix and rollout gates are in [`docs/hardware-acceptance.md`](docs/hardware-acceptance.md).
 
 Build or run through Nix:
 
