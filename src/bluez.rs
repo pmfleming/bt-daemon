@@ -19,6 +19,7 @@ use tokio::{
 
 use crate::{
     backend::{BackendError, BackendErrorKind, BluetoothBackend, ObexRemote, ObexTarget},
+    fast_pair::FastPairBatteryProvider,
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
     params::Params,
@@ -31,20 +32,32 @@ pub struct BluezBackend {
     identities: Arc<DeviceIdentityRegistry>,
     last_seen: Mutex<HashMap<String, u64>>,
     system_bus: zbus::Connection,
+    fast_pair: Option<Arc<FastPairBatteryProvider>>,
 }
 
 impl BluezBackend {
     pub async fn new() -> Result<Self> {
         let (changes, _) = broadcast::channel(64);
+        let session = Session::new().await.backend_context("open BlueZ session")?;
+        let system_bus = zbus::Connection::system()
+            .await
+            .context("open system D-Bus for BlueZ compatibility properties")?;
+        let fast_pair = match FastPairBatteryProvider::start(session.clone(), changes.clone()).await
+        {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                tracing::warn!(error = %error, "Fast Pair component battery provider is unavailable");
+                None
+            }
+        };
         Ok(Self {
-            session: Session::new().await.backend_context("open BlueZ session")?,
+            session,
             discovery_tasks: Mutex::new(HashMap::new()),
             changes,
             identities: DeviceIdentityRegistry::load_default()?,
             last_seen: Mutex::new(HashMap::new()),
-            system_bus: zbus::Connection::system()
-                .await
-                .context("open system D-Bus for BlueZ compatibility properties")?,
+            system_bus,
+            fast_pair,
         })
     }
 
@@ -243,6 +256,7 @@ impl BluetoothBackend for BluezBackend {
                     &self.identities,
                     &self.last_seen,
                     &self.system_bus,
+                    self.fast_pair.as_deref(),
                 )
                 .await?
                 {
@@ -524,6 +538,7 @@ async fn device_snapshot(
     identities: &DeviceIdentityRegistry,
     last_seen: &Mutex<HashMap<String, u64>>,
     system_bus: &zbus::Connection,
+    fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<Option<Device>> {
     let identity = device.address();
     let paired = bluez_result(device.is_paired().await, "read device paired state")?;
@@ -566,18 +581,30 @@ async fn device_snapshot(
             seen.get(&key).copied()
         }
     };
-    let battery = bluez_result(device.battery_percentage().await, "read device battery")?
-        .map(|percentage| {
-            vec![Battery {
-                id: "aggregate".to_string(),
-                label: "Battery".to_string(),
-                component: "main".to_string(),
-                percentage,
-                source: "bluez".to_string(),
-                confidence: "standard".to_string(),
-            }]
-        })
-        .unwrap_or_default();
+    let component_battery = if connected {
+        match fast_pair {
+            Some(provider) => provider.batteries(identity).await,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let battery = if component_battery.is_empty() {
+        bluez_result(device.battery_percentage().await, "read device battery")?
+            .map(|percentage| {
+                vec![Battery {
+                    id: "aggregate".to_string(),
+                    label: "Battery".to_string(),
+                    component: "main".to_string(),
+                    percentage,
+                    source: "bluez".to_string(),
+                    confidence: "standard".to_string(),
+                }]
+            })
+            .unwrap_or_default()
+    } else {
+        component_battery
+    };
     let capabilities = device_capabilities(paired, connected, blocked, wake_allowed);
     Ok(Some(Device {
         key,
@@ -728,6 +755,7 @@ fn service_label(uuid: &str) -> &'static str {
         "1124" => "Human Interface Device",
         "1200" => "Device Information",
         "180f" => "Battery Service",
+        "fe2c" => "Fast Pair Message Stream",
         _ => "Bluetooth service",
     }
 }

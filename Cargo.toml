@@ -9,7 +9,7 @@ repository = "https://github.com/pmfleming/bt-daemon"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bluer = { version = "0.17", features = ["bluetoothd", "serde"] }
+bluer = { version = "0.17", features = ["bluetoothd", "rfcomm", "serde"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = "0.4"

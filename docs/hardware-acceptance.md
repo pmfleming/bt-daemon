@@ -30,8 +30,9 @@ Follow-up acceptance on the same machine:
 - Adapter power off/on: **pass**.
 - Sony WF-1000XM5 connect/disconnect: **pass**.
 - Sony WF-1000XM5 pair and remove pairing: **pass**.
-- Sony WF-1000XM5 standard aggregate battery report: **pass**. BlueZ exposes one correct figure; left/right bud and case values are unavailable and intentionally not inferred.
-- The alternate no-trust pairing policy, audio playback/profile readiness, and reconnect behavior remain to be checked separately.
+- Sony WF-1000XM5 standard aggregate battery report: **pass**. BlueZ exposes one correct figure.
+- Sony WF-1000XM5 Fast Pair Message Stream component battery report: **pass**. The authenticated RFCOMM stream reported left `100%`, right `100%`, and case `78%`; the case value was not inferred from BlueZ's aggregate `100%`. BlueZ resolved the documented profile UUID to SDP channel 23 during this run.
+- The alternate no-trust pairing policy, audio playback/profile readiness, component-update behavior as batteries discharge, and reconnect behavior remain to be checked separately.
 
 ## Interactive Rofi-replacement gate
 
@@ -58,7 +59,7 @@ Record a date, device, and result for every row before moving `SUPER+B`.
 
 | Device/workflow | Status |
 |---|---|
-| WF-1000XM5 A2DP playback, battery, reconnect | Partial — pair/connect/disconnect/remove and aggregate battery passed; playback and reconnect pending. Component batteries are unavailable from BlueZ. |
+| WF-1000XM5 A2DP playback, battery, reconnect | Partial — pair/connect/disconnect/remove, aggregate battery, and Fast Pair left/right/case battery passed; playback, live battery-change notification, and reconnect remain pending. |
 | WF-1000XM5 headset microphone profile | Pending |
 | HX audio profiles | Pending |
 | Buds audio profiles and wake behavior | Pending |

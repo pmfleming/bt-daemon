@@ -6,6 +6,7 @@ pub mod backend;
 pub mod bluez;
 pub mod client;
 pub mod daemon;
+pub mod fast_pair;
 pub mod identity;
 pub mod model;
 pub mod obex;
