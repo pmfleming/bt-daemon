@@ -158,6 +158,7 @@ impl PairingBroker {
         if accept {
             request.response.validate(params)?;
         }
+        tracing::info!(%request_id, accept, kind = %request.event.kind, device_key = %request.event.device_key, "pairing response received");
         let response = pending
             .remove(request_id)
             .context("pairing request is no longer pending")?
@@ -242,6 +243,7 @@ impl PairingBroker {
             reason: None,
             timeout_ms: self.prompt_timeout.as_millis() as u64,
         };
+        tracing::info!(request_id = %id, %kind, device_key = %event.device_key, timeout_ms = event.timeout_ms, "pairing request started");
         self.pending.lock().await.insert(
             id.clone(),
             PendingRequest {
@@ -255,10 +257,11 @@ impl PairingBroker {
 
     fn schedule_timeout(self: &Arc<Self>, request_id: String) {
         let broker = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::task::spawn("pairing-timeout", async move {
             tokio::time::sleep(broker.prompt_timeout).await;
             let request = broker.pending.lock().await.remove(&request_id);
             if let Some(request) = request {
+                tracing::warn!(%request_id, kind = %request.event.kind, device_key = %request.event.device_key, "pairing request timed out");
                 cancel(request.response);
                 let mut event = request.event;
                 event.event = "cancelled".to_string();
@@ -284,11 +287,13 @@ impl PairingBroker {
             "pairing-display-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
+        let device_key = self.identities.device_key(adapter, device);
+        tracing::info!(request_id = %id, %kind, %device_key, "pairing display started");
         self.emit(PairingEvent {
             event: "display".to_string(),
             request_id: id.clone(),
             kind: kind.to_string(),
-            device_key: self.identities.device_key(adapter, device),
+            device_key,
             response_required: false,
             value: Some(value),
             entered,
@@ -307,6 +312,7 @@ impl PairingBroker {
         device: Address,
         reason: &str,
     ) {
+        tracing::warn!(%request_id, %kind, %reason, "pairing interaction cancelled");
         self.emit(PairingEvent {
             event: "cancelled".to_string(),
             request_id,
@@ -383,7 +389,7 @@ fn callback_display_pin(broker: Arc<PairingBroker>) -> bluer::agent::DisplayPinC
             let device = request.device;
             let id = broker.display("display-pin", &adapter, device, request.pincode, None);
             let watcher = Arc::clone(&broker);
-            tokio::spawn(async move {
+            crate::task::spawn("pairing-display-pin", async move {
                 let _ = request.cancel.await;
                 watcher.cancelled(id, "display-pin", &adapter, device, "cancelled");
             });
@@ -406,7 +412,7 @@ fn callback_display_passkey(broker: Arc<PairingBroker>) -> bluer::agent::Display
                 Some(request.entered),
             );
             let watcher = Arc::clone(&broker);
-            tokio::spawn(async move {
+            crate::task::spawn("pairing-display-passkey", async move {
                 let _ = request.cancel.await;
                 watcher.cancelled(id, "display-passkey", &adapter, device, "cancelled");
             });

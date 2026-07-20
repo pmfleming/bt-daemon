@@ -47,6 +47,17 @@ The transport implementation follows Google's public [Fast Pair BLE Device](http
 
 `bt-daemon daemon` owns `org.laufan.BluetoothDaemon` on the session bus. `bt-daemon client` bridges newline-delimited frontend JSON through that service and does not bypass daemon policy with direct BlueZ mutations. Device and scan operations receive opaque request IDs and publish lifecycle events; active operations can be cancelled through the transport. Dropping BlueR's Pair future invokes BlueZ `CancelPairing`. Errors distinguish timeout, unavailable-device, rejected, BlueZ-unavailable, validation, and generic failures. The application-specific BlueR pairing agent covers PIN input/display, passkey input/display, numeric confirmation, pairing authorization, service authorization, BlueZ cancellation, and a 60-second prompt timeout without requesting default-agent ownership from Blueman.
 
+## Operational logs
+
+The daemon writes structured lifecycle, operation, transfer, subscription, and error-chain logs to stderr at `debug` level by default. The systemd user service captures them in the journal:
+
+```sh
+journalctl --user -u bt-daemon.service -f
+RUST_LOG=bt_daemon=trace bt-daemon daemon
+```
+
+Request parameters, pairing PINs/passkeys, and full transfer paths are not logged. Errors at D-Bus, BlueZ, OBEX, Fast Pair, PipeWire, task, and client boundaries include their operation context and available error chain for later review.
+
 Inspect the canonical protocol metadata and checked fixture with:
 
 ```sh

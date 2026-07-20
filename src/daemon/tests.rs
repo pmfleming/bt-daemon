@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::{
-    backend::{BluetoothBackend, ObexRemote, ObexTarget},
+    backend::{AdapterOperation, BluetoothBackend, DeviceOperation, ObexRemote, ObexTarget},
     identity::DeviceIdentityRegistry,
     model::Snapshot,
     pairing::PairingBroker,
@@ -42,7 +42,7 @@ impl BluetoothBackend for TestBackend {
         self.snapshot().await
     }
 
-    async fn adapter_operation(&self, _: &str, _: &str, _: &Value) -> Result<Snapshot> {
+    async fn adapter_operation(&self, _: &str, _: AdapterOperation, _: &Value) -> Result<Snapshot> {
         self.snapshot().await
     }
 
@@ -60,7 +60,7 @@ impl BluetoothBackend for TestBackend {
         })
     }
 
-    async fn device_operation(&self, _: &str, _: &str, _: &Value) -> Result<Snapshot> {
+    async fn device_operation(&self, _: &str, _: DeviceOperation, _: &Value) -> Result<Snapshot> {
         if self.complete {
             self.snapshot().await
         } else {

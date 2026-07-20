@@ -83,15 +83,20 @@ impl ScanCoordinator {
             .and_then(Value::as_u64)
             .unwrap_or(15_000)
             .clamp(1_000, 60_000);
+        tracing::info!(?adapter_key, timeout_ms, "Bluetooth scan requested");
         let snapshot = match self
             .backend
             .set_scanning(adapter_key.as_deref(), true)
             .await
         {
             Ok(snapshot) => snapshot,
-            Err(error) => return api::error("scan-start-failed", format!("{error:#}")),
+            Err(error) => {
+                tracing::warn!(?adapter_key, error = %error, error_chain = %format!("{error:#}"), "Bluetooth scan failed to start");
+                return api::error("scan-start-failed", format!("{error:#}"));
+            }
         };
         let request_id = format!("scan-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
+        tracing::info!(%request_id, ?adapter_key, timeout_ms, "Bluetooth scan started");
         let running = ScanEvent {
             event: "started".into(),
             request_id: request_id.clone(),
@@ -106,7 +111,7 @@ impl ScanCoordinator {
         let events = self.events.clone();
         let task_id = request_id.clone();
         let task_adapter = adapter_key.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::task::spawn("scan-timeout", async move {
             tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
             let should_stop = {
                 let mut active = tasks.lock().await;
@@ -117,14 +122,24 @@ impl ScanCoordinator {
                         || task.event.adapter_key == task_adapter
                 })
             };
-            let result = if should_stop {
-                backend.set_scanning(task_adapter.as_deref(), false).await
-            } else {
-                backend.snapshot().await
-            };
+            let result = crate::task::catch("Bluetooth scan completion", async {
+                if should_stop {
+                    backend.set_scanning(task_adapter.as_deref(), false).await
+                } else {
+                    backend.snapshot().await
+                }
+            })
+            .await
+            .and_then(|result| result);
             let (snapshot, error, state) = match result {
-                Ok(snapshot) => (Some(snapshot), None, "completed"),
-                Err(error) => (None, Some(api::error_value(&error)), "failed"),
+                Ok(snapshot) => {
+                    tracing::info!(request_id = %task_id, "Bluetooth scan completed");
+                    (Some(snapshot), None, "completed")
+                }
+                Err(error) => {
+                    tracing::warn!(request_id = %task_id, error = %error, error_chain = %format!("{error:#}"), "Bluetooth scan completion failed");
+                    (None, Some(api::error_value(&error)), "failed")
+                }
             };
             let _ = events.send(ScanEvent {
                 event: state.into(),
@@ -157,11 +172,16 @@ impl ScanCoordinator {
             }
         };
         if removed.is_empty() {
+            tracing::warn!(
+                ?request_id,
+                "Bluetooth scan stop did not match an active scan"
+            );
             return api::error(
                 "request-not-found",
                 "No matching scan is active".to_string(),
             );
         }
+        tracing::info!(?request_id, count = removed.len(), %event, "stopping Bluetooth scan sessions");
         let mut last_snapshot = None;
         for task in removed {
             task.handle.abort();

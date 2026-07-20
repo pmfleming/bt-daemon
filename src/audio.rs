@@ -74,12 +74,76 @@ struct DeviceEndpoints {
     source: Option<AudioEndpoint>,
 }
 
+type ChangeCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 fn initialize() {
     static INITIALIZE: Once = Once::new();
     INITIALIZE.call_once(pw::init);
 }
 
-pub fn monitor(on_change: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<()> {
+fn monitor_relevant(global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>) -> bool {
+    match global.type_ {
+        ObjectType::Device => global
+            .props
+            .is_some_and(|properties| properties.get("device.api") == Some("bluez5")),
+        ObjectType::Node => global.props.is_some_and(|properties| {
+            properties.get("device.api") == Some("bluez5")
+                || properties
+                    .get("node.name")
+                    .is_some_and(|name| name.starts_with("bluez_"))
+        }),
+        ObjectType::Metadata => global
+            .props
+            .is_some_and(|properties| properties.get("metadata.name") == Some("default")),
+        _ => false,
+    }
+}
+
+fn bind_monitor_object(
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
+    objects: &Rc<RefCell<Objects>>,
+    event: ChangeCallback,
+) -> Result<()> {
+    match global.type_ {
+        ObjectType::Device => {
+            let device = registry
+                .bind::<Device, _>(global)
+                .context("bind PipeWire Bluetooth monitor device")?;
+            let info_event = std::sync::Arc::clone(&event);
+            let listener = device
+                .add_listener_local()
+                .info(move |_| info_event())
+                .param(move |_, _, _, _, _| event())
+                .register();
+            objects.borrow_mut().retain(device, listener);
+        }
+        ObjectType::Node => {
+            let node = registry
+                .bind::<Node, _>(global)
+                .context("bind PipeWire Bluetooth monitor node")?;
+            let listener = node.add_listener_local().info(move |_| event()).register();
+            objects.borrow_mut().retain(node, listener);
+        }
+        ObjectType::Metadata => {
+            let metadata = registry
+                .bind::<Metadata, _>(global)
+                .context("bind PipeWire default metadata monitor")?;
+            let listener = metadata
+                .add_listener_local()
+                .property(move |_, _, _, _| {
+                    event();
+                    0
+                })
+                .register();
+            objects.borrow_mut().retain(metadata, listener);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn monitor(on_change: ChangeCallback) -> Result<()> {
     initialize();
     let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire monitor loop")?;
     let context =
@@ -101,60 +165,28 @@ pub fn monitor(on_change: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<()> 
     let _listener = registry
         .add_listener_local()
         .global(move |global| {
-            let relevant = match global.type_ {
-                ObjectType::Device => global
-                    .props
-                    .is_some_and(|properties| properties.get("device.api") == Some("bluez5")),
-                ObjectType::Node => global.props.is_some_and(|properties| {
-                    properties.get("device.api") == Some("bluez5")
-                        || properties
-                            .get("node.name")
-                            .is_some_and(|name| name.starts_with("bluez_"))
-                }),
-                ObjectType::Metadata => global
-                    .props
-                    .is_some_and(|properties| properties.get("metadata.name") == Some("default")),
-                _ => false,
-            };
-            if !relevant {
+            if !monitor_relevant(global) {
                 return;
             }
+            tracing::debug!(id = global.id, object_type = ?global.type_, "PipeWire Bluetooth object added");
             relevant_for_global.borrow_mut().insert(global.id);
             changes_for_global();
             let Some(registry) = registry_weak.upgrade() else {
+                tracing::warn!(id = global.id, "PipeWire registry disappeared while binding object");
                 return;
             };
-            let event = std::sync::Arc::clone(&changes_for_global);
-            let objects = &objects_for_registry;
-            let _ = match global.type_ {
-                ObjectType::Device => registry.bind::<Device, _>(global).ok().map(|device| {
-                    let info_event = std::sync::Arc::clone(&event);
-                    let listener = device
-                        .add_listener_local()
-                        .info(move |_| info_event())
-                        .param(move |_, _, _, _, _| event())
-                        .register();
-                    objects.borrow_mut().retain(device, listener);
-                }),
-                ObjectType::Node => registry.bind::<Node, _>(global).ok().map(|node| {
-                    let listener = node.add_listener_local().info(move |_| event()).register();
-                    objects.borrow_mut().retain(node, listener);
-                }),
-                ObjectType::Metadata => registry.bind::<Metadata, _>(global).ok().map(|metadata| {
-                    let listener = metadata
-                        .add_listener_local()
-                        .property(move |_, _, _, _| {
-                            event();
-                            0
-                        })
-                        .register();
-                    objects.borrow_mut().retain(metadata, listener);
-                }),
-                _ => None,
-            };
+            if let Err(error) = bind_monitor_object(
+                &registry,
+                global,
+                &objects_for_registry,
+                std::sync::Arc::clone(&changes_for_global),
+            ) {
+                tracing::warn!(id = global.id, error = %error, error_chain = %format!("{error:#}"), "could not monitor PipeWire Bluetooth object");
+            }
         })
         .global_remove(move |id| {
             if relevant_for_remove.borrow_mut().remove(&id) {
+                tracing::debug!(id, "PipeWire Bluetooth object removed");
                 changes_for_remove();
             }
         })
@@ -212,10 +244,15 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
             let Some(registry) = registry_weak.upgrade() else {
                 return;
             };
-            let Ok(device) = registry.bind::<Device, _>(global) else {
-                return;
+            let device = match registry.bind::<Device, _>(global) {
+                Ok(device) => device,
+                Err(error) => {
+                    tracing::warn!(id = global.id, %error, "could not bind PipeWire device for profile change");
+                    return;
+                }
             };
             let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
+                tracing::error!("serialized PipeWire profile parameter could not be decoded");
                 return;
             };
             device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
@@ -303,8 +340,12 @@ impl ProbeState {
         global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
         properties: &pw::spa::utils::dict::DictRef,
     ) {
-        let Ok(device) = registry.bind::<Device, _>(global) else {
-            return;
+        let device = match registry.bind::<Device, _>(global) {
+            Ok(device) => device,
+            Err(error) => {
+                tracing::warn!(id = global.id, %error, "could not bind PipeWire Bluetooth device");
+                return;
+            }
         };
         self.devices.borrow_mut().insert(
             global.id,
@@ -382,8 +423,12 @@ impl ProbeState {
                 is_default: false,
             },
         );
-        let Ok(node) = registry.bind::<Node, _>(global) else {
-            return;
+        let node = match registry.bind::<Node, _>(global) {
+            Ok(node) => node,
+            Err(error) => {
+                tracing::warn!(id = global.id, %error, "could not bind PipeWire Bluetooth node");
+                return;
+            }
         };
         let endpoints_for_info = Rc::clone(&self.endpoints);
         let listener = node
@@ -404,8 +449,12 @@ impl ProbeState {
         registry: &pw::registry::RegistryRc,
         global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
     ) {
-        let Ok(metadata) = registry.bind::<Metadata, _>(global) else {
-            return;
+        let metadata = match registry.bind::<Metadata, _>(global) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(id = global.id, %error, "could not bind PipeWire default metadata");
+                return;
+            }
         };
         let defaults_for_events = Rc::clone(&self.defaults);
         let listener = metadata

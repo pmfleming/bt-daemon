@@ -19,11 +19,15 @@ pub(super) async fn respond(incoming: &obex::IncomingBroker, params: &Value) -> 
         Ok(request) => request,
         Err(error) => return api::error("validation-error", error.to_string()),
     };
+    tracing::info!(%request_id, accept, "incoming OBEX authorization response received");
     match incoming.respond(request_id, accept).await {
         Ok(()) => api::success(json!({
             "authorization": { "request_id": request_id, "accepted": accept }
         })),
-        Err(error) => api::error("obex-response-rejected", format!("{error:#}")),
+        Err(error) => {
+            tracing::warn!(%request_id, accept, error = %error, error_chain = %format!("{error:#}"), "incoming OBEX authorization response failed");
+            api::error("obex-response-rejected", format!("{error:#}"))
+        }
     }
 }
 
@@ -52,13 +56,20 @@ impl OutgoingTransfers {
             Ok(params) => params,
             Err(error) => return api::error("validation-error", error.to_string()),
         };
+        tracing::info!(%device_key, "outgoing OBEX transfer requested");
         let target = match self.backend.obex_target(device_key).await {
             Ok(target) => target,
-            Err(error) => return api::error("device-unavailable", format!("{error:#}")),
+            Err(error) => {
+                tracing::warn!(%device_key, error = %error, error_chain = %format!("{error:#}"), "could not resolve outgoing OBEX target");
+                return api::error("device-unavailable", format!("{error:#}"));
+            }
         };
         let transfer = match obex::start_file(&target.source, &target.destination, path).await {
             Ok(transfer) => transfer,
-            Err(error) => return api::error("obex-start-failed", format!("{error:#}")),
+            Err(error) => {
+                tracing::warn!(%device_key, error = %error, error_chain = %format!("{error:#}"), "could not start outgoing OBEX transfer");
+                return api::error("obex-start-failed", format!("{error:#}"));
+            }
         };
         let request_id = format!(
             "obex-transfer-{}",
@@ -67,6 +78,7 @@ impl OutgoingTransfers {
         let file_name = transfer.file_name.clone();
         let size = transfer.size;
         let queued = obex::ObexEvent::outgoing(&request_id, device_key, &file_name, size);
+        tracing::info!(%request_id, %device_key, %file_name, size, "outgoing OBEX transfer queued");
         let (cancel_sender, cancel_receiver) = oneshot::channel();
         self.cancellations
             .lock()
@@ -76,17 +88,23 @@ impl OutgoingTransfers {
         let cancellations = Arc::clone(&self.cancellations);
         let task_id = request_id;
         let task_event = queued.clone();
-        tokio::spawn(async move {
+        crate::task::spawn("outgoing-obex-transfer", async move {
             let update_events = events.clone();
             let update_event = task_event.clone();
-            let result = transfer
-                .run(cancel_receiver, move |update| {
+            let result = crate::task::catch(
+                "outgoing OBEX transfer",
+                transfer.run(cancel_receiver, move |update| {
                     let _ = update_events.send(update_event.updated(update));
-                })
-                .await;
+                }),
+            )
+            .await
+            .and_then(|result| result);
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
+                tracing::warn!(request_id = %task_id, error = %error, error_chain = %format!("{error:#}"), "outgoing OBEX transfer failed");
                 let _ = events.send(task_event.failed(api::error_value(&error)));
+            } else {
+                tracing::info!(request_id = %task_id, "outgoing OBEX transfer completed");
             }
         });
         api::success(json!({ "transfer": queued }))
@@ -97,6 +115,7 @@ impl OutgoingTransfers {
             return false;
         };
         let _ = cancel.send(());
+        tracing::info!(%request_id, "outgoing OBEX transfer cancellation sent");
         true
     }
 }

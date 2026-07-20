@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::IsTerminal, sync::Arc};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -42,11 +42,24 @@ enum DebugCommand {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_thread_ids(true)
+        .with_line_number(true)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("bt_daemon=info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("bt_daemon=debug")),
         )
         .init();
+    let result = run().await;
+    if let Err(error) = &result {
+        tracing::error!(error = %error, error_chain = %format!("{error:#}"), "bt-daemon terminated with an error");
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
+    tracing::info!(command = ?cli.command, "bt-daemon command started");
     match cli.command {
         Command::Daemon => {
             let bluez = Arc::new(BluezBackend::new().await?);

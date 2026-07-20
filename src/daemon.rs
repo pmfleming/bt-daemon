@@ -18,7 +18,7 @@ use zbus::{connection, object_server::SignalEmitter};
 
 use crate::{
     api, audio as pipewire_audio, backend::BluetoothBackend, obex as bluez_obex,
-    pairing::PairingBroker, protocol,
+    pairing::PairingBroker,
 };
 
 pub const BUS_NAME: &str = "org.laufan.BluetoothDaemon";
@@ -33,6 +33,7 @@ mod audio;
 mod obex;
 mod operation;
 mod scan;
+mod subscription;
 
 use self::{obex::OutgoingTransfers, operation::OperationCoordinator, scan::ScanCoordinator};
 
@@ -89,14 +90,20 @@ impl BluetoothDaemon {
 #[zbus::interface(name = "org.laufan.BluetoothDaemon1")]
 impl BluetoothDaemon {
     async fn call(&self, method: &str, params_json: &str) -> String {
+        tracing::info!(%method, "D-Bus request received");
         let params = match serde_json::from_str(params_json) {
             Ok(params) => params,
             Err(error) => {
-                return api::error("validation-error", format!("invalid params JSON: {error}"))
-                    .to_string();
+                tracing::warn!(%method, %error, "D-Bus request contains invalid JSON");
+                let response =
+                    api::error("validation-error", format!("invalid params JSON: {error}"));
+                api::log_response(method, &response);
+                return response.to_string();
             }
         };
-        self.dispatch_call(method, params).await.to_string()
+        let response = self.dispatch_call(method, params).await;
+        api::log_response(method, &response);
+        response.to_string()
     }
 
     async fn subscribe(
@@ -104,91 +111,11 @@ impl BluetoothDaemon {
         streams: Vec<String>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> String {
-        if streams.is_empty()
-            || streams.iter().any(|requested| {
-                !protocol::STREAMS
-                    .iter()
-                    .any(|(supported, _)| requested == supported)
-            })
-        {
-            return api::error(
-                "unsupported-stream",
-                "Subscriptions require bluetooth.changed, pairing.request, bluetooth.operation, bluetooth.scan, bluetooth.audio.changed, and/or bluetooth.obex.transfer"
-                    .to_string(),
-            )
-            .to_string();
-        }
-        let wants = |target| streams.iter().any(|stream| stream == target);
-        let wants_changes = wants(CHANGED_STREAM);
-        let wants_pairing = wants(PAIRING_STREAM);
-        let wants_operations = wants(OPERATION_STREAM);
-        let wants_scans = wants(SCAN_STREAM);
-        let wants_audio = wants(AUDIO_STREAM);
-        let wants_obex = wants(OBEX_STREAM);
-        let id = self.next_id("subscription");
-        let mut changes = self.backend.subscribe_changes();
-        let mut pairing_events = self.pairing.subscribe();
-        let mut operation_events = self.operations.subscribe();
-        let mut scan_events = self.scans.subscribe();
-        let mut audio_events = self.audio_events.subscribe();
-        let mut obex_events = self.obex_events.subscribe();
-        let backend = Arc::clone(&self.backend);
-        let pairing = Arc::clone(&self.pairing);
-        let signal_emitter = emitter.to_owned();
-        let subscription_id = id.clone();
-        let task = tokio::spawn(async move {
-            if wants_changes {
-                emit_snapshot(&signal_emitter, &backend, &subscription_id, "subscribed").await;
-            }
-            if wants_audio {
-                emit_audio(&signal_emitter, &pairing, &subscription_id, "subscribed").await;
-            }
-            loop {
-                tokio::select! {
-                    result = changes.recv(), if wants_changes => match result {
-                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                            while changes.try_recv().is_ok() {}
-                            emit_snapshot(&signal_emitter, &backend, &subscription_id, "changed").await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    result = pairing_events.recv(), if wants_pairing => match result {
-                        Ok(event) => emit_stream(&signal_emitter, PAIRING_STREAM, &subscription_id, &event.event, &event).await,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    result = operation_events.recv(), if wants_operations => match result {
-                        Ok(event) => emit_stream(&signal_emitter, OPERATION_STREAM, &subscription_id, &event.event, &event).await,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    result = scan_events.recv(), if wants_scans => match result {
-                        Ok(event) => emit_stream(&signal_emitter, SCAN_STREAM, &subscription_id, &event.event, &event).await,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    result = audio_events.recv(), if wants_audio => match result {
-                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                            while audio_events.try_recv().is_ok() {}
-                            emit_audio(&signal_emitter, &pairing, &subscription_id, "changed").await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    result = obex_events.recv(), if wants_obex => match result {
-                        Ok(event) => emit_stream(&signal_emitter, OBEX_STREAM, &subscription_id, &event.event, &event).await,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
-        });
-        self.subscriptions.lock().await.insert(id.clone(), task);
-        api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
+        subscription::start(self, streams, emitter).await
     }
 
     async fn cancel(&self, request_id: &str) -> String {
+        tracing::info!(%request_id, "cancellation requested");
         if let Some(task) = self.subscriptions.lock().await.remove(request_id) {
             task.abort();
             return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
@@ -213,6 +140,7 @@ impl BluetoothDaemon {
             return api::success(json!({ "cancelled": request_id, "kind": "obex-transfer" }))
                 .to_string();
         }
+        tracing::warn!(%request_id, "cancellation target was not found");
         api::error(
             "request-not-found",
             format!("No active subscription or operation named {request_id}"),
@@ -250,7 +178,7 @@ async fn emit_snapshot(
         }),
     };
     if let Err(error) = BluetoothDaemon::event(emitter, CHANGED_STREAM, &value.to_string()).await {
-        tracing::debug!(%error, "could not emit Bluetooth subscription event");
+        tracing::warn!(%error, %subscription_id, "could not emit Bluetooth subscription event");
     }
 }
 
@@ -270,7 +198,7 @@ async fn emit_stream<T: Serialize>(
         "data": data,
     });
     if let Err(error) = BluetoothDaemon::event(emitter, stream, &value.to_string()).await {
-        tracing::debug!(%error, %stream, "could not emit subscription event");
+        tracing::warn!(%error, %stream, %subscription_id, "could not emit subscription event");
     }
 }
 
@@ -301,8 +229,30 @@ async fn emit_audio(
         })
     };
     if let Err(error) = BluetoothDaemon::event(emitter, AUDIO_STREAM, &value.to_string()).await {
-        tracing::debug!(%error, "could not emit Bluetooth audio event");
+        tracing::warn!(%error, %subscription_id, "could not emit Bluetooth audio event");
     }
+}
+
+fn start_audio_monitor(events: broadcast::Sender<()>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("bt-pipewire-monitor".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                let sender = events.clone();
+                let notify = Arc::new(move || {
+                    let _ = sender.send(());
+                });
+                if let Err(error) = pipewire_audio::monitor(notify) {
+                    tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "PipeWire audio monitor is retrying");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }));
+            if result.is_err() {
+                tracing::error!("PipeWire audio monitor thread panicked");
+            }
+        })
+        .context("start PipeWire audio monitor thread")?;
+    Ok(())
 }
 
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
@@ -312,19 +262,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     let scans = ScanCoordinator::new(Arc::clone(&backend));
     let outgoing_obex = OutgoingTransfers::new(Arc::clone(&backend), obex_events.clone());
     let incoming_obex = bluez_obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
-    let monitor_events = audio_events.clone();
-    std::thread::spawn(move || {
-        loop {
-            let events = monitor_events.clone();
-            let notify = Arc::new(move || {
-                let _ = events.send(());
-            });
-            if let Err(error) = pipewire_audio::monitor(notify) {
-                tracing::warn!(%error, "PipeWire audio monitor is retrying");
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    });
+    start_audio_monitor(audio_events.clone())?;
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
@@ -355,7 +293,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         .context("start bt-daemon D-Bus service")?;
     incoming_obex.set_connection(connection.clone());
     if let Err(error) = bluez_obex::register_agent(&connection, &incoming_obex).await {
-        tracing::warn!(%error, "incoming OBEX authorization is unavailable");
+        tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "incoming OBEX authorization is unavailable");
     }
     bluez_obex::monitor_agent_owner(connection, incoming_obex);
     tracing::info!(

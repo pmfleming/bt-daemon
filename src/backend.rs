@@ -60,6 +60,62 @@ impl fmt::Display for BackendError {
 
 impl Error for BackendError {}
 
+macro_rules! operation_enum {
+    ($name:ident, $target:literal, {$($variant:ident => $value:literal),+ $(,)?}) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = BackendError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(BackendError::new(
+                        BackendErrorKind::InvalidInput,
+                        format!("unsupported Bluetooth {} operation: {value}", $target),
+                    )),
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+operation_enum!(AdapterOperation, "adapter", {
+    SetAlias => "set-alias",
+    SetDiscoverable => "set-discoverable",
+    SetPairable => "set-pairable",
+    SetDiscoverableTimeout => "set-discoverable-timeout",
+    SetPairableTimeout => "set-pairable-timeout",
+});
+
+operation_enum!(DeviceOperation, "device", {
+    Pair => "pair",
+    Connect => "connect",
+    Disconnect => "disconnect",
+    Remove => "remove",
+    SetTrusted => "set-trusted",
+    SetBlocked => "set-blocked",
+    SetWakeAllowed => "set-wake-allowed",
+    SetAlias => "set-alias",
+});
+
 #[derive(Debug, Clone)]
 pub struct ObexTarget {
     pub source: String,
@@ -81,7 +137,7 @@ pub trait BluetoothBackend: Send + Sync {
     async fn adapter_operation(
         &self,
         adapter_key: &str,
-        operation: &str,
+        operation: AdapterOperation,
         params: &Value,
     ) -> Result<Snapshot>;
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget>;
@@ -89,7 +145,7 @@ pub trait BluetoothBackend: Send + Sync {
     async fn device_operation(
         &self,
         device_key: &str,
-        operation: &str,
+        operation: DeviceOperation,
         params: &Value,
     ) -> Result<Snapshot>;
 }

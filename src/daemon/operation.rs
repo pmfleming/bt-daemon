@@ -13,7 +13,11 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{api, backend::BluetoothBackend, params::Params};
+use crate::{
+    api,
+    backend::{BluetoothBackend, DeviceOperation},
+    params::Params,
+};
 
 #[derive(Clone, Serialize)]
 pub(super) struct OperationEvent {
@@ -100,28 +104,16 @@ impl OperationCoordinator {
 
     pub(super) async fn start(&self, params: Value) -> Value {
         let (device_key, operation) = match params.require_strings("key", "operation") {
-            Ok((key, operation)) => (key.to_string(), operation.to_string()),
+            Ok((key, operation)) => match DeviceOperation::try_from(operation) {
+                Ok(operation) => (key.to_string(), operation),
+                Err(error) => return api::error("validation-error", error.to_string()),
+            },
             Err(error) => return api::error("validation-error", error.to_string()),
         };
-        if !matches!(
-            operation.as_str(),
-            "pair"
-                | "connect"
-                | "disconnect"
-                | "remove"
-                | "set-trusted"
-                | "set-blocked"
-                | "set-wake-allowed"
-                | "set-alias"
-        ) {
-            return api::error(
-                "validation-error",
-                format!("unsupported Bluetooth device operation: {operation}"),
-            );
-        }
 
         let mut state = self.state.lock().await;
         if let Some(request_id) = state.active_devices.get(&device_key) {
+            tracing::warn!(%device_key, %request_id, "Bluetooth device operation rejected because the device is busy");
             return api::error(
                 "device-busy",
                 format!("Device already has active operation {request_id}"),
@@ -131,21 +123,38 @@ impl OperationCoordinator {
             "operation-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
-        let queued =
-            OperationEvent::queued(request_id.clone(), device_key.clone(), operation.clone());
+        let queued = OperationEvent::queued(
+            request_id.clone(),
+            device_key.clone(),
+            operation.to_string(),
+        );
+        tracing::info!(%request_id, %device_key, %operation, "Bluetooth device operation queued");
         let backend = Arc::clone(&self.backend);
         let operation_state = Arc::clone(&self.state);
         let events = self.events.clone();
         let task_event = queued.clone();
+        let task_operation = operation;
         let (start_sender, start_receiver) = oneshot::channel();
-        let handle = tokio::spawn(async move {
+        let handle = crate::task::spawn("device-operation", async move {
             if start_receiver.await.is_err() {
                 return;
             }
+            tracing::info!(request_id = %task_event.request_id, device_key = %task_event.device_key, operation = %task_operation, "Bluetooth device operation started");
             let _ = events.send(task_event.with_state("started", "running"));
-            let result = backend
-                .device_operation(&task_event.device_key, &task_event.operation, &params)
-                .await;
+            let result = crate::task::catch(
+                "Bluetooth backend device operation",
+                backend.device_operation(&task_event.device_key, task_operation, &params),
+            )
+            .await
+            .and_then(|result| result);
+            match &result {
+                Ok(_) => {
+                    tracing::info!(request_id = %task_event.request_id, "Bluetooth device operation completed")
+                }
+                Err(error) => {
+                    tracing::warn!(request_id = %task_event.request_id, error = %error, error_chain = %format!("{error:#}"), "Bluetooth device operation failed")
+                }
+            }
             let mut state = operation_state.lock().await;
             state.tasks.remove(&task_event.request_id);
             if state.active_devices.get(&task_event.device_key) == Some(&task_event.request_id) {
@@ -185,6 +194,7 @@ impl OperationCoordinator {
             return false;
         };
         task.handle.abort();
+        tracing::info!(%request_id, "Bluetooth device operation cancelled");
         let _ = self
             .events
             .send(task.event.with_state("cancelled", "cancelled"));

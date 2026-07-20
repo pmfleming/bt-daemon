@@ -4,6 +4,16 @@ use serde_json::{Value, json};
 
 use crate::{api, audio, pairing::PairingBroker, params::Params};
 
+fn device_address(device: &audio::AudioDevice) -> Option<bluer::Address> {
+    match device.address.parse() {
+        Ok(address) => Some(address),
+        Err(error) => {
+            tracing::warn!(pipewire_id = device.pipewire_id, %error, "PipeWire Bluetooth device has an invalid address");
+            None
+        }
+    }
+}
+
 pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
     let (device_key, profile_key) = match params.require_strings("device_key", "profile_key") {
         Ok(params) => params,
@@ -15,7 +25,7 @@ pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) ->
         Err(error) => return api::error("audio-unavailable", error.to_string()),
     };
     let selection = devices.into_iter().find_map(|device| {
-        let address = device.address.parse().ok()?;
+        let address = device_address(&device)?;
         if device.adapter.is_empty() || pairing.device_key(&device.adapter, address) != device_key {
             return None;
         }
@@ -46,7 +56,7 @@ pub(super) async fn snapshot(pairing: Arc<PairingBroker>) -> Value {
     let devices = devices
         .into_iter()
         .filter_map(|device| {
-            let address = device.address.parse().ok()?;
+            let address = device_address(&device)?;
             if device.adapter.is_empty() {
                 return None;
             }

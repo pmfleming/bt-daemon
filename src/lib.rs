@@ -13,3 +13,4 @@ pub mod obex;
 pub mod pairing;
 mod params;
 pub mod protocol;
+mod task;

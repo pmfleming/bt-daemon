@@ -41,7 +41,14 @@ enum Request {
 type Output = Arc<Mutex<tokio::io::Stdout>>;
 
 pub async fn run() -> Result<()> {
-    let dbus = zbus::Connection::session().await.ok();
+    tracing::info!("JSON-lines client started");
+    let dbus = match zbus::Connection::session().await {
+        Ok(connection) => Some(connection),
+        Err(error) => {
+            tracing::warn!(%error, "client could not connect to session D-Bus");
+            None
+        }
+    };
     let output = Arc::new(Mutex::new(tokio::io::stdout()));
     if let Some(connection) = dbus.clone() {
         spawn_event_forwarder(connection.clone(), Arc::clone(&output));
@@ -55,6 +62,7 @@ pub async fn run() -> Result<()> {
             Ok(Some(request)) => request,
             Ok(None) => continue,
             Err(error) => {
+                tracing::warn!(%error, "client received invalid JSON request");
                 emit(
                     &output,
                     &json!({ "kind": "protocol-error", "error": error.to_string() }),
@@ -82,11 +90,14 @@ async fn handle_request(
             let output = Arc::clone(output);
             calls.spawn(async move {
                 let response = dispatch(&connection, &method, params).await;
-                let _ = emit(
+                if let Err(error) = emit(
                     &output,
                     &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(%error, "client could not emit call response");
+                }
             });
         }
         Request::Subscribe { id, streams } => {
@@ -98,10 +109,14 @@ async fn handle_request(
             emit_transport_response(output, &id, response).await?;
         }
         Request::Shutdown { id } => {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while calls.join_next().await.is_some() {}
             })
-            .await;
+            .await
+            .is_err()
+            {
+                tracing::warn!("client shutdown timed out while waiting for calls");
+            }
             calls.abort_all();
             emit(
                 output,
@@ -115,22 +130,35 @@ async fn handle_request(
 }
 
 async fn dispatch(connection: &Option<zbus::Connection>, method: &str, params: Value) -> Value {
-    if let Some(connection) = connection
-        && let Ok(proxy) = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE).await
-    {
-        let params_json = params.to_string();
-        let response: zbus::Result<String> =
-            proxy.call("Call", &(method, params_json.as_str())).await;
-        if let Ok(response) = response
-            && let Ok(value) = serde_json::from_str(&response)
-        {
-            return value;
+    match call_daemon(connection, method, params).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%method, error = %error, error_chain = %format!("{error:#}"), "client call to daemon failed");
+            api::error(
+                "daemon-unavailable",
+                "bt-daemon session service is unavailable".to_string(),
+            )
         }
     }
-    api::error(
-        "daemon-unavailable",
-        "bt-daemon session service is unavailable".to_string(),
-    )
+}
+
+async fn call_daemon(
+    connection: &Option<zbus::Connection>,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let connection = connection
+        .as_ref()
+        .context("session D-Bus connection is unavailable")?;
+    let proxy = zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE)
+        .await
+        .context("create bt-daemon client proxy")?;
+    let params_json = params.to_string();
+    let response: String = proxy
+        .call("Call", &(method, params_json.as_str()))
+        .await
+        .context("call bt-daemon")?;
+    serde_json::from_str(&response).context("decode bt-daemon response")
 }
 
 async fn call_subscribe(
@@ -157,7 +185,7 @@ async fn call_cancel(
 
 fn spawn_owner_watcher(connection: zbus::Connection, output: Output) {
     let task_output = Arc::clone(&output);
-    spawn_transport_task(output, async move {
+    spawn_transport_task("client-owner-watch", output, async move {
         let proxy = zbus::Proxy::new(
             &connection,
             "org.freedesktop.DBus",
@@ -184,7 +212,7 @@ fn spawn_owner_watcher(connection: zbus::Connection, output: Output) {
 
 fn spawn_event_forwarder(connection: zbus::Connection, output: Output) {
     let task_output = Arc::clone(&output);
-    spawn_transport_task(output, async move {
+    spawn_transport_task("client-event-forwarder", output, async move {
         let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
         let mut signals = proxy.receive_signal("Event").await?;
         while let Some(message) = signals.next().await {
@@ -201,16 +229,21 @@ fn spawn_event_forwarder(connection: zbus::Connection, output: Output) {
 }
 
 fn spawn_transport_task(
+    name: &'static str,
     output: Output,
     task: impl std::future::Future<Output = Result<()>> + Send + 'static,
 ) {
-    tokio::spawn(async move {
+    crate::task::spawn(name, async move {
         if let Err(error) = task.await {
-            let _ = emit(
+            tracing::warn!(task = name, error = %error, error_chain = %format!("{error:#}"), "client transport task failed");
+            if let Err(emit_error) = emit(
                 &output,
                 &json!({ "kind": "transport-error", "error": error.to_string() }),
             )
-            .await;
+            .await
+            {
+                tracing::error!(task = name, %emit_error, "client could not report transport failure");
+            }
         }
     });
 }
@@ -220,6 +253,9 @@ async fn emit_transport_response(
     id: &str,
     response: zbus::Result<Value>,
 ) -> Result<()> {
+    if let Err(error) = &response {
+        tracing::warn!(%id, %error, "client transport request failed");
+    }
     let value = transport_response(id, response.map_err(|error| error.to_string()));
     emit(output, &value).await
 }

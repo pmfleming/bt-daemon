@@ -205,6 +205,7 @@ impl IncomingBroker {
     }
 
     pub async fn respond(&self, request_id: &str, accept: bool) -> Result<()> {
+        tracing::info!(%request_id, accept, "answering incoming OBEX authorization");
         let pending = self
             .pending
             .lock()
@@ -222,10 +223,12 @@ impl IncomingBroker {
 
     pub async fn cancel_transfer(&self, request_id: &str) -> bool {
         if let Some(pending) = self.pending.lock().await.remove(request_id) {
+            tracing::info!(%request_id, "cancelling pending incoming OBEX authorization");
             let _ = pending.sender.send(AuthorizationDecision::Cancel);
             return true;
         }
         if let Some(cancel) = self.cancellations.lock().await.remove(request_id) {
+            tracing::info!(%request_id, "cancelling active incoming OBEX transfer");
             let _ = cancel.send(());
             return true;
         }
@@ -294,6 +297,7 @@ impl IncomingBroker {
             authorization.request_id.clone(),
             PendingAuthorization { sender },
         );
+        tracing::info!(request_id = %authorization.request_id, device_key = %authorization.remote.device_key, file_name = %authorization.file_name, size = authorization.details.size, "incoming OBEX authorization requested");
         let requested = authorization.event(
             "authorization-requested",
             "awaiting-authorization",
@@ -301,9 +305,16 @@ impl IncomingBroker {
         );
         let _ = self.events.send(requested);
         match tokio::time::timeout(AUTHORIZATION_TIMEOUT, receiver).await {
-            Ok(Ok(decision)) => Ok(decision),
-            Ok(Err(_)) => Ok(AuthorizationDecision::Cancel),
+            Ok(Ok(decision)) => {
+                tracing::info!(request_id = %authorization.request_id, "incoming OBEX authorization answered");
+                Ok(decision)
+            }
+            Ok(Err(_)) => {
+                tracing::warn!(request_id = %authorization.request_id, "incoming OBEX authorization responder disappeared");
+                Ok(AuthorizationDecision::Cancel)
+            }
             Err(_) => {
+                tracing::warn!(request_id = %authorization.request_id, "incoming OBEX authorization timed out");
                 self.pending.lock().await.remove(&authorization.request_id);
                 let _ = self
                     .events
@@ -337,15 +348,20 @@ impl IncomingBroker {
         let task_id = authorization.request_id.clone();
         let event = authorization.event("queued", "queued", None);
         let destination = authorization.destination.to_string_lossy().into_owned();
-        tokio::spawn(async move {
-            let result = monitor_incoming(
-                &authorization.connection,
-                authorization.transfer_path,
-                cancel_receiver,
-                event.clone(),
-                &events,
+        tracing::info!(request_id = %authorization.request_id, device_key = %authorization.remote.device_key, file_name = %authorization.file_name, "incoming OBEX transfer queued");
+        crate::task::spawn("incoming-obex-transfer", async move {
+            let result = crate::task::catch(
+                "incoming OBEX transfer",
+                monitor_incoming(
+                    &authorization.connection,
+                    authorization.transfer_path,
+                    cancel_receiver,
+                    event.clone(),
+                    &events,
+                ),
             )
-            .await;
+            .await
+            .and_then(|result| result);
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
                 let error = serde_json::json!({
@@ -414,11 +430,12 @@ pub async fn register_agent(
         .await
         .context("register incoming OBEX authorization agent")?;
     broker.available.store(true, Ordering::Relaxed);
+    tracing::info!(path = AGENT_PATH, "incoming OBEX agent registered");
     Ok(())
 }
 
 pub fn monitor_agent_owner(connection: zbus::Connection, broker: Arc<IncomingBroker>) {
-    tokio::spawn(async move {
+    crate::task::spawn("obex-agent-owner", async move {
         loop {
             let result = watch_agent_owner(&connection, &broker).await;
             broker.available.store(false, Ordering::Relaxed);
@@ -500,6 +517,7 @@ pub async fn start_file(
     destination: &str,
     selected_path: &str,
 ) -> Result<ActiveTransfer> {
+    tracing::debug!("creating outgoing OBEX session");
     let path = validate_outgoing_path(selected_path)?;
     let metadata = std::fs::metadata(&path).context("read outgoing file metadata")?;
     let file_name = path
@@ -533,9 +551,12 @@ pub async fn start_file(
     let (transfer_path, properties) = match transfer_result {
         Ok(result) => result,
         Err(error) => {
-            let _ = client
+            if let Err(cleanup_error) = client
                 .call::<_, _, ()>("RemoveSession", &(session_path.clone(),))
-                .await;
+                .await
+            {
+                tracing::warn!(%cleanup_error, path = %session_path, "could not clean up failed OBEX session");
+            }
             return Err(error);
         }
     };
@@ -607,14 +628,22 @@ impl ActiveTransfer {
             Ok(())
         }
         .await;
-        if let Ok(client) =
-            zbus::Proxy::new(&self.connection, BUS_NAME, OBJECT_PATH, CLIENT_INTERFACE).await
-        {
-            let _ = client
-                .call::<_, _, ()>("RemoveSession", &(self.session_path,))
-                .await;
-        }
+        cleanup_session(&self.connection, self.session_path).await;
         result
+    }
+}
+
+async fn cleanup_session(connection: &zbus::Connection, session_path: OwnedObjectPath) {
+    match zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, CLIENT_INTERFACE).await {
+        Ok(client) => {
+            if let Err(error) = client
+                .call::<_, _, ()>("RemoveSession", &(session_path,))
+                .await
+            {
+                tracing::warn!(%error, "could not remove completed OBEX session");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not create OBEX client for session cleanup"),
     }
 }
 
@@ -700,6 +729,7 @@ async fn monitor_incoming(
     event.transferred = property_u64(&initial, "Transferred").unwrap_or(0);
     event.size = property_u64(&initial, "Size").unwrap_or(event.size);
     event.event = lifecycle_event(&event.status).into();
+    tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
     let _ = events.send(event.clone());
     while !matches!(event.status.as_str(), "complete" | "error" | "cancelled") {
         tokio::select! {
@@ -721,6 +751,7 @@ async fn monitor_incoming(
                     event.transferred = value;
                 }
                 event.event = lifecycle_event(&event.status).into();
+                tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
                 let _ = events.send(event.clone());
             }
         }

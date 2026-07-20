@@ -18,7 +18,10 @@ use tokio::{
 };
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BluetoothBackend, ObexRemote, ObexTarget},
+    backend::{
+        AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
+        ObexRemote, ObexTarget,
+    },
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
@@ -37,6 +40,7 @@ pub struct BluezBackend {
 
 impl BluezBackend {
     pub async fn new() -> Result<Self> {
+        tracing::info!("initializing BlueZ backend");
         let (changes, _) = broadcast::channel(64);
         let session = Session::new().await.backend_context("open BlueZ session")?;
         let system_bus = zbus::Connection::system()
@@ -50,6 +54,7 @@ impl BluezBackend {
                 None
             }
         };
+        tracing::info!(fast_pair = fast_pair.is_some(), "BlueZ backend initialized");
         Ok(Self {
             session,
             discovery_tasks: Mutex::new(HashMap::new()),
@@ -73,13 +78,15 @@ impl BluezBackend {
     }
 
     pub fn start_monitoring(self: &Arc<Self>) {
+        tracing::info!("BlueZ event monitor started");
         let backend = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::task::spawn("bluez-monitor", async move {
             loop {
                 if let Err(error) = backend.monitor_one_change().await {
                     tracing::warn!(error = %error, "BlueZ event monitor is retrying");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+                tracing::trace!("BlueZ change notification received");
                 let _ = backend.changes.send(());
             }
         });
@@ -96,21 +103,8 @@ impl BluezBackend {
                 .boxed(),
         );
         for adapter in self.adapters().await? {
-            streams.push(
-                adapter
-                    .events()
-                    .await
-                    .backend_context("watch adapter changes")?
-                    .map(|_| ())
-                    .boxed(),
-            );
-            for address in adapter.device_addresses().await.unwrap_or_default() {
-                let Ok(device) = adapter.device(address) else {
-                    continue;
-                };
-                if let Ok(events) = device.events().await {
-                    streams.push(events.map(|_| ()).boxed());
-                }
+            if let Err(error) = append_adapter_event_streams(&adapter, &mut streams).await {
+                tracing::warn!(adapter = adapter.name(), error = %error, error_chain = %format!("{error:#}"), "could not monitor BlueZ adapter");
             }
         }
         streams.next().await.context("BlueZ event streams ended")
@@ -180,7 +174,9 @@ impl BluezBackend {
             .backend_context(&format!("start discovery on {name}"))?;
         tasks.insert(
             name,
-            tokio::spawn(async move { while events.next().await.is_some() {} }),
+            crate::task::spawn("bluez-discovery", async move {
+                while events.next().await.is_some() {}
+            }),
         );
         Ok(())
     }
@@ -223,10 +219,16 @@ impl BluetoothBackend for BluezBackend {
                 device.name.to_lowercase(),
             )
         });
+        tracing::debug!(
+            adapters = snapshot.adapters.len(),
+            devices = snapshot.devices.len(),
+            "BlueZ snapshot completed"
+        );
         Ok(snapshot)
     }
 
     async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot> {
+        tracing::info!(?adapter_key, powered, "setting Bluetooth adapter power");
         if let Some(key) = adapter_key {
             self.find_adapter(key)
                 .await?
@@ -248,6 +250,7 @@ impl BluetoothBackend for BluezBackend {
     }
 
     async fn set_scanning(&self, adapter_key: Option<&str>, enabled: bool) -> Result<Snapshot> {
+        tracing::info!(?adapter_key, enabled, "setting Bluetooth discovery state");
         if let Some(key) = adapter_key {
             set_adapter_scanning(self, self.find_adapter(key).await?, enabled).await?;
         } else if enabled {
@@ -263,37 +266,38 @@ impl BluetoothBackend for BluezBackend {
     async fn adapter_operation(
         &self,
         adapter_key: &str,
-        operation: &str,
+        operation: AdapterOperation,
         params: &Value,
     ) -> Result<Snapshot> {
+        tracing::info!(%adapter_key, %operation, "Bluetooth adapter operation started");
         let adapter = self.find_adapter(adapter_key).await?;
         match operation {
-            "set-alias" => adapter
+            AdapterOperation::SetAlias => adapter
                 .set_alias(params.require_string("alias")?.to_string())
                 .await
                 .backend_context("set adapter alias")?,
-            "set-discoverable" => adapter
+            AdapterOperation::SetDiscoverable => adapter
                 .set_discoverable(params.require_bool("discoverable")?)
                 .await
                 .backend_context("set adapter discoverable state")?,
-            "set-pairable" => adapter
+            AdapterOperation::SetPairable => adapter
                 .set_pairable(params.require_bool("pairable")?)
                 .await
                 .backend_context("set adapter pairable state")?,
-            "set-discoverable-timeout" => adapter
+            AdapterOperation::SetDiscoverableTimeout => adapter
                 .set_discoverable_timeout(params.require_u32("timeout")?)
                 .await
                 .backend_context("set adapter discoverable timeout")?,
-            "set-pairable-timeout" => adapter
+            AdapterOperation::SetPairableTimeout => adapter
                 .set_pairable_timeout(params.require_u32("timeout")?)
                 .await
                 .backend_context("set adapter pairable timeout")?,
-            _ => return Err(unsupported_operation("adapter", operation)),
         }
         self.snapshot().await
     }
 
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
+        tracing::debug!(%device_key, "resolving outgoing OBEX target");
         let (adapter, device) = self.find_device(device_key).await?;
         Ok(ObexTarget {
             source: adapter
@@ -306,6 +310,7 @@ impl BluetoothBackend for BluezBackend {
     }
 
     async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote> {
+        tracing::debug!("validating incoming OBEX remote");
         let source = source.parse().map_err(|error| {
             BackendError::new(
                 BackendErrorKind::InvalidInput,
@@ -359,13 +364,42 @@ impl BluetoothBackend for BluezBackend {
     async fn device_operation(
         &self,
         device_key: &str,
-        operation: &str,
+        operation: DeviceOperation,
         params: &Value,
     ) -> Result<Snapshot> {
+        tracing::info!(%device_key, %operation, "Bluetooth device operation started");
         let (adapter, device) = self.find_device(device_key).await?;
         run_device_operation(&adapter, &device, operation, params).await?;
         self.snapshot().await
     }
+}
+
+async fn append_adapter_event_streams(
+    adapter: &BluezAdapter,
+    streams: &mut SelectAll<BoxStream<'static, ()>>,
+) -> Result<()> {
+    streams.push(
+        adapter
+            .events()
+            .await
+            .backend_context("watch adapter changes")?
+            .map(|_| ())
+            .boxed(),
+    );
+    for address in adapter
+        .device_addresses()
+        .await
+        .backend_context("list monitored adapter devices")?
+    {
+        let device = adapter
+            .device(address)
+            .backend_context("open monitored BlueZ device")?;
+        match device.events().await {
+            Ok(events) => streams.push(events.map(|_| ()).boxed()),
+            Err(error) => tracing::warn!(%address, %error, "could not monitor BlueZ device events"),
+        }
+    }
+    Ok(())
 }
 
 async fn set_adapter_scanning(
@@ -448,31 +482,32 @@ async fn adapter_snapshot(adapter: &BluezAdapter, key: &str) -> Result<Adapter> 
 async fn run_device_operation(
     adapter: &BluezAdapter,
     device: &BluezDevice,
-    operation: &str,
+    operation: DeviceOperation,
     params: &Value,
 ) -> Result<()> {
     match operation {
-        "pair" => pair_device(device, params).await?,
-        "connect" => connect_device(device, "connect Bluetooth device").await?,
-        "disconnect" => disconnect_device(device, "disconnect Bluetooth device").await?,
-        "remove" => remove_device(adapter, device).await?,
-        "set-trusted" => device
+        DeviceOperation::Pair => pair_device(device, params).await?,
+        DeviceOperation::Connect => connect_device(device, "connect Bluetooth device").await?,
+        DeviceOperation::Disconnect => {
+            disconnect_device(device, "disconnect Bluetooth device").await?
+        }
+        DeviceOperation::Remove => remove_device(adapter, device).await?,
+        DeviceOperation::SetTrusted => device
             .set_trusted(params.require_bool("trusted")?)
             .await
             .backend_context("set trusted state")?,
-        "set-blocked" => device
+        DeviceOperation::SetBlocked => device
             .set_blocked(params.require_bool("blocked")?)
             .await
             .backend_context("set blocked state")?,
-        "set-wake-allowed" => device
+        DeviceOperation::SetWakeAllowed => device
             .set_wake_allowed(params.require_bool("wake_allowed")?)
             .await
             .backend_context("set wake permission")?,
-        "set-alias" => device
+        DeviceOperation::SetAlias => device
             .set_alias(params.require_string("alias")?.to_string())
             .await
             .backend_context("set device alias")?,
-        _ => return Err(unsupported_operation("device", operation)),
     }
     Ok(())
 }
@@ -516,14 +551,6 @@ async fn remove_device(adapter: &BluezAdapter, device: &BluezDevice) -> Result<(
         .remove_device(device.address())
         .await
         .backend_context("remove Bluetooth device")
-}
-
-fn unsupported_operation(target: &str, operation: &str) -> anyhow::Error {
-    BackendError::new(
-        BackendErrorKind::InvalidInput,
-        format!("unsupported Bluetooth {target} operation: {operation}"),
-    )
-    .into()
 }
 
 async fn adapter_key(adapter: &BluezAdapter) -> Result<String> {
@@ -766,6 +793,7 @@ fn bluez_result<T>(result: bluer::Result<T>, operation: &str) -> Result<T> {
             | bluer::ErrorKind::InvalidName(_) => BackendErrorKind::InvalidInput,
             _ => BackendErrorKind::OperationFailed,
         };
+        tracing::warn!(%operation, code = kind.code(), %error, "BlueZ operation failed");
         BackendError::new(kind, format!("{operation}: {error}")).into()
     })
 }
@@ -825,10 +853,20 @@ async fn bonded_property(
         "/org/bluez/{adapter}/dev_{}",
         address.to_string().replace(':', "_")
     );
-    let proxy = zbus::Proxy::new(connection, "org.bluez", path, "org.bluez.Device1")
-        .await
-        .ok()?;
-    proxy.get_property::<bool>("Bonded").await.ok()
+    let proxy = match zbus::Proxy::new(connection, "org.bluez", path, "org.bluez.Device1").await {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            tracing::debug!(%adapter, %address, %error, "BlueZ Bonded compatibility proxy is unavailable");
+            return None;
+        }
+    };
+    match proxy.get_property::<bool>("Bonded").await {
+        Ok(bonded) => Some(bonded),
+        Err(error) => {
+            tracing::debug!(%adapter, %address, %error, "BlueZ Bonded compatibility property is unavailable");
+            None
+        }
+    }
 }
 
 fn modalias_string(value: bluer::Modalias) -> String {
