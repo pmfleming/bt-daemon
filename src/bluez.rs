@@ -19,7 +19,7 @@ use tokio::{
 
 use crate::{
     backend::{BackendError, BackendErrorKind, BluetoothBackend, ObexRemote, ObexTarget},
-    fast_pair::FastPairBatteryProvider,
+    fast_pair::{FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
     params::Params,
@@ -735,6 +735,12 @@ async fn operation_timeout<T>(
 }
 
 fn service_label(uuid: &str) -> &'static str {
+    if uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID) {
+        return "Fast Pair Message Stream";
+    }
+    if uuid.eq_ignore_ascii_case("0000fe2c-0000-1000-8000-00805f9b34fb") {
+        return "Fast Pair Service";
+    }
     match uuid
         .get(4..8)
         .unwrap_or_default()
@@ -755,7 +761,6 @@ fn service_label(uuid: &str) -> &'static str {
         "1124" => "Human Interface Device",
         "1200" => "Device Information",
         "180f" => "Battery Service",
-        "fe2c" => "Fast Pair Message Stream",
         _ => "Bluetooth service",
     }
 }
@@ -790,7 +795,7 @@ fn signal_strength(rssi: i16) -> u8 {
 mod tests {
     use crate::backend::{BackendError, BackendErrorKind};
 
-    use super::{bluez_result, device_capabilities, opaque_key, signal_strength};
+    use super::{bluez_result, device_capabilities, opaque_key, service_label, signal_strength};
 
     #[test]
     fn adapter_keys_are_opaque_and_deterministic() {
@@ -799,6 +804,18 @@ mod tests {
             opaque_key("adapter", "hci0:AA")
         );
         assert!(!opaque_key("adapter", "hci0:AA").contains("AA"));
+    }
+
+    #[test]
+    fn fast_pair_service_labels_distinguish_gatt_and_message_stream() {
+        assert_eq!(
+            service_label("0000fe2c-0000-1000-8000-00805f9b34fb"),
+            "Fast Pair Service"
+        );
+        assert_eq!(
+            service_label("df21fe2c-2515-4fdb-8886-f12c4d67927c"),
+            "Fast Pair Message Stream"
+        );
     }
 
     #[test]

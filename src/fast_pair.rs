@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn live_wf_1000xm5_frame_maps_to_component_model() {
+    fn three_component_update_maps_to_component_model() {
         let report = BatteryReport::from_payload(&[0x64, 0x64, 0x4e]).unwrap();
         let batteries = report.model_batteries();
         assert_eq!(
@@ -457,11 +457,15 @@ mod tests {
 
     #[test]
     fn unknown_components_are_not_inferred() {
-        let report = BatteryReport::from_payload(&[0x32, 0x7f, 0xff]).unwrap();
+        let report = BatteryReport::from_payload(&[0x64, 0x64, 0xff]).unwrap();
         let batteries = report.model_batteries();
-        assert_eq!(batteries.len(), 1);
-        assert_eq!(batteries[0].component, "left");
-        assert_eq!(batteries[0].percentage, 50);
+        assert_eq!(
+            batteries
+                .iter()
+                .map(|battery| (battery.component.as_str(), battery.percentage))
+                .collect::<Vec<_>>(),
+            [("left", 100), ("right", 100)]
+        );
         assert!(BatteryReport::from_payload(&[1, 2]).is_err());
     }
 }
