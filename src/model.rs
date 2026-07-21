@@ -49,6 +49,7 @@ pub struct Device {
     pub fast_pair: Option<FastPairFeatures>,
     pub rssi: Option<i16>,
     pub signal_strength: Option<u8>,
+    pub signal_live: bool,
     pub present: bool,
     pub last_seen_ms: Option<u64>,
     pub capabilities: DeviceCapabilities,

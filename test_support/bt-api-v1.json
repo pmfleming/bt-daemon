@@ -354,6 +354,7 @@
               }
             ],
             "services_resolved": true,
+            "signal_live": false,
             "signal_strength": null,
             "trusted": true,
             "uuids": [

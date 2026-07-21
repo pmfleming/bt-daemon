@@ -28,12 +28,20 @@ use crate::{
     params::Params,
 };
 
+const DISCOVERED_DEVICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone)]
+struct CachedDevice {
+    device: Device,
+    observed_at_ms: u64,
+}
+
 pub struct BluezBackend {
     session: Session,
     discovery_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     changes: broadcast::Sender<()>,
     identities: Arc<DeviceIdentityRegistry>,
-    last_seen: Mutex<HashMap<String, u64>>,
+    device_cache: Mutex<HashMap<String, CachedDevice>>,
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
 }
@@ -80,7 +88,7 @@ impl BluezBackend {
             discovery_tasks: Mutex::new(HashMap::new()),
             changes,
             identities,
-            last_seen: Mutex::new(HashMap::new()),
+            device_cache: Mutex::new(HashMap::new()),
             system_bus,
             fast_pair,
         })
@@ -203,14 +211,28 @@ impl BluezBackend {
 
     async fn stop_discovery(&self, adapter_name: Option<&str>) {
         let mut tasks = self.discovery_tasks.lock().await;
-        if let Some(name) = adapter_name {
-            if let Some(task) = tasks.remove(name) {
-                task.abort();
-            }
+        let stopped = if let Some(name) = adapter_name {
+            tasks
+                .remove(name)
+                .map(|task| {
+                    task.abort();
+                    true
+                })
+                .unwrap_or(false)
         } else {
+            let stopped = !tasks.is_empty();
             for (_, task) in tasks.drain() {
                 task.abort();
             }
+            stopped
+        };
+        drop(tasks);
+        if stopped {
+            let changes = self.changes.clone();
+            crate::task::spawn("bluetooth-cache-expiry", async move {
+                tokio::time::sleep(DISCOVERED_DEVICE_CACHE_TTL).await;
+                let _ = changes.send(());
+            });
         }
     }
 }
@@ -222,6 +244,11 @@ impl BluetoothBackend for BluezBackend {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
+        let now_ms = unix_time_ms();
+        self.device_cache
+            .lock()
+            .await
+            .retain(|_, cached| cache_entry_is_fresh(cached.observed_at_ms, now_ms));
         let mut snapshot = Snapshot::default();
         for adapter in self.adapters().await? {
             let address = adapter
@@ -362,6 +389,9 @@ impl BluetoothBackend for BluezBackend {
             self.fast_pair.as_deref(),
         )
         .await?;
+        if operation == DeviceOperation::Remove {
+            self.device_cache.lock().await.remove(device_key);
+        }
         self.snapshot().await
     }
 }
@@ -470,6 +500,7 @@ async fn adapter_devices(
     adapter_key: &str,
 ) -> Result<Vec<Device>> {
     let mut devices = Vec::new();
+    let mut included = std::collections::HashSet::new();
     for address in adapter
         .device_addresses()
         .await
@@ -483,15 +514,29 @@ async fn adapter_devices(
             &device,
             adapter_key,
             &backend.identities,
-            &backend.last_seen,
+            &backend.device_cache,
             &backend.system_bus,
             backend.fast_pair.as_deref(),
         )
         .await?
         {
+            included.insert(snapshot.key.clone());
             devices.push(snapshot);
         }
     }
+
+    let now_ms = unix_time_ms();
+    let cached = backend.device_cache.lock().await;
+    devices.extend(
+        cached
+            .values()
+            .filter(|cached| {
+                cached.device.adapter_key == adapter_key
+                    && !included.contains(&cached.device.key)
+                    && cache_entry_is_fresh(cached.observed_at_ms, now_ms)
+            })
+            .map(cached_device_view),
+    );
     Ok(devices)
 }
 
@@ -690,15 +735,24 @@ async fn device_snapshot(
     device: &BluezDevice,
     adapter_key: &str,
     identities: &DeviceIdentityRegistry,
-    last_seen: &Mutex<HashMap<String, u64>>,
+    device_cache: &Mutex<HashMap<String, CachedDevice>>,
     system_bus: &zbus::Connection,
     fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<Option<Device>> {
     let paired = bluez_result(device.is_paired().await, "read device paired state")?;
     let connected = bluez_result(device.is_connected().await, "read device connected state")?;
-    let rssi = bluez_result(device.rssi().await, "read device signal strength")?;
-    let present = rssi.is_some() || connected;
-    if !paired && !present {
+    let live_rssi = bluez_result(device.rssi().await, "read device signal strength")?;
+    let present = live_rssi.is_some() || connected;
+    let identity = device.address();
+    let key = identities.device_key(adapter.name(), identity);
+    let now_ms = unix_time_ms();
+    let cached = device_cache
+        .lock()
+        .await
+        .get(&key)
+        .filter(|cached| cache_entry_is_fresh(cached.observed_at_ms, now_ms))
+        .cloned();
+    if !should_include_device(paired, present, cached.is_some()) {
         return Ok(None);
     }
     let trusted = bluez_result(device.is_trusted().await, "read device trusted state")?;
@@ -707,9 +761,7 @@ async fn device_snapshot(
         device.is_wake_allowed().await,
         "read device wake permission",
     )?;
-    let identity = device.address();
     let metadata = DeviceMetadata::read(device).await?;
-    let key = identities.device_key(adapter.name(), identity);
     let services = metadata
         .uuids
         .iter()
@@ -718,7 +770,14 @@ async fn device_snapshot(
             label: service_label(uuid).to_string(),
         })
         .collect();
-    let last_seen_ms = update_last_seen(last_seen, &key, present).await;
+    let last_seen_ms = if present {
+        Some(now_ms)
+    } else {
+        cached
+            .as_ref()
+            .and_then(|cached| cached.device.last_seen_ms)
+    };
+    let rssi = live_rssi.or_else(|| cached.as_ref().and_then(|cached| cached.device.rssi));
     let battery = device_batteries(device, identity, connected, fast_pair).await?;
     let fast_pair_features = match (connected, fast_pair) {
         (true, Some(provider)) => provider.features(device).await,
@@ -736,8 +795,8 @@ async fn device_snapshot(
         has_fast_pair,
         fast_pair_features.as_ref(),
     );
-    Ok(Some(Device {
-        key,
+    let snapshot = Device {
+        key: key.clone(),
         adapter_key: adapter_key.to_string(),
         name: metadata.alias.clone(),
         alias: metadata.alias,
@@ -759,27 +818,56 @@ async fn device_snapshot(
         fast_pair: fast_pair_features,
         rssi,
         signal_strength: rssi.map(signal_strength),
+        signal_live: live_rssi.is_some(),
         present,
         last_seen_ms,
         capabilities,
-    }))
+    };
+    if present {
+        device_cache.lock().await.insert(
+            key,
+            CachedDevice {
+                device: snapshot.clone(),
+                observed_at_ms: now_ms,
+            },
+        );
+    }
+    Ok(Some(snapshot))
 }
 
-async fn update_last_seen(
-    last_seen: &Mutex<HashMap<String, u64>>,
-    key: &str,
-    present: bool,
-) -> Option<u64> {
-    let mut seen = last_seen.lock().await;
-    if !present {
-        return seen.get(key).copied();
-    }
-    let now = std::time::SystemTime::now()
+fn cached_device_view(cached: &CachedDevice) -> Device {
+    let mut device = cached.device.clone();
+    device.connected = false;
+    device.present = false;
+    device.signal_live = false;
+    let has_fast_pair = device.uuids.iter().any(|uuid| {
+        uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
+            || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
+    });
+    device.capabilities = device_capabilities(
+        device.paired,
+        false,
+        device.blocked,
+        device.wake_allowed,
+        has_fast_pair,
+        device.fast_pair.as_ref(),
+    );
+    device
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64;
-    seen.insert(key.to_string(), now);
-    Some(now)
+        .as_millis() as u64
+}
+
+fn cache_entry_is_fresh(observed_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(observed_at_ms) <= DISCOVERED_DEVICE_CACHE_TTL.as_millis() as u64
+}
+
+const fn should_include_device(paired: bool, present: bool, cached: bool) -> bool {
+    paired || present || cached
 }
 
 async fn device_batteries(
@@ -1017,7 +1105,10 @@ fn signal_strength(rssi: i16) -> u8 {
 mod tests {
     use crate::backend::{BackendError, BackendErrorKind};
 
-    use super::{bluez_result, device_capabilities, opaque_key, service_label, signal_strength};
+    use super::{
+        DISCOVERED_DEVICE_CACHE_TTL, bluez_result, cache_entry_is_fresh, device_capabilities,
+        opaque_key, service_label, should_include_device, signal_strength,
+    };
 
     #[test]
     fn adapter_keys_are_opaque_and_deterministic() {
@@ -1047,6 +1138,22 @@ mod tests {
         assert_eq!(signal_strength(-70), 50);
         assert_eq!(signal_strength(-40), 100);
         assert_eq!(signal_strength(-10), 100);
+    }
+
+    #[test]
+    fn discovered_device_cache_has_a_bounded_lifetime() {
+        let ttl_ms = DISCOVERED_DEVICE_CACHE_TTL.as_millis() as u64;
+        assert!(cache_entry_is_fresh(1_000, 1_000 + ttl_ms));
+        assert!(!cache_entry_is_fresh(1_000, 1_001 + ttl_ms));
+        assert!(cache_entry_is_fresh(2_000, 1_000));
+    }
+
+    #[test]
+    fn cached_unpaired_device_survives_loss_of_live_rssi() {
+        assert!(should_include_device(false, true, false));
+        assert!(should_include_device(false, false, true));
+        assert!(!should_include_device(false, false, false));
+        assert!(should_include_device(true, false, false));
     }
 
     #[test]
