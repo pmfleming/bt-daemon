@@ -320,14 +320,20 @@
               "can_connect": true,
               "can_disconnect": false,
               "can_pair": false,
+              "can_provision_fast_pair": false,
               "can_remove": true,
               "can_rename": true,
               "can_send_file": true,
+              "can_set_multipoint": false,
+              "can_set_noise_control": false,
               "can_trust": true,
               "can_wake": false,
               "unsupported_reasons": {
                 "disconnect": "Device is not connected",
                 "pair": "Device is already paired",
+                "provision_fast_pair": "Fast Pair provisioning requires recent-pairing model metadata from a connected device",
+                "set_multipoint": "Authenticated configurable Fast Pair multipoint is unavailable",
+                "set_noise_control": "Authenticated Fast Pair noise control is unavailable",
                 "wake": "BlueZ does not expose wake control for this device"
               }
             },

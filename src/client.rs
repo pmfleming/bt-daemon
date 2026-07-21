@@ -42,13 +42,7 @@ type Output = Arc<Mutex<tokio::io::Stdout>>;
 
 pub async fn run() -> Result<()> {
     tracing::info!("JSON-lines client started");
-    let dbus = match zbus::Connection::session().await {
-        Ok(connection) => Some(connection),
-        Err(error) => {
-            tracing::warn!(%error, "client could not connect to session D-Bus");
-            None
-        }
-    };
+    let dbus = session_connection().await;
     let output = Arc::new(Mutex::new(tokio::io::stdout()));
     if let Some(connection) = dbus.clone() {
         spawn_event_forwarder(connection.clone(), Arc::clone(&output));
@@ -58,18 +52,8 @@ pub async fn run() -> Result<()> {
     let mut calls = JoinSet::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await.context("read client request")? {
-        let request = match decode_request(&line) {
-            Ok(Some(request)) => request,
-            Ok(None) => continue,
-            Err(error) => {
-                tracing::warn!(%error, "client received invalid JSON request");
-                emit(
-                    &output,
-                    &json!({ "kind": "protocol-error", "error": error.to_string() }),
-                )
-                .await?;
-                continue;
-            }
+        let Some(request) = decode_and_report(&line, &output).await? else {
+            continue;
         };
         if !handle_request(request, &dbus, &output, &mut calls).await? {
             break;
@@ -77,6 +61,28 @@ pub async fn run() -> Result<()> {
     }
     while calls.join_next().await.is_some() {}
     Ok(())
+}
+
+async fn session_connection() -> Option<zbus::Connection> {
+    zbus::Connection::session()
+        .await
+        .inspect_err(|error| tracing::warn!(%error, "client could not connect to session D-Bus"))
+        .ok()
+}
+
+async fn decode_and_report(line: &str, output: &Output) -> Result<Option<Request>> {
+    match decode_request(line) {
+        Ok(request) => Ok(request),
+        Err(error) => {
+            tracing::warn!(%error, "client received invalid JSON request");
+            emit(
+                output,
+                &json!({ "kind": "protocol-error", "error": error.to_string() }),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
 }
 
 async fn handle_request(
@@ -87,19 +93,13 @@ async fn handle_request(
 ) -> Result<bool> {
     match request {
         Request::Call { id, method, params } => {
-            let connection = dbus.clone();
-            let output = Arc::clone(output);
-            calls.spawn(async move {
-                let response = dispatch(&connection, &method, params).await;
-                if let Err(error) = emit(
-                    &output,
-                    &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
-                )
-                .await
-                {
-                    tracing::error!(%error, "client could not emit call response");
-                }
-            });
+            calls.spawn(run_call(
+                dbus.clone(),
+                Arc::clone(output),
+                id,
+                method,
+                params,
+            ));
         }
         Request::Subscribe { id, streams } => {
             let response = call_subscribe(dbus.as_ref(), streams).await;
@@ -109,25 +109,45 @@ async fn handle_request(
             let response = call_cancel(dbus.as_ref(), &request_id).await;
             emit_transport_response(output, &id, response).await?;
         }
-        Request::Shutdown { id } => {
-            if tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while calls.join_next().await.is_some() {}
-            })
-            .await
-            .is_err()
-            {
-                tracing::warn!("client shutdown timed out while waiting for calls");
-            }
-            calls.abort_all();
-            emit(
-                output,
-                &json!({ "kind": "response", "id": id, "ok": true, "response": { "shutdown": true } }),
-            )
-            .await?;
-            return Ok(false);
-        }
+        Request::Shutdown { id } => return shutdown(calls, output, id).await,
     }
     Ok(true)
+}
+
+async fn run_call(
+    connection: Option<zbus::Connection>,
+    output: Output,
+    id: String,
+    method: String,
+    params: Value,
+) {
+    let response = dispatch(&connection, &method, params).await;
+    if let Err(error) = emit(
+        &output,
+        &json!({ "kind": "response", "id": id, "ok": true, "response": response }),
+    )
+    .await
+    {
+        tracing::error!(%error, "client could not emit call response");
+    }
+}
+
+async fn shutdown(calls: &mut JoinSet<()>, output: &Output, id: String) -> Result<bool> {
+    if tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while calls.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!("client shutdown timed out while waiting for calls");
+    }
+    calls.abort_all();
+    emit(
+        output,
+        &json!({ "kind": "response", "id": id, "ok": true, "response": { "shutdown": true } }),
+    )
+    .await?;
+    Ok(false)
 }
 
 async fn dispatch(connection: &Option<zbus::Connection>, method: &str, params: Value) -> Value {

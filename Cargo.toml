@@ -7,14 +7,17 @@ description = "Bluetooth policy and API daemon for Shelllist"
 repository = "https://github.com/pmfleming/bt-daemon"
 
 [dependencies]
+aes = "0.8"
 anyhow = "1"
 async-trait = "0.1"
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap", "rfcomm", "serde"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = "0.4"
+p256 = { version = "0.13", features = ["ecdh"] }
 pipewire = { version = "0.10", features = ["v1_2_0"] }
-serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }

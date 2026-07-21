@@ -45,6 +45,8 @@ pub struct Device {
     pub uuids: Vec<String>,
     pub services: Vec<Service>,
     pub battery: Vec<Battery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_pair: Option<FastPairFeatures>,
     pub rssi: Option<i16>,
     pub signal_strength: Option<u8>,
     pub present: bool,
@@ -69,6 +71,31 @@ pub struct Battery {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct FastPairFeatures {
+    pub model_id: Option<String>,
+    pub authenticated_controls: bool,
+    pub multipoint: Option<FastPairMultipoint>,
+    pub noise_control: Option<FastPairNoiseControl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FastPairMultipoint {
+    pub version: u16,
+    pub supported: bool,
+    pub configurable: bool,
+    pub enabled: bool,
+    pub audio_switch_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FastPairNoiseControl {
+    pub version: u8,
+    pub available_modes: Vec<String>,
+    pub settable_modes: Vec<String>,
+    pub active_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceCapabilities {
     pub can_pair: bool,
     pub can_connect: bool,
@@ -79,5 +106,8 @@ pub struct DeviceCapabilities {
     pub can_wake: bool,
     pub can_rename: bool,
     pub can_send_file: bool,
+    pub can_provision_fast_pair: bool,
+    pub can_set_multipoint: bool,
+    pub can_set_noise_control: bool,
     pub unsupported_reasons: HashMap<String, String>,
 }

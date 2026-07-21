@@ -108,50 +108,23 @@ pub(super) async fn start(
                 subscription_id.clone(),
             ),
         );
-        spawn_if(
-            &mut forwarders,
-            requested.pairing,
-            forward_events(
-                pairing_events,
-                signal_emitter.clone(),
-                PAIRING_STREAM,
-                subscription_id.clone(),
-                |event| &event.event,
-            ),
-        );
-        spawn_if(
-            &mut forwarders,
-            requested.operations,
-            forward_events(
-                operation_events,
-                signal_emitter.clone(),
-                OPERATION_STREAM,
-                subscription_id.clone(),
-                |event| &event.event,
-            ),
-        );
-        spawn_if(
-            &mut forwarders,
-            requested.scans,
-            forward_events(
-                scan_events,
-                signal_emitter.clone(),
-                SCAN_STREAM,
-                subscription_id.clone(),
-                |event| &event.event,
-            ),
-        );
-        spawn_if(
-            &mut forwarders,
-            requested.obex,
-            forward_events(
-                obex_events,
-                signal_emitter,
-                OBEX_STREAM,
-                subscription_id.clone(),
-                |event| &event.event,
-            ),
-        );
+        macro_rules! forward {
+            ($enabled:expr, $receiver:expr, $stream:expr) => {
+                if $enabled {
+                    forwarders.spawn(forward_events(
+                        $receiver,
+                        signal_emitter.clone(),
+                        $stream,
+                        subscription_id.clone(),
+                        |event| &event.event,
+                    ));
+                }
+            };
+        }
+        forward!(requested.pairing, pairing_events, PAIRING_STREAM);
+        forward!(requested.operations, operation_events, OPERATION_STREAM);
+        forward!(requested.scans, scan_events, SCAN_STREAM);
+        forward!(requested.obex, obex_events, OBEX_STREAM);
         forwarders.spawn(wait_for_owner_loss(connection, owner));
         if let Some(Err(error)) = forwarders.join_next().await {
             tracing::error!(%subscription_id, %error, "subscription forwarder task failed");

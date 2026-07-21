@@ -130,13 +130,27 @@ fn daemon(
     )
 }
 
+async fn start_operation(daemon: &BluetoothDaemon, operation: &str) -> Value {
+    daemon
+        .operations
+        .start(json!({ "key": "device-opaque", "operation": operation }))
+        .await
+}
+
+fn stopped_calls(scanning: &ScanningCalls) -> Vec<(Option<String>, bool)> {
+    scanning
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .filter(|(_, enabled)| !enabled)
+        .cloned()
+        .collect()
+}
+
 #[tokio::test]
 async fn operation_emits_started_and_completed_events() {
     let (daemon, mut events, _) = daemon(true);
-    let response = daemon
-        .operations
-        .start(json!({ "key": "device-opaque", "operation": "connect" }))
-        .await;
+    let response = start_operation(&daemon, "connect").await;
     assert_eq!(response["data"]["operation"]["state"], "queued");
     assert_eq!(events.recv().await.unwrap().event, "started");
     assert_eq!(events.recv().await.unwrap().event, "completed");
@@ -146,10 +160,7 @@ async fn operation_emits_started_and_completed_events() {
 #[tokio::test]
 async fn active_operation_can_be_cancelled() {
     let (daemon, mut events, _) = daemon(false);
-    let response = daemon
-        .operations
-        .start(json!({ "key": "device-opaque", "operation": "pair" }))
-        .await;
+    let response = start_operation(&daemon, "pair").await;
     let request_id = response["data"]["operation"]["request_id"]
         .as_str()
         .unwrap();
@@ -164,16 +175,10 @@ async fn active_operation_can_be_cancelled() {
 #[tokio::test]
 async fn rejects_concurrent_operations_for_one_device() {
     let (daemon, mut events, _) = daemon(false);
-    let first = daemon
-        .operations
-        .start(json!({ "key": "device-opaque", "operation": "connect" }))
-        .await;
+    let first = start_operation(&daemon, "connect").await;
     let request_id = first["data"]["operation"]["request_id"].as_str().unwrap();
     assert_eq!(events.recv().await.unwrap().event, "started");
-    let second = daemon
-        .operations
-        .start(json!({ "key": "device-opaque", "operation": "remove" }))
-        .await;
+    let second = start_operation(&daemon, "remove").await;
     assert_eq!(second["error"]["code"], "device-busy");
     let _ = daemon.cancel(request_id).await;
 }
@@ -212,23 +217,13 @@ async fn overlapping_global_scan_stops_only_uncovered_adapters() {
     let targeted_id = targeted["data"]["scan"]["request_id"].as_str().unwrap();
 
     scans.stop(Some(global_id), "cancelled").await;
-    let stopped = scanning
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .iter()
-        .filter(|(_, enabled)| !enabled)
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(stopped, vec![(Some("adapter-2".into()), false)]);
+    assert_eq!(
+        stopped_calls(&scanning),
+        vec![(Some("adapter-2".into()), false)]
+    );
 
     scans.stop(Some(targeted_id), "cancelled").await;
-    let stopped = scanning
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .iter()
-        .filter(|(_, enabled)| !enabled)
-        .cloned()
-        .collect::<Vec<_>>();
+    let stopped = stopped_calls(&scanning);
     assert_eq!(
         stopped,
         vec![

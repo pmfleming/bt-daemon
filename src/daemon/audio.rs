@@ -1,8 +1,30 @@
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 use crate::{api, audio, pairing::PairingBroker, params::Params};
+
+pub(super) fn start_monitor(events: broadcast::Sender<()>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("bt-pipewire-monitor".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                let sender = events.clone();
+                let notify = Arc::new(move || drop(sender.send(())));
+                if let Err(error) = audio::monitor(notify) {
+                    tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "PipeWire audio monitor is retrying");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }));
+            if result.is_err() {
+                tracing::error!("PipeWire audio monitor thread panicked");
+            }
+        })
+        .context("start PipeWire audio monitor thread")?;
+    Ok(())
+}
 
 fn device_address(device: &audio::AudioDevice) -> Option<bluer::Address> {
     match device.address.parse() {

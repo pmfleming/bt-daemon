@@ -61,7 +61,12 @@ impl BluezBackend {
                 .backend_context("read stable adapter identity")?;
             identities.register_adapter(&name, &address.to_string());
         }
-        let fast_pair = match FastPairBatteryProvider::start(session.clone(), changes.clone()).await
+        let fast_pair = match FastPairBatteryProvider::start(
+            session.clone(),
+            Arc::clone(&identities),
+            changes.clone(),
+        )
+        .await
         {
             Ok(provider) => Some(provider),
             Err(error) => {
@@ -335,54 +340,10 @@ impl BluetoothBackend for BluezBackend {
 
     async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote> {
         tracing::debug!("validating incoming OBEX remote");
-        let source = source.parse().map_err(|error| {
-            BackendError::new(
-                BackendErrorKind::InvalidInput,
-                format!("parse incoming OBEX adapter address: {error}"),
-            )
-        })?;
-        let destination = destination.parse().map_err(|error| {
-            BackendError::new(
-                BackendErrorKind::InvalidInput,
-                format!("parse incoming OBEX device address: {error}"),
-            )
-        })?;
-        for adapter in self.adapters().await? {
-            if adapter
-                .address()
-                .await
-                .backend_context("read adapter address")?
-                != source
-            {
-                continue;
-            }
-            let device = adapter
-                .device(destination)
-                .backend_context("open incoming OBEX device")?;
-            if !bluez_result(device.is_paired().await, "read device paired state")? {
-                return Err(BackendError::new(
-                    BackendErrorKind::Rejected,
-                    "incoming transfers require a paired Bluetooth device",
-                )
-                .into());
-            }
-            if bluez_result(device.is_blocked().await, "read device blocked state")? {
-                return Err(BackendError::new(
-                    BackendErrorKind::Rejected,
-                    "incoming transfers are disabled for blocked Bluetooth devices",
-                )
-                .into());
-            }
-            return Ok(ObexRemote {
-                device_key: self.identities.device_key(adapter.name(), device.address()),
-                name: bluez_result(device.alias().await, "read device alias")?,
-            });
-        }
-        Err(BackendError::new(
-            BackendErrorKind::DeviceUnavailable,
-            "incoming OBEX adapter is unavailable",
-        )
-        .into())
+        let source = parse_obex_address(source, "adapter")?;
+        let destination = parse_obex_address(destination, "device")?;
+        let adapter = find_adapter_address(self, source).await?;
+        validated_obex_remote(&self.identities, &adapter, destination).await
     }
 
     async fn device_operation(
@@ -393,9 +354,71 @@ impl BluetoothBackend for BluezBackend {
     ) -> Result<Snapshot> {
         tracing::info!(%device_key, %operation, "Bluetooth device operation started");
         let (adapter, device) = self.find_device(device_key).await?;
-        run_device_operation(&adapter, &device, operation, params).await?;
+        run_device_operation(
+            &adapter,
+            &device,
+            operation,
+            params,
+            self.fast_pair.as_deref(),
+        )
+        .await?;
         self.snapshot().await
     }
+}
+
+async fn find_adapter_address(
+    backend: &BluezBackend,
+    address: bluer::Address,
+) -> Result<BluezAdapter> {
+    for adapter in backend.adapters().await? {
+        if adapter
+            .address()
+            .await
+            .backend_context("read adapter address")?
+            == address
+        {
+            return Ok(adapter);
+        }
+    }
+    Err(BackendError::new(
+        BackendErrorKind::DeviceUnavailable,
+        "incoming OBEX adapter is unavailable",
+    )
+    .into())
+}
+
+fn parse_obex_address(value: &str, role: &str) -> Result<bluer::Address> {
+    value.parse().map_err(|error| {
+        BackendError::new(
+            BackendErrorKind::InvalidInput,
+            format!("parse incoming OBEX {role} address: {error}"),
+        )
+        .into()
+    })
+}
+
+async fn validated_obex_remote(
+    identities: &DeviceIdentityRegistry,
+    adapter: &BluezAdapter,
+    address: bluer::Address,
+) -> Result<ObexRemote> {
+    let device = adapter
+        .device(address)
+        .backend_context("open incoming OBEX device")?;
+    let paired = bluez_result(device.is_paired().await, "read device paired state")?;
+    let blocked = bluez_result(device.is_blocked().await, "read device blocked state")?;
+    if !paired || blocked {
+        let message = if blocked {
+            "incoming transfers are disabled for blocked Bluetooth devices"
+        } else {
+            "incoming transfers require a paired Bluetooth device"
+        };
+        return Err(BackendError::new(BackendErrorKind::Rejected, message).into());
+    }
+    Ok(ObexRemote {
+        device_key: identities.device_key(adapter.name(), device.address()),
+        name: bluez_result(device.alias().await, "read device alias")?,
+    })
 }
 
 async fn append_adapter_event_streams(
@@ -508,9 +531,21 @@ async fn run_device_operation(
     device: &BluezDevice,
     operation: DeviceOperation,
     params: &Value,
+    fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<()> {
     match operation {
-        DeviceOperation::Pair => pair_device(device, params).await?,
+        DeviceOperation::Pair => {
+            pair_device(device, params).await?;
+            if let Some(public_key) = params
+                .get("fast_pair_anti_spoofing_public_key")
+                .and_then(Value::as_str)
+            {
+                fast_pair
+                    .context("Fast Pair provider is unavailable")?
+                    .provision_account_key(adapter, device, public_key)
+                    .await?;
+            }
+        }
         DeviceOperation::Connect => connect_device(device, "connect Bluetooth device").await?,
         DeviceOperation::Disconnect => {
             disconnect_device(device, "disconnect Bluetooth device").await?
@@ -532,6 +567,28 @@ async fn run_device_operation(
             .set_alias(params.require_string("alias")?.to_string())
             .await
             .backend_context("set device alias")?,
+        DeviceOperation::ProvisionFastPair => {
+            fast_pair
+                .context("Fast Pair provider is unavailable")?
+                .provision_account_key(
+                    adapter,
+                    device,
+                    params.require_string("anti_spoofing_public_key")?,
+                )
+                .await?;
+        }
+        DeviceOperation::SetMultipoint => {
+            fast_pair
+                .context("Fast Pair provider is unavailable")?
+                .set_multipoint(device, params.require_bool("enabled")?)
+                .await?;
+        }
+        DeviceOperation::SetNoiseControl => {
+            fast_pair
+                .context("Fast Pair provider is unavailable")?
+                .set_noise_control(device, params.require_string("mode")?)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -663,7 +720,22 @@ async fn device_snapshot(
         .collect();
     let last_seen_ms = update_last_seen(last_seen, &key, present).await;
     let battery = device_batteries(device, identity, connected, fast_pair).await?;
-    let capabilities = device_capabilities(paired, connected, blocked, wake_allowed);
+    let fast_pair_features = match (connected, fast_pair) {
+        (true, Some(provider)) => provider.features(device).await,
+        _ => None,
+    };
+    let has_fast_pair = metadata.uuids.iter().any(|uuid| {
+        uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
+            || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
+    });
+    let capabilities = device_capabilities(
+        paired,
+        connected,
+        blocked,
+        wake_allowed,
+        has_fast_pair,
+        fast_pair_features.as_ref(),
+    );
     Ok(Some(Device {
         key,
         adapter_key: adapter_key.to_string(),
@@ -684,6 +756,7 @@ async fn device_snapshot(
         uuids: metadata.uuids,
         services,
         battery,
+        fast_pair: fast_pair_features,
         rssi,
         signal_strength: rssi.map(signal_strength),
         present,
@@ -746,6 +819,8 @@ fn device_capabilities(
     connected: bool,
     blocked: bool,
     wake_allowed: Option<bool>,
+    has_fast_pair: bool,
+    fast_pair: Option<&crate::model::FastPairFeatures>,
 ) -> DeviceCapabilities {
     let mut unsupported_reasons = HashMap::new();
     if paired {
@@ -768,6 +843,40 @@ fn device_capabilities(
             "Pair the device before sending files".into(),
         );
     }
+    let can_provision_fast_pair = paired
+        && connected
+        && has_fast_pair
+        && fast_pair.is_some_and(|features| {
+            features.model_id.is_some() && !features.authenticated_controls
+        });
+    if !can_provision_fast_pair {
+        unsupported_reasons.insert(
+            "provision_fast_pair".into(),
+            "Fast Pair provisioning requires recent-pairing model metadata from a connected device"
+                .into(),
+        );
+    }
+    let authenticated = fast_pair.is_some_and(|features| features.authenticated_controls);
+    let can_set_multipoint = authenticated
+        && fast_pair
+            .and_then(|features| features.multipoint)
+            .is_some_and(|multipoint| multipoint.supported && multipoint.configurable);
+    if !can_set_multipoint {
+        unsupported_reasons.insert(
+            "set_multipoint".into(),
+            "Authenticated configurable Fast Pair multipoint is unavailable".into(),
+        );
+    }
+    let can_set_noise_control = authenticated
+        && fast_pair
+            .and_then(|features| features.noise_control.as_ref())
+            .is_some_and(|noise| !noise.settable_modes.is_empty());
+    if !can_set_noise_control {
+        unsupported_reasons.insert(
+            "set_noise_control".into(),
+            "Authenticated Fast Pair noise control is unavailable".into(),
+        );
+    }
     DeviceCapabilities {
         can_pair: !paired && !blocked,
         can_connect: !connected && !blocked,
@@ -778,6 +887,9 @@ fn device_capabilities(
         can_wake: wake_allowed.is_some(),
         can_rename: true,
         can_send_file: paired && !blocked,
+        can_provision_fast_pair,
+        can_set_multipoint,
+        can_set_noise_control,
         unsupported_reasons,
     }
 }
@@ -956,7 +1068,7 @@ mod tests {
 
     #[test]
     fn capabilities_preserve_false_state_without_claiming_unavailability() {
-        let capabilities = device_capabilities(false, false, false, None);
+        let capabilities = device_capabilities(false, false, false, None, false, None);
         assert!(capabilities.can_pair);
         assert!(capabilities.can_connect);
         assert!(!capabilities.can_disconnect);

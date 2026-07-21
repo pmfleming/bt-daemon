@@ -122,7 +122,7 @@ impl DeviceIdentityRegistry {
     }
 }
 
-fn state_directory() -> Result<PathBuf> {
+pub(crate) fn state_directory() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("BT_DAEMON_STATE_DIR") {
         return Ok(PathBuf::from(path));
     }

@@ -16,10 +16,7 @@ use tokio::{
 };
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
-use crate::{
-    api, audio as pipewire_audio, backend::BluetoothBackend, obex as bluez_obex,
-    pairing::PairingBroker,
-};
+use crate::{api, backend::BluetoothBackend, obex as bluez_obex, pairing::PairingBroker};
 
 pub const BUS_NAME: &str = "org.laufan.BluetoothDaemon";
 pub const OBJECT_PATH: &str = "/org/laufan/BluetoothDaemon";
@@ -241,28 +238,6 @@ async fn emit_audio(
     }
 }
 
-fn start_audio_monitor(events: broadcast::Sender<()>) -> Result<()> {
-    std::thread::Builder::new()
-        .name("bt-pipewire-monitor".into())
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
-                let sender = events.clone();
-                let notify = Arc::new(move || {
-                    let _ = sender.send(());
-                });
-                if let Err(error) = pipewire_audio::monitor(notify) {
-                    tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "PipeWire audio monitor is retrying");
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }));
-            if result.is_err() {
-                tracing::error!("PipeWire audio monitor thread panicked");
-            }
-        })
-        .context("start PipeWire audio monitor thread")?;
-    Ok(())
-}
-
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
     let (audio_events, _) = broadcast::channel(32);
     let (obex_events, _) = broadcast::channel(32);
@@ -270,7 +245,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     let scans = ScanCoordinator::new(Arc::clone(&backend));
     let outgoing_obex = OutgoingTransfers::new(Arc::clone(&backend), obex_events.clone());
     let incoming_obex = bluez_obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
-    start_audio_monitor(audio_events.clone())?;
+    audio::start_monitor(audio_events.clone())?;
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)

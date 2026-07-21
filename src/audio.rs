@@ -206,22 +206,8 @@ pub fn set_profile(address: &str, index: u32) -> Result<()> {
 }
 
 fn set_profile_inner(address: &str, index: u32) -> Result<()> {
-    use pw::spa::pod::{Object, Property, Value, serialize::PodSerializer};
-
     let requested_index = index;
-    let index = i32::try_from(index).context("PipeWire profile index exceeds i32")?;
-    let value = Value::Object(Object {
-        type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamProfile,
-        id: pw::spa::sys::SPA_PARAM_Profile,
-        properties: vec![
-            Property::new(pw::spa::sys::SPA_PARAM_PROFILE_index, Value::Int(index)),
-            Property::new(pw::spa::sys::SPA_PARAM_PROFILE_save, Value::Bool(true)),
-        ],
-    });
-    let bytes = PodSerializer::serialize(Cursor::new(Vec::new()), &value)
-        .context("serialize PipeWire profile parameter")?
-        .0
-        .into_inner();
+    let bytes = profile_parameter(index)?;
     let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
     let context =
         pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
@@ -229,8 +215,6 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
     let registry = core.get_registry_rc().context("open PipeWire registry")?;
     let registry_weak = registry.downgrade();
     let expected_name = format!("bluez_card.{}", address.replace(':', "_"));
-    let applied = Rc::new(Cell::new(false));
-    let applied_for_registry = Rc::clone(&applied);
     let confirmed = Rc::new(Cell::new(false));
     let confirmed_for_registry = Rc::clone(&confirmed);
     let objects = Rc::new(RefCell::new(Objects::default()));
@@ -247,44 +231,72 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
             let Some(registry) = registry_weak.upgrade() else {
                 return;
             };
-            let device = match registry.bind::<Device, _>(global) {
-                Ok(device) => device,
-                Err(error) => {
-                    tracing::warn!(id = global.id, %error, "could not bind PipeWire device for profile change");
-                    return;
-                }
-            };
-            let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
-                tracing::error!("serialized PipeWire profile parameter could not be decoded");
-                return;
-            };
-            let confirmed = Rc::clone(&confirmed_for_registry);
-            let listener = device
-                .add_listener_local()
-                .param(move |_, parameter, _, _, pod| {
-                    if parameter == pw::spa::param::ParamType::Profile
-                        && pod
-                            .and_then(parse_profile)
-                            .is_some_and(|profile| profile.index == requested_index)
-                    {
-                        confirmed.set(true);
-                    }
-                })
-                .register();
-            device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
-            device.enum_params(1, Some(pw::spa::param::ParamType::Profile), 0, 1);
-            applied_for_registry.set(true);
-            objects_for_registry.borrow_mut().retain(device, listener);
+            if let Err(error) = apply_profile(
+                &registry,
+                global,
+                &bytes,
+                requested_index,
+                Rc::clone(&confirmed_for_registry),
+                &objects_for_registry,
+            ) {
+                tracing::warn!(id = global.id, %error, "could not apply PipeWire Bluetooth profile");
+            }
         })
         .register();
     pipewire_roundtrip(&main_loop, &core)?;
     pipewire_roundtrip(&main_loop, &core)?;
-    if !applied.get() {
-        anyhow::bail!("Bluetooth audio device is not available in PipeWire");
-    }
     if !confirmed.get() {
         anyhow::bail!("PipeWire did not activate the requested Bluetooth audio profile");
     }
+    Ok(())
+}
+
+fn profile_parameter(index: u32) -> Result<Vec<u8>> {
+    use pw::spa::pod::{Object, Property, Value, serialize::PodSerializer};
+
+    let index = i32::try_from(index).context("PipeWire profile index exceeds i32")?;
+    let value = Value::Object(Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamProfile,
+        id: pw::spa::sys::SPA_PARAM_Profile,
+        properties: vec![
+            Property::new(pw::spa::sys::SPA_PARAM_PROFILE_index, Value::Int(index)),
+            Property::new(pw::spa::sys::SPA_PARAM_PROFILE_save, Value::Bool(true)),
+        ],
+    });
+    Ok(PodSerializer::serialize(Cursor::new(Vec::new()), &value)
+        .context("serialize PipeWire profile parameter")?
+        .0
+        .into_inner())
+}
+
+fn apply_profile(
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
+    bytes: &[u8],
+    requested_index: u32,
+    confirmed: Rc<Cell<bool>>,
+    objects: &Rc<RefCell<Objects>>,
+) -> Result<()> {
+    let device = registry
+        .bind::<Device, _>(global)
+        .context("bind PipeWire device for profile change")?;
+    let pod = pw::spa::pod::Pod::from_bytes(bytes)
+        .context("decode serialized PipeWire profile parameter")?;
+    let listener = device
+        .add_listener_local()
+        .param(move |_, parameter, _, _, pod| {
+            if parameter == pw::spa::param::ParamType::Profile
+                && pod
+                    .and_then(parse_profile)
+                    .is_some_and(|profile| profile.index == requested_index)
+            {
+                confirmed.set(true);
+            }
+        })
+        .register();
+    device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
+    device.enum_params(1, Some(pw::spa::param::ParamType::Profile), 0, 1);
+    objects.borrow_mut().retain(device, listener);
     Ok(())
 }
 

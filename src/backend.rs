@@ -114,6 +114,9 @@ operation_enum!(DeviceOperation, "device", {
     SetBlocked => "set-blocked",
     SetWakeAllowed => "set-wake-allowed",
     SetAlias => "set-alias",
+    ProvisionFastPair => "provision-fast-pair",
+    SetMultipoint => "set-multipoint",
+    SetNoiseControl => "set-noise-control",
 });
 
 #[derive(Debug, Clone)]
