@@ -1,9 +1,13 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
+use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
-use tokio::{sync::broadcast, task::JoinSet};
-use zbus::object_server::SignalEmitter;
+use tokio::{
+    sync::{broadcast, oneshot},
+    task::JoinSet,
+};
+use zbus::{names::UniqueName, object_server::SignalEmitter};
 
 use crate::{api, backend::BluetoothBackend, pairing::PairingBroker, protocol};
 
@@ -48,6 +52,7 @@ impl RequestedStreams {
 pub(super) async fn start(
     daemon: &BluetoothDaemon,
     streams: Vec<String>,
+    owner: UniqueName<'static>,
     emitter: SignalEmitter<'_>,
 ) -> String {
     let Some(requested) = RequestedStreams::parse(&streams) else {
@@ -64,7 +69,8 @@ pub(super) async fn start(
 
     let id = daemon.next_id("subscription");
     let subscription_id = id.clone();
-    let signal_emitter = emitter.to_owned();
+    let signal_emitter = emitter.set_destination(owner.clone().into()).to_owned();
+    let connection = signal_emitter.connection().clone();
     let backend = Arc::clone(&daemon.backend);
     let pairing = Arc::clone(&daemon.pairing);
     let pairing_events = daemon.pairing.subscribe();
@@ -74,8 +80,13 @@ pub(super) async fn start(
     let changes = daemon.backend.subscribe_changes();
     let audio_events = daemon.audio_events.subscribe();
 
-    tracing::info!(%subscription_id, ?streams, "subscription started");
+    tracing::info!(%subscription_id, %owner, ?streams, "subscription started");
+    let subscriptions = Arc::clone(&daemon.subscriptions);
+    let (start_sender, start_receiver) = oneshot::channel();
     let task = crate::task::spawn("subscription", async move {
+        if start_receiver.await.is_err() {
+            return;
+        }
         let mut forwarders = JoinSet::new();
         spawn_if(
             &mut forwarders,
@@ -141,15 +152,46 @@ pub(super) async fn start(
                 |event| &event.event,
             ),
         );
-        while let Some(result) = forwarders.join_next().await {
-            if let Err(error) = result {
-                tracing::error!(%subscription_id, %error, "subscription forwarder task failed");
-            }
+        forwarders.spawn(wait_for_owner_loss(connection, owner));
+        if let Some(Err(error)) = forwarders.join_next().await {
+            tracing::error!(%subscription_id, %error, "subscription forwarder task failed");
         }
+        forwarders.abort_all();
+        subscriptions.lock().await.remove(&subscription_id);
         tracing::info!(%subscription_id, "subscription ended");
     });
     daemon.subscriptions.lock().await.insert(id.clone(), task);
+    let _ = start_sender.send(());
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
+}
+
+async fn wait_for_owner_loss(connection: zbus::Connection, owner: UniqueName<'static>) {
+    let result = async {
+        let proxy = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .await?;
+        let mut changes = proxy.receive_signal("NameOwnerChanged").await?;
+        let has_owner: bool = proxy.call("NameHasOwner", &(owner.as_str(),)).await?;
+        if !has_owner {
+            return Ok::<(), anyhow::Error>(());
+        }
+        while let Some(message) = changes.next().await {
+            let (name, old_owner, new_owner): (String, String, String) =
+                message.body().deserialize()?;
+            if name == owner.as_str() && !old_owner.is_empty() && new_owner.is_empty() {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+        anyhow::bail!("D-Bus owner watch ended")
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%owner, %error, "subscription owner watch ended");
+    }
 }
 
 fn spawn_if(
@@ -236,4 +278,24 @@ async fn receive_coalesced(
     tokio::time::sleep(delay).await;
     while receiver.try_recv().is_ok() {}
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestedStreams;
+
+    #[test]
+    fn requested_streams_are_validated_and_deduplicated() {
+        assert!(RequestedStreams::parse(&[]).is_none());
+        assert!(RequestedStreams::parse(&["unsupported".to_string()]).is_none());
+        let streams = RequestedStreams::parse(&[
+            "bluetooth.changed".to_string(),
+            "bluetooth.changed".to_string(),
+            "bluetooth.operation".to_string(),
+        ])
+        .expect("supported streams");
+        assert!(streams.changes);
+        assert!(streams.operations);
+        assert!(!streams.pairing);
+    }
 }

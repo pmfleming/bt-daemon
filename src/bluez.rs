@@ -46,6 +46,21 @@ impl BluezBackend {
         let system_bus = zbus::Connection::system()
             .await
             .context("open system D-Bus for BlueZ compatibility properties")?;
+        let identities = DeviceIdentityRegistry::load_default()?;
+        for name in session
+            .adapter_names()
+            .await
+            .backend_context("list adapters for identity initialization")?
+        {
+            let adapter = session
+                .adapter(&name)
+                .backend_context(&format!("open adapter {name} for identity initialization"))?;
+            let address = adapter
+                .address()
+                .await
+                .backend_context("read stable adapter identity")?;
+            identities.register_adapter(&name, &address.to_string());
+        }
         let fast_pair = match FastPairBatteryProvider::start(session.clone(), changes.clone()).await
         {
             Ok(provider) => Some(provider),
@@ -59,7 +74,7 @@ impl BluezBackend {
             session,
             discovery_tasks: Mutex::new(HashMap::new()),
             changes,
-            identities: DeviceIdentityRegistry::load_default()?,
+            identities,
             last_seen: Mutex::new(HashMap::new()),
             system_bus,
             fast_pair,
@@ -204,7 +219,13 @@ impl BluetoothBackend for BluezBackend {
     async fn snapshot(&self) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
         for adapter in self.adapters().await? {
-            let adapter_key = adapter_key(&adapter).await?;
+            let address = adapter
+                .address()
+                .await
+                .backend_context("read stable adapter identity")?;
+            self.identities
+                .register_adapter(adapter.name(), &address.to_string());
+            let adapter_key = opaque_key("adapter", &address.to_string());
             snapshot
                 .adapters
                 .push(adapter_snapshot(&adapter, &adapter_key).await?);
@@ -230,11 +251,14 @@ impl BluetoothBackend for BluezBackend {
     async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot> {
         tracing::info!(?adapter_key, powered, "setting Bluetooth adapter power");
         if let Some(key) = adapter_key {
-            self.find_adapter(key)
-                .await?
+            let adapter = self.find_adapter(key).await?;
+            adapter
                 .set_powered(powered)
                 .await
                 .backend_context("set adapter power")?;
+            if !powered {
+                self.stop_discovery(Some(adapter.name())).await;
+            }
         } else {
             for adapter in self.adapters().await? {
                 adapter
@@ -243,7 +267,7 @@ impl BluetoothBackend for BluezBackend {
                     .backend_context("set adapter power")?;
             }
         }
-        if !powered {
+        if !powered && adapter_key.is_none() {
             self.stop_discovery(None).await;
         }
         self.snapshot().await
@@ -558,10 +582,7 @@ async fn adapter_key(adapter: &BluezAdapter) -> Result<String> {
         .address()
         .await
         .backend_context("read adapter identity")?;
-    Ok(opaque_key(
-        "adapter",
-        &format!("{}:{address}", adapter.name()),
-    ))
+    Ok(opaque_key("adapter", &address.to_string()))
 }
 
 fn opaque_key(kind: &str, identity: &str) -> String {

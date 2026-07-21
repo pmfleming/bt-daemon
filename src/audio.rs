@@ -208,6 +208,7 @@ pub fn set_profile(address: &str, index: u32) -> Result<()> {
 fn set_profile_inner(address: &str, index: u32) -> Result<()> {
     use pw::spa::pod::{Object, Property, Value, serialize::PodSerializer};
 
+    let requested_index = index;
     let index = i32::try_from(index).context("PipeWire profile index exceeds i32")?;
     let value = Value::Object(Object {
         type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamProfile,
@@ -230,8 +231,10 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
     let expected_name = format!("bluez_card.{}", address.replace(':', "_"));
     let applied = Rc::new(Cell::new(false));
     let applied_for_registry = Rc::clone(&applied);
-    let proxies = Rc::new(RefCell::new(Vec::<Box<dyn ProxyT>>::new()));
-    let proxies_for_registry = Rc::clone(&proxies);
+    let confirmed = Rc::new(Cell::new(false));
+    let confirmed_for_registry = Rc::clone(&confirmed);
+    let objects = Rc::new(RefCell::new(Objects::default()));
+    let objects_for_registry = Rc::clone(&objects);
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
@@ -255,22 +258,32 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
                 tracing::error!("serialized PipeWire profile parameter could not be decoded");
                 return;
             };
+            let confirmed = Rc::clone(&confirmed_for_registry);
+            let listener = device
+                .add_listener_local()
+                .param(move |_, parameter, _, _, pod| {
+                    if parameter == pw::spa::param::ParamType::Profile
+                        && pod
+                            .and_then(parse_profile)
+                            .is_some_and(|profile| profile.index == requested_index)
+                    {
+                        confirmed.set(true);
+                    }
+                })
+                .register();
             device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
+            device.enum_params(1, Some(pw::spa::param::ParamType::Profile), 0, 1);
             applied_for_registry.set(true);
-            proxies_for_registry.borrow_mut().push(Box::new(device));
+            objects_for_registry.borrow_mut().retain(device, listener);
         })
         .register();
-    let main_loop_for_timer = main_loop.clone();
-    let timer = main_loop
-        .loop_()
-        .add_timer(move |_| main_loop_for_timer.quit());
-    timer
-        .update_timer(Some(Duration::from_millis(500)), None)
-        .into_result()
-        .context("arm PipeWire profile timer")?;
-    main_loop.run();
+    pipewire_roundtrip(&main_loop, &core)?;
+    pipewire_roundtrip(&main_loop, &core)?;
     if !applied.get() {
         anyhow::bail!("Bluetooth audio device is not available in PipeWire");
+    }
+    if !confirmed.get() {
+        anyhow::bail!("PipeWire did not activate the requested Bluetooth audio profile");
     }
     Ok(())
 }
@@ -293,16 +306,46 @@ fn probe_inner() -> Result<Vec<AudioDevice>> {
         })
         .register();
 
-    let main_loop_for_timer = main_loop.clone();
-    let timer = main_loop
-        .loop_()
-        .add_timer(move |_| main_loop_for_timer.quit());
-    timer
-        .update_timer(Some(Duration::from_millis(750)), None)
-        .into_result()
-        .context("arm PipeWire probe timer")?;
-    main_loop.run();
+    pipewire_roundtrip(&main_loop, &core)?;
+    pipewire_roundtrip(&main_loop, &core)?;
     Ok(state.finish())
+}
+
+fn pipewire_roundtrip(
+    main_loop: &pw::main_loop::MainLoopRc,
+    core: &pw::core::CoreRc,
+) -> Result<()> {
+    let pending = core.sync(0).context("start PipeWire synchronization")?;
+    let done = Rc::new(Cell::new(false));
+    let done_for_listener = Rc::clone(&done);
+    let loop_for_listener = main_loop.clone();
+    let _listener = core
+        .add_listener_local()
+        .done(move |id, sequence| {
+            if id == pw::core::PW_ID_CORE && sequence == pending {
+                done_for_listener.set(true);
+                loop_for_listener.quit();
+            }
+        })
+        .register();
+    let timed_out = Rc::new(Cell::new(false));
+    let timed_out_for_timer = Rc::clone(&timed_out);
+    let loop_for_timer = main_loop.clone();
+    let timer = main_loop.loop_().add_timer(move |_| {
+        timed_out_for_timer.set(true);
+        loop_for_timer.quit();
+    });
+    timer
+        .update_timer(Some(Duration::from_secs(3)), None)
+        .into_result()
+        .context("arm PipeWire synchronization timeout")?;
+    while !done.get() && !timed_out.get() {
+        main_loop.run();
+    }
+    if timed_out.get() {
+        anyhow::bail!("PipeWire synchronization timed out");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]

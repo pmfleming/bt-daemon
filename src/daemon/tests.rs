@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{Arc, Mutex as StdMutex, atomic::AtomicU64};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, broadcast};
 use crate::{
     backend::{AdapterOperation, BluetoothBackend, DeviceOperation, ObexRemote, ObexTarget},
     identity::DeviceIdentityRegistry,
-    model::Snapshot,
+    model::{Adapter, Snapshot},
     pairing::PairingBroker,
 };
 
@@ -17,8 +17,11 @@ use super::{
     operation::OperationEvent, scan::ScanEvent,
 };
 
+type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
+
 struct TestBackend {
     complete: bool,
+    scanning: ScanningCalls,
 }
 
 #[async_trait]
@@ -29,7 +32,7 @@ impl BluetoothBackend for TestBackend {
 
     async fn snapshot(&self) -> Result<Snapshot> {
         Ok(Snapshot {
-            adapters: vec![],
+            adapters: vec![test_adapter("adapter-1"), test_adapter("adapter-2")],
             devices: vec![],
         })
     }
@@ -38,7 +41,11 @@ impl BluetoothBackend for TestBackend {
         self.snapshot().await
     }
 
-    async fn set_scanning(&self, _: Option<&str>, _: bool) -> Result<Snapshot> {
+    async fn set_scanning(&self, adapter: Option<&str>, enabled: bool) -> Result<Snapshot> {
+        self.scanning
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push((adapter.map(str::to_string), enabled));
         self.snapshot().await
     }
 
@@ -69,6 +76,23 @@ impl BluetoothBackend for TestBackend {
     }
 }
 
+fn test_adapter(key: &str) -> Adapter {
+    Adapter {
+        key: key.into(),
+        name: key.into(),
+        alias: key.into(),
+        address: "00:00:00:00:00:00".into(),
+        address_type: "public".into(),
+        powered: true,
+        discovering: false,
+        discoverable: false,
+        pairable: true,
+        discoverable_timeout: 0,
+        pairable_timeout: 0,
+        modalias: None,
+    }
+}
+
 fn daemon(
     complete: bool,
 ) -> (
@@ -78,7 +102,10 @@ fn daemon(
 ) {
     let (audio_events, _) = broadcast::channel(8);
     let (obex_events, _) = broadcast::channel(8);
-    let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend { complete });
+    let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
+        complete,
+        scanning: Arc::new(StdMutex::new(Vec::new())),
+    });
     let incoming_obex = crate::obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
     let operations = OperationCoordinator::new(Arc::clone(&backend));
     let receiver = operations.subscribe();
@@ -149,6 +176,66 @@ async fn rejects_concurrent_operations_for_one_device() {
         .await;
     assert_eq!(second["error"]["code"], "device-busy");
     let _ = daemon.cancel(request_id).await;
+}
+
+#[tokio::test]
+async fn scan_rejects_malformed_optional_parameters() {
+    let (daemon, _, _) = daemon(true);
+    let response = daemon
+        .scans
+        .start(&json!({ "adapter_key": 42, "enabled": true }))
+        .await;
+    assert_eq!(response["error"]["code"], "validation-error");
+    let response = daemon.scans.start(&json!({ "enabled": "yes" })).await;
+    assert_eq!(response["error"]["code"], "validation-error");
+}
+
+#[tokio::test]
+async fn overlapping_global_scan_stops_only_uncovered_adapters() {
+    let scanning = Arc::new(StdMutex::new(Vec::new()));
+    let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
+        complete: true,
+        scanning: Arc::clone(&scanning),
+    });
+    let scans = ScanCoordinator::new(backend);
+    let global = scans
+        .start(&json!({ "enabled": true, "timeout_ms": 60_000 }))
+        .await;
+    let global_id = global["data"]["scan"]["request_id"].as_str().unwrap();
+    let targeted = scans
+        .start(&json!({
+            "adapter_key": "adapter-1",
+            "enabled": true,
+            "timeout_ms": 60_000
+        }))
+        .await;
+    let targeted_id = targeted["data"]["scan"]["request_id"].as_str().unwrap();
+
+    scans.stop(Some(global_id), "cancelled").await;
+    let stopped = scanning
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .filter(|(_, enabled)| !enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(stopped, vec![(Some("adapter-2".into()), false)]);
+
+    scans.stop(Some(targeted_id), "cancelled").await;
+    let stopped = scanning
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .filter(|(_, enabled)| !enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stopped,
+        vec![
+            (Some("adapter-2".into()), false),
+            (Some("adapter-1".into()), false)
+        ]
+    );
 }
 
 #[tokio::test]

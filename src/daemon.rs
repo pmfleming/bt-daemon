@@ -14,7 +14,7 @@ use tokio::{
     sync::{Mutex, broadcast},
     task::JoinHandle,
 };
-use zbus::{connection, object_server::SignalEmitter};
+use zbus::{connection, message::Header, object_server::SignalEmitter};
 
 use crate::{
     api, audio as pipewire_audio, backend::BluetoothBackend, obex as bluez_obex,
@@ -109,9 +109,17 @@ impl BluetoothDaemon {
     async fn subscribe(
         &self,
         streams: Vec<String>,
+        #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> String {
-        subscription::start(self, streams, emitter).await
+        let Some(sender) = header.sender().map(|sender| sender.to_owned()) else {
+            return api::error(
+                "subscription-unavailable",
+                "D-Bus caller identity is unavailable".to_string(),
+            )
+            .to_string();
+        };
+        subscription::start(self, streams, sender, emitter).await
     }
 
     async fn cancel(&self, request_id: &str) -> String {

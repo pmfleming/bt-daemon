@@ -17,6 +17,8 @@ const REGISTRY_VERSION: u8 = 1;
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct RegistryFile {
     version: u8,
+    #[serde(default)]
+    adapters: HashMap<String, String>,
     devices: HashMap<String, String>,
 }
 
@@ -53,6 +55,7 @@ impl DeviceIdentityRegistry {
             }
             _ => RegistryFile {
                 version: REGISTRY_VERSION,
+                adapters: HashMap::new(),
                 devices: HashMap::new(),
             },
         };
@@ -62,12 +65,49 @@ impl DeviceIdentityRegistry {
         }))
     }
 
-    pub fn device_key(&self, adapter: &str, address: Address) -> String {
-        let identity = format!("{adapter}:{address}");
+    pub fn register_adapter(&self, adapter: &str, stable_identity: &str) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let previous = state.adapters.get(adapter).cloned();
+        if previous.as_deref() == Some(stable_identity) {
+            return;
+        }
+        state
+            .adapters
+            .insert(adapter.to_string(), stable_identity.to_string());
+        if previous.is_none() {
+            let legacy_prefix = format!("{adapter}:");
+            let legacy = state
+                .devices
+                .iter()
+                .filter(|(identity, _)| identity.starts_with(&legacy_prefix))
+                .map(|(identity, key)| (identity.clone(), key.clone()))
+                .collect::<Vec<_>>();
+            for (identity, key) in legacy {
+                state.devices.remove(&identity);
+                let address = &identity[legacy_prefix.len()..];
+                state
+                    .devices
+                    .entry(format!("{stable_identity}:{address}"))
+                    .or_insert(key);
+            }
+        }
+        if let Some(path) = &self.path
+            && let Err(error) = persist(path, &state)
+        {
+            tracing::warn!(%error, "could not persist Bluetooth adapter identity");
+        }
+    }
+
+    pub fn device_key(&self, adapter: &str, address: Address) -> String {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let adapter_identity = state.adapters.get(adapter).map_or(adapter, String::as_str);
+        let identity = format!("{adapter_identity}:{address}");
         if let Some(key) = state.devices.get(&identity) {
             return key.clone();
         }
@@ -136,6 +176,16 @@ mod tests {
         assert_eq!(first, registry.device_key("hci0", address));
         assert!(!first.contains("AA"));
         assert_ne!(first, registry.device_key("hci1", address));
+    }
+
+    #[test]
+    fn keys_use_stable_adapter_identity_across_kernel_renames() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        registry.register_adapter("hci0", "00:11:22:33:44:55");
+        let first = registry.device_key("hci0", address);
+        registry.register_adapter("hci1", "00:11:22:33:44:55");
+        assert_eq!(first, registry.device_key("hci1", address));
     }
 
     #[test]

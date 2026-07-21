@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -17,7 +17,7 @@ use bluer::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot};
 
 use crate::{identity::DeviceIdentityRegistry, params::Params};
 
@@ -58,18 +58,17 @@ impl PendingResponse {
 
     fn accept(self, params: &Value) -> Result<()> {
         match self {
-            Self::Pin(sender) => {
-                let _ = sender.send(Ok(pin_value(params)?));
-            }
-            Self::Passkey(sender) => {
-                let _ = sender.send(Ok(passkey_value(params)?));
-            }
-            Self::Unit(sender) => {
-                let _ = sender.send(Ok(()));
-            }
+            Self::Pin(sender) => send_response(sender, Ok(pin_value(params)?)),
+            Self::Passkey(sender) => send_response(sender, Ok(passkey_value(params)?)),
+            Self::Unit(sender) => send_response(sender, Ok(())),
         }
-        Ok(())
     }
+}
+
+fn send_response<T>(sender: oneshot::Sender<ReqResult<T>>, response: ReqResult<T>) -> Result<()> {
+    sender
+        .send(response)
+        .map_err(|_| anyhow::anyhow!("pairing request was cancelled"))
 }
 
 fn pin_value(params: &Value) -> Result<String> {
@@ -99,8 +98,36 @@ struct PendingRequest {
     event: PairingEvent,
 }
 
+struct RequestGuard {
+    broker: Arc<PairingBroker>,
+    request_id: Option<String>,
+}
+
+impl RequestGuard {
+    fn new(broker: Arc<PairingBroker>, request_id: String) -> Self {
+        Self {
+            broker,
+            request_id: Some(request_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        // BlueR reports Agent1.Cancel by dropping the callback future.
+        if let Some(request_id) = self.request_id.take() {
+            self.broker.cancel_pending(&request_id, "bluez-cancelled");
+        }
+    }
+}
+
 pub struct PairingBroker {
     sequence: AtomicU64,
+    // Synchronous so a dropped callback can remove its prompt in Drop without a race.
     pending: Mutex<HashMap<String, PendingRequest>>,
     events: broadcast::Sender<PairingEvent>,
     identities: Arc<DeviceIdentityRegistry>,
@@ -151,7 +178,10 @@ impl PairingBroker {
     pub async fn respond(&self, params: &Value) -> Result<bool> {
         let request_id = params.require_string("request_id")?;
         let accept = params.require_bool("accept")?;
-        let mut pending = self.pending.lock().await;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let request = pending
             .get(request_id)
             .context("pairing request is no longer pending")?;
@@ -174,30 +204,32 @@ impl PairingBroker {
 
     async fn request_pin(self: &Arc<Self>, adapter: String, device: Address) -> ReqResult<String> {
         let (sender, receiver) = oneshot::channel();
-        self.insert_request(
-            "pin-code",
-            &adapter,
-            device,
-            PendingResponse::Pin(sender),
-            None,
-            None,
-        )
-        .await;
-        wait_for_response(receiver).await
+        let request_id = self
+            .insert_request(
+                "pin-code",
+                &adapter,
+                device,
+                PendingResponse::Pin(sender),
+                None,
+                None,
+            )
+            .await;
+        self.wait_for_response(request_id, receiver).await
     }
 
     async fn request_passkey(self: &Arc<Self>, adapter: String, device: Address) -> ReqResult<u32> {
         let (sender, receiver) = oneshot::channel();
-        self.insert_request(
-            "passkey",
-            &adapter,
-            device,
-            PendingResponse::Passkey(sender),
-            None,
-            None,
-        )
-        .await;
-        wait_for_response(receiver).await
+        let request_id = self
+            .insert_request(
+                "passkey",
+                &adapter,
+                device,
+                PendingResponse::Passkey(sender),
+                None,
+                None,
+            )
+            .await;
+        self.wait_for_response(request_id, receiver).await
     }
 
     async fn request_unit(
@@ -209,16 +241,17 @@ impl PairingBroker {
         service: Option<String>,
     ) -> ReqResult<()> {
         let (sender, receiver) = oneshot::channel();
-        self.insert_request(
-            kind,
-            &adapter,
-            device,
-            PendingResponse::Unit(sender),
-            value,
-            service,
-        )
-        .await;
-        wait_for_response(receiver).await
+        let request_id = self
+            .insert_request(
+                kind,
+                &adapter,
+                device,
+                PendingResponse::Unit(sender),
+                value,
+                service,
+            )
+            .await;
+        self.wait_for_response(request_id, receiver).await
     }
 
     async fn insert_request(
@@ -229,7 +262,7 @@ impl PairingBroker {
         pending: PendingResponse,
         value: Option<String>,
         service: Option<String>,
-    ) {
+    ) -> String {
         let id = format!("pairing-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
         let event = PairingEvent {
             event: "requested".to_string(),
@@ -244,22 +277,63 @@ impl PairingBroker {
             timeout_ms: self.prompt_timeout.as_millis() as u64,
         };
         tracing::info!(request_id = %id, %kind, device_key = %event.device_key, timeout_ms = event.timeout_ms, "pairing request started");
-        self.pending.lock().await.insert(
-            id.clone(),
-            PendingRequest {
-                response: pending,
-                event: event.clone(),
-            },
-        );
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                id.clone(),
+                PendingRequest {
+                    response: pending,
+                    event: event.clone(),
+                },
+            );
         self.emit(event);
-        self.schedule_timeout(id);
+        self.schedule_timeout(id.clone());
+        id
+    }
+
+    async fn wait_for_response<T>(
+        self: &Arc<Self>,
+        request_id: String,
+        receiver: oneshot::Receiver<ReqResult<T>>,
+    ) -> ReqResult<T> {
+        let mut guard = RequestGuard::new(Arc::clone(self), request_id);
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err(ReqError::Canceled),
+        };
+        guard.disarm();
+        result
+    }
+
+    fn cancel_pending(&self, request_id: &str, reason: &str) {
+        let request = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(request_id);
+        if let Some(request) = request {
+            tracing::warn!(%request_id, kind = %request.event.kind, device_key = %request.event.device_key, %reason, "pairing request cancelled");
+            let mut event = request.event;
+            event.event = "cancelled".to_string();
+            event.response_required = false;
+            event.value = None;
+            event.service = None;
+            event.reason = Some(reason.to_string());
+            event.timeout_ms = 0;
+            self.emit(event);
+        }
     }
 
     fn schedule_timeout(self: &Arc<Self>, request_id: String) {
         let broker = Arc::clone(self);
         crate::task::spawn("pairing-timeout", async move {
             tokio::time::sleep(broker.prompt_timeout).await;
-            let request = broker.pending.lock().await.remove(&request_id);
+            let request = broker
+                .pending
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&request_id);
             if let Some(request) = request {
                 tracing::warn!(%request_id, kind = %request.event.kind, device_key = %request.event.device_key, "pairing request timed out");
                 cancel(request.response);
@@ -329,13 +403,6 @@ impl PairingBroker {
 
     fn emit(&self, event: PairingEvent) {
         let _ = self.events.send(event);
-    }
-}
-
-async fn wait_for_response<T>(receiver: oneshot::Receiver<ReqResult<T>>) -> ReqResult<T> {
-    match receiver.await {
-        Ok(result) => result,
-        Err(_) => Err(ReqError::Canceled),
     }
 }
 
@@ -449,7 +516,13 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(!request.is_finished());
-        assert!(broker.pending.lock().await.contains_key(&event.request_id));
+        assert!(
+            broker
+                .pending
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&event.request_id)
+        );
         request.abort();
     }
 
@@ -504,6 +577,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_bluez_request_is_cancelled_immediately() {
+        let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
+        let mut events = broker.subscribe();
+        let request_broker = broker.clone();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let request = tokio::spawn(async move {
+            request_broker
+                .request_unit("confirmation", "hci0".into(), address, None, None)
+                .await
+        });
+        let requested = events.recv().await.unwrap();
+        request.abort();
+        let cancelled = events.recv().await.unwrap();
+        assert_eq!(cancelled.request_id, requested.request_id);
+        assert_eq!(cancelled.reason.as_deref(), Some("bluez-cancelled"));
+        assert!(
+            broker
+                .respond(&json!({ "request_id": requested.request_id, "accept": true }))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_cancels_request_and_emits_terminal_event() {
         let broker = PairingBroker::with_timeout(
             DeviceIdentityRegistry::in_memory(),
@@ -524,6 +621,12 @@ mod tests {
         assert_eq!(cancelled.reason.as_deref(), Some("timeout"));
         assert!(!cancelled.response_required);
         assert_eq!(request.await.unwrap(), Err(ReqError::Canceled));
-        assert!(broker.pending.lock().await.is_empty());
+        assert!(
+            broker
+                .pending
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty()
+        );
     }
 }

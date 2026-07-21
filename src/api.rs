@@ -80,15 +80,19 @@ pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: 
 }
 
 fn parse_backend_request<'a>(method: &str, params: &'a Value) -> Result<BackendRequest<'a>, Value> {
-    let adapter_key = || params.get("adapter_key").and_then(Value::as_str);
+    let adapter_key = || {
+        params
+            .optional_string("adapter_key")
+            .map_err(validation_error)
+    };
     match method {
         "bluetooth.snapshot" => Ok(BackendRequest::Snapshot),
         "bluetooth.setPowered" => Ok(BackendRequest::SetPowered {
-            adapter_key: adapter_key(),
+            adapter_key: adapter_key()?,
             powered: params.require_bool("powered").map_err(validation_error)?,
         }),
         "bluetooth.scan" => Ok(BackendRequest::SetScanning {
-            adapter_key: adapter_key(),
+            adapter_key: adapter_key()?,
             enabled: params.require_bool("enabled").map_err(validation_error)?,
         }),
         "bluetooth.adapter.operation" => {
@@ -157,7 +161,7 @@ mod tests {
 
     use crate::backend::{BackendError, BackendErrorKind};
 
-    use super::error_value;
+    use super::{error_value, parse_backend_request};
 
     #[test]
     fn classifies_typed_errors_through_context() {
@@ -176,5 +180,14 @@ mod tests {
         let value = error_value(&anyhow!("authentication rejected after timeout"));
         assert_eq!(value["code"], "operation-failed");
         assert_eq!(value["retryable"], false);
+    }
+
+    #[test]
+    fn invalid_optional_adapter_key_is_not_treated_as_all_adapters() {
+        let params = serde_json::json!({ "adapter_key": 42, "powered": false });
+        let Err(error) = parse_backend_request("bluetooth.setPowered", &params) else {
+            panic!("invalid adapter key was accepted");
+        };
+        assert_eq!(error["error"]["code"], "validation-error");
     }
 }

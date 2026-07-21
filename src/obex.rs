@@ -243,7 +243,14 @@ impl IncomingBroker {
 
     async fn authorize(&self, transfer_path: OwnedObjectPath) -> Result<String, ObexAgentError> {
         let authorization = self.prepare_authorization(transfer_path).await?;
-        match self.request_decision(&authorization).await? {
+        let decision = match self.request_decision(&authorization).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                remove_reservation(&authorization.destination);
+                return Err(error);
+            }
+        };
+        match decision {
             AuthorizationDecision::Accept => Ok(self.start_incoming(authorization).await),
             AuthorizationDecision::Reject => Err(self.reject_authorization(
                 authorization,
@@ -272,7 +279,7 @@ impl IncomingBroker {
             .await
             .map_err(rejected)?;
         let file_name = safe_file_name(&details.name);
-        let destination = incoming_destination(&file_name).map_err(rejected)?;
+        let destination = reserve_incoming_destination(&file_name).map_err(rejected)?;
         let request_id = format!(
             "obex-incoming-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
@@ -331,6 +338,7 @@ impl IncomingBroker {
         authorization: IncomingAuthorization,
         error: ObexAgentError,
     ) -> ObexAgentError {
+        remove_reservation(&authorization.destination);
         let _ = self
             .events
             .send(authorization.event("cancelled", "cancelled", None));
@@ -772,16 +780,16 @@ pub(crate) fn lifecycle_event(status: &str) -> &'static str {
     }
 }
 
-fn incoming_destination(file_name: &str) -> Result<PathBuf> {
+fn reserve_incoming_destination(file_name: &str) -> Result<PathBuf> {
     let directory = std::env::var_os("BT_DAEMON_DOWNLOAD_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_DOWNLOAD_DIR").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
         .context("no incoming Bluetooth download directory is configured")?;
-    incoming_destination_in(&directory, file_name)
+    reserve_incoming_destination_in(&directory, file_name)
 }
 
-fn incoming_destination_in(directory: &Path, file_name: &str) -> Result<PathBuf> {
+fn reserve_incoming_destination_in(directory: &Path, file_name: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(directory).with_context(|| {
         format!(
             "create Bluetooth download directory {}",
@@ -791,27 +799,47 @@ fn incoming_destination_in(directory: &Path, file_name: &str) -> Result<PathBuf>
     let directory = directory
         .canonicalize()
         .context("resolve Bluetooth download directory")?;
-    let candidate = directory.join(file_name);
-    if !candidate.exists() {
-        return Ok(candidate);
-    }
     let path = Path::new(file_name);
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("bluetooth-transfer");
     let extension = path.extension().and_then(|value| value.to_str());
-    for suffix in 1..10_000 {
-        let name = match extension {
-            Some(extension) => format!("{stem} ({suffix}).{extension}"),
-            None => format!("{stem} ({suffix})"),
+    for suffix in 0..10_000 {
+        let name = match (suffix, extension) {
+            (0, _) => file_name.to_string(),
+            (_, Some(extension)) => format!("{stem} ({suffix}).{extension}"),
+            (_, None) => format!("{stem} ({suffix})"),
         };
         let candidate = directory.join(name);
-        if !candidate.exists() {
-            return Ok(candidate);
+        // obexd opens the authorized destination with O_TRUNC. Creating it
+        // exclusively here reserves the name across concurrent authorizations.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reserve incoming Bluetooth file {}", candidate.display())
+                });
+            }
         }
     }
-    bail!("could not allocate a unique incoming Bluetooth filename")
+    bail!("could not reserve a unique incoming Bluetooth filename")
+}
+
+fn remove_reservation(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), %error, "could not remove incoming Bluetooth reservation");
+    }
 }
 
 fn safe_file_name(value: &str) -> String {
@@ -871,8 +899,8 @@ mod tests {
     use crate::backend::ObexRemote;
 
     use super::{
-        IncomingDetails, incoming_destination_in, incoming_event, lifecycle_event, safe_file_name,
-        validate_outgoing_path,
+        IncomingDetails, incoming_event, lifecycle_event, reserve_incoming_destination_in,
+        safe_file_name, validate_outgoing_path,
     };
 
     #[test]
@@ -888,8 +916,12 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("example.txt"), b"existing").unwrap();
         assert_eq!(
-            incoming_destination_in(&directory, "example.txt").unwrap(),
+            reserve_incoming_destination_in(&directory, "example.txt").unwrap(),
             directory.join("example (1).txt")
+        );
+        assert_eq!(
+            reserve_incoming_destination_in(&directory, "example.txt").unwrap(),
+            directory.join("example (2).txt")
         );
         fs::remove_dir_all(directory).unwrap();
     }

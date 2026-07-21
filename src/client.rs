@@ -75,6 +75,7 @@ pub async fn run() -> Result<()> {
             break;
         }
     }
+    while calls.join_next().await.is_some() {}
     Ok(())
 }
 
