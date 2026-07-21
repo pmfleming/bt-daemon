@@ -73,6 +73,7 @@ pub struct Battery {
 #[derive(Debug, Clone, Serialize)]
 pub struct FastPairFeatures {
     pub model_id: Option<String>,
+    pub ble_address: Option<String>,
     pub authenticated_controls: bool,
     pub multipoint: Option<FastPairMultipoint>,
     pub noise_control: Option<FastPairNoiseControl>,

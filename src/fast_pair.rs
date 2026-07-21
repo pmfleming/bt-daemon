@@ -777,6 +777,59 @@ fn nak_reason(reason: u8) -> &'static str {
     }
 }
 
+async fn resolve_ble_device(adapter: &Adapter, address: Address) -> Result<Device> {
+    let known = adapter
+        .device_addresses()
+        .await
+        .context("list devices before Fast Pair BLE discovery")?
+        .contains(&address);
+    if !known {
+        let events = adapter
+            .discover_devices()
+            .await
+            .context("start discovery for Fast Pair BLE address")?;
+        futures::pin_mut!(events);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, bluer::AdapterEvent::DeviceAdded(found) if found == address) {
+                    return Ok(());
+                }
+            }
+            bail!("Bluetooth discovery ended before the Fast Pair BLE address appeared")
+        })
+        .await
+        .context("Fast Pair BLE address was not discovered")??;
+    }
+    let device = adapter
+        .device(address)
+        .context("open discovered Fast Pair BLE device")?;
+    if !device
+        .is_connected()
+        .await
+        .context("read Fast Pair BLE connection state")?
+    {
+        device
+            .connect()
+            .await
+            .context("connect Fast Pair BLE device for provisioning")?;
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if device
+                .is_services_resolved()
+                .await
+                .context("read Fast Pair BLE service resolution state")?
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("Fast Pair BLE service resolution timed out")??;
+    Ok(device)
+}
+
 async fn find_service(device: &Device, uuid: Uuid) -> Result<Option<Service>> {
     for service in device
         .services()
@@ -886,6 +939,7 @@ impl FastPairBatteryProvider {
             .device_key(device.adapter_name(), device.address());
         Some(FastPairFeatures {
             model_id: runtime.model_id.map(hex::encode),
+            ble_address: runtime.ble_address.map(|address| address.to_string()),
             authenticated_controls: runtime.session_nonce.is_some()
                 && self.account_keys.get(&device_key).is_some(),
             multipoint: runtime.multipoint,
@@ -967,9 +1021,7 @@ impl FastPairBatteryProvider {
         .await
         .context("timed out waiting for Fast Pair retroactive-pairing metadata")?;
         let ble_address = runtime.ble_address.unwrap_or_else(|| device.address());
-        let ble_device = adapter
-            .device(ble_address)
-            .context("open Fast Pair BLE device for account-key provisioning")?;
+        let ble_device = resolve_ble_device(adapter, ble_address).await?;
         let service = find_service(&ble_device, self.fast_pair_service_uuid)
             .await?
             .context("Fast Pair GATT service is unavailable for account-key provisioning")?;
