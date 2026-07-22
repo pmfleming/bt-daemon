@@ -3,11 +3,8 @@ use std::sync::Arc;
 use anyhow::Error;
 use serde_json::{Value, json};
 
-use crate::{
-    backend::{
-        AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
-    },
-    params::Params,
+use crate::backend::{
+    AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation, Params,
 };
 
 pub use crate::protocol::{NAME as PROTOCOL, VERSION};

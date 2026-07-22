@@ -14,7 +14,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{api, backend::BluetoothBackend, params::Params};
+use crate::backend::Params;
+use crate::{api, backend::BluetoothBackend};
 
 #[derive(Clone, Serialize)]
 pub(super) struct ScanEvent {

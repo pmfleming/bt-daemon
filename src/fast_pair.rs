@@ -8,7 +8,7 @@ use aes::{
     Aes128,
     cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use bluer::{
     Adapter, Address, AddressType, Device, Session,
     gatt::remote::{Characteristic, Service},
@@ -572,6 +572,27 @@ struct ConnectionState {
 
 type PendingCommand = oneshot::Sender<std::result::Result<(), String>>;
 
+#[derive(Clone, Copy)]
+struct FastPairUuids {
+    message_stream: Uuid,
+    service: Uuid,
+    message_stream_psm: Uuid,
+    key_based_pairing: Uuid,
+    account_key: Uuid,
+}
+
+impl FastPairUuids {
+    fn parse() -> Result<Self> {
+        Ok(Self {
+            message_stream: Uuid::parse_str(MESSAGE_STREAM_UUID)?,
+            service: Uuid::parse_str(FAST_PAIR_SERVICE_UUID)?,
+            message_stream_psm: Uuid::parse_str(MESSAGE_STREAM_PSM_UUID)?,
+            key_based_pairing: Uuid::parse_str(KEY_BASED_PAIRING_UUID)?,
+            account_key: Uuid::parse_str(ACCOUNT_KEY_UUID)?,
+        })
+    }
+}
+
 pub struct FastPairBatteryProvider {
     session: Session,
     identities: Arc<DeviceIdentityRegistry>,
@@ -581,11 +602,7 @@ pub struct FastPairBatteryProvider {
     connections: Mutex<ConnectionState>,
     pending_commands: Mutex<HashMap<(Address, u8, u8), PendingCommand>>,
     changes: broadcast::Sender<()>,
-    message_stream_uuid: Uuid,
-    fast_pair_service_uuid: Uuid,
-    message_stream_psm_uuid: Uuid,
-    key_based_pairing_uuid: Uuid,
-    account_key_uuid: Uuid,
+    uuids: FastPairUuids,
     rfcomm_available: bool,
 }
 
@@ -778,12 +795,12 @@ fn nak_reason(reason: u8) -> &'static str {
 }
 
 async fn resolve_ble_device(adapter: &Adapter, address: Address) -> Result<Device> {
-    let known = adapter
+    if !adapter
         .device_addresses()
         .await
         .context("list devices before Fast Pair BLE discovery")?
-        .contains(&address);
-    if !known {
+        .contains(&address)
+    {
         let events = adapter
             .discover_devices()
             .await
@@ -872,19 +889,10 @@ impl FastPairBatteryProvider {
         identities: Arc<DeviceIdentityRegistry>,
         changes: broadcast::Sender<()>,
     ) -> Result<Arc<Self>> {
-        let message_stream_uuid =
-            Uuid::parse_str(MESSAGE_STREAM_UUID).expect("fixed Fast Pair UUID is valid");
-        let fast_pair_service_uuid =
-            Uuid::parse_str(FAST_PAIR_SERVICE_UUID).expect("fixed Fast Pair service UUID is valid");
-        let message_stream_psm_uuid = Uuid::parse_str(MESSAGE_STREAM_PSM_UUID)
-            .expect("fixed Fast Pair PSM characteristic UUID is valid");
-        let key_based_pairing_uuid = Uuid::parse_str(KEY_BASED_PAIRING_UUID)
-            .expect("fixed Fast Pair key-based pairing UUID is valid");
-        let account_key_uuid =
-            Uuid::parse_str(ACCOUNT_KEY_UUID).expect("fixed Fast Pair account key UUID is valid");
+        let uuids = FastPairUuids::parse().context("parse fixed Fast Pair UUIDs")?;
         let account_keys = AccountKeyStore::load_default()?;
         let profile = Profile {
-            uuid: message_stream_uuid,
+            uuid: uuids.message_stream,
             name: Some("Shelllist Fast Pair battery provider".to_string()),
             role: Some(Role::Client),
             require_authentication: Some(true),
@@ -908,11 +916,7 @@ impl FastPairBatteryProvider {
             connections: Mutex::new(ConnectionState::default()),
             pending_commands: Mutex::new(HashMap::new()),
             changes,
-            message_stream_uuid,
-            fast_pair_service_uuid,
-            message_stream_psm_uuid,
-            key_based_pairing_uuid,
-            account_key_uuid,
+            uuids,
             rfcomm_available: requests.is_some(),
         });
         if let Some(requests) = requests {
@@ -1007,34 +1011,25 @@ impl FastPairBatteryProvider {
         device: &Device,
         anti_spoofing_key: &str,
     ) -> Result<()> {
-        let provider_public_key = parse_anti_spoofing_public_key(anti_spoofing_key)?;
-        let runtime = tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                if let Some(runtime) = self.runtime.read().await.get(&device.address()).cloned()
-                    && runtime.model_id.is_some()
-                {
-                    return runtime;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .context("timed out waiting for Fast Pair retroactive-pairing metadata")?;
+        let runtime = self
+            .wait_for_provisioning_metadata(device.address())
+            .await?;
         let ble_address = runtime.ble_address.unwrap_or_else(|| device.address());
         let ble_device = resolve_ble_device(adapter, ble_address).await?;
-        let service = find_service(&ble_device, self.fast_pair_service_uuid)
+        let service = find_service(&ble_device, self.uuids.service)
             .await?
             .context("Fast Pair GATT service is unavailable for account-key provisioning")?;
-        let pairing = find_characteristic(&service, self.key_based_pairing_uuid)
+        let pairing = find_characteristic(&service, self.uuids.key_based_pairing)
             .await?
             .context("Fast Pair key-based pairing characteristic is unavailable")?;
-        let account_key_characteristic = find_characteristic(&service, self.account_key_uuid)
+        let account_key_characteristic = find_characteristic(&service, self.uuids.account_key)
             .await?
             .context("Fast Pair account key characteristic is unavailable")?;
 
+        let provider_key = parse_anti_spoofing_public_key(anti_spoofing_key)?;
         let ephemeral = EphemeralSecret::random(&mut OsRng);
         let seeker_public = PublicKey::from(&ephemeral).to_encoded_point(false);
-        let shared = ephemeral.diffie_hellman(&provider_public_key);
+        let shared = ephemeral.diffie_hellman(&provider_key);
         let shared_key = derive_aes_key(shared.raw_secret_bytes());
         let mut request = [0_u8; 16];
         request[0] = 0x00;
@@ -1050,7 +1045,6 @@ impl FastPairBatteryProvider {
         crypt_block(&shared_key, &mut request, true);
         let mut write = request.to_vec();
         write.extend_from_slice(&seeker_public.as_bytes()[1..]);
-
         let notifications = pairing
             .notify()
             .await
@@ -1071,12 +1065,14 @@ impl FastPairBatteryProvider {
             )
         })?;
         crypt_block(&shared_key, &mut response, false);
-        if response[0] != 0x01 {
-            bail!("Fast Pair provider returned an invalid key-based pairing response");
-        }
-        if response[1..7] != address_bytes(device.address()) {
-            bail!("Fast Pair provider response did not match the paired Bluetooth device");
-        }
+        ensure!(
+            response[0] == 0x01,
+            "Fast Pair provider returned an invalid key-based pairing response"
+        );
+        ensure!(
+            response[1..7] == address_bytes(device.address()),
+            "Fast Pair provider response did not match the paired Bluetooth device"
+        );
 
         let account_key = AccountKeyStore::generate();
         let mut encrypted_account_key = account_key;
@@ -1096,6 +1092,21 @@ impl FastPairBatteryProvider {
         );
         let _ = self.changes.send(());
         Ok(())
+    }
+
+    async fn wait_for_provisioning_metadata(&self, address: Address) -> Result<RuntimeReport> {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(runtime) = self.runtime.read().await.get(&address).cloned()
+                    && runtime.model_id.is_some()
+                {
+                    return runtime;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for Fast Pair retroactive-pairing metadata")
     }
 
     async fn send_authenticated(
@@ -1264,8 +1275,8 @@ impl FastPairBatteryProvider {
         };
         match select_transport(
             self.rfcomm_available,
-            uuids.contains(&self.message_stream_uuid),
-            uuids.contains(&self.fast_pair_service_uuid),
+            uuids.contains(&self.uuids.message_stream),
+            uuids.contains(&self.uuids.service),
         ) {
             Some(MessageStreamTransport::Rfcomm) => self.ensure_rfcomm_connected(device).await,
             Some(MessageStreamTransport::L2cap) => self.ensure_l2cap_connected(device).await,
@@ -1284,7 +1295,7 @@ impl FastPairBatteryProvider {
             let result = crate::task::catch("Fast Pair RFCOMM connection", async {
                 tokio::time::timeout(
                     CONNECT_TIMEOUT,
-                    device.connect_profile(&provider.message_stream_uuid),
+                    device.connect_profile(&provider.uuids.message_stream),
                 )
                 .await
                 .context("Fast Pair profile connection timed out")?
@@ -1372,10 +1383,10 @@ impl FastPairBatteryProvider {
     }
 
     async fn read_message_stream_psm(&self, device: &Device) -> Result<PsmAvailability> {
-        let service = find_service(device, self.fast_pair_service_uuid)
+        let service = find_service(device, self.uuids.service)
             .await?
             .context("Fast Pair GATT service is unavailable")?;
-        let characteristic = find_characteristic(&service, self.message_stream_psm_uuid)
+        let characteristic = find_characteristic(&service, self.uuids.message_stream_psm)
             .await?
             .context("Fast Pair Message Stream PSM characteristic is unavailable")?;
         let value = characteristic

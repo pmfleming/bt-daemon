@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::{api, audio, pairing::PairingBroker, params::Params};
+use crate::{api, audio, backend::Params, pairing::PairingBroker};
 
 pub(super) fn start_monitor(events: broadcast::Sender<()>) -> Result<()> {
     std::thread::Builder::new()

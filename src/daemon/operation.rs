@@ -15,8 +15,7 @@ use tokio::{
 
 use crate::{
     api,
-    backend::{BluetoothBackend, DeviceOperation},
-    params::Params,
+    backend::{BluetoothBackend, DeviceOperation, Params},
 };
 
 #[derive(Clone, Serialize)]

@@ -9,7 +9,8 @@ use std::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 
-use crate::{api, backend::BluetoothBackend, obex, params::Params};
+use crate::backend::Params;
+use crate::{api, backend::BluetoothBackend, obex};
 
 pub(super) async fn respond(incoming: &obex::IncomingBroker, params: &Value) -> Value {
     let request = params

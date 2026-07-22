@@ -20,12 +20,11 @@ use tokio::{
 use crate::{
     backend::{
         AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
-        ObexRemote, ObexTarget,
+        ObexRemote, ObexTarget, Params,
     },
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::DeviceIdentityRegistry,
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
-    params::Params,
 };
 
 const DISCOVERED_DEVICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -581,15 +580,7 @@ async fn run_device_operation(
     match operation {
         DeviceOperation::Pair => {
             pair_device(device, params).await?;
-            if let Some(public_key) = params
-                .get("fast_pair_anti_spoofing_public_key")
-                .and_then(Value::as_str)
-            {
-                fast_pair
-                    .context("Fast Pair provider is unavailable")?
-                    .provision_account_key(adapter, device, public_key)
-                    .await?;
-            }
+            provision_after_pair(adapter, device, params, fast_pair).await?;
         }
         DeviceOperation::Connect => connect_device(device, "connect Bluetooth device").await?,
         DeviceOperation::Disconnect => {
@@ -634,6 +625,24 @@ async fn run_device_operation(
                 .set_noise_control(device, params.require_string("mode")?)
                 .await?;
         }
+    }
+    Ok(())
+}
+
+async fn provision_after_pair(
+    adapter: &BluezAdapter,
+    device: &BluezDevice,
+    params: &Value,
+    fast_pair: Option<&FastPairBatteryProvider>,
+) -> Result<()> {
+    if let Some(public_key) = params
+        .get("fast_pair_anti_spoofing_public_key")
+        .and_then(Value::as_str)
+    {
+        fast_pair
+            .context("Fast Pair provider is unavailable")?
+            .provision_account_key(adapter, device, public_key)
+            .await?;
     }
     Ok(())
 }
@@ -910,61 +919,51 @@ fn device_capabilities(
     has_fast_pair: bool,
     fast_pair: Option<&crate::model::FastPairFeatures>,
 ) -> DeviceCapabilities {
-    let mut unsupported_reasons = HashMap::new();
-    if paired {
-        unsupported_reasons.insert("pair".into(), "Device is already paired".into());
-    }
-    if connected {
-        unsupported_reasons.insert("connect".into(), "Device is already connected".into());
-    } else {
-        unsupported_reasons.insert("disconnect".into(), "Device is not connected".into());
-    }
-    if wake_allowed.is_none() {
-        unsupported_reasons.insert(
-            "wake".into(),
-            "BlueZ does not expose wake control for this device".into(),
-        );
-    }
-    if !paired {
-        unsupported_reasons.insert(
-            "send_file".into(),
-            "Pair the device before sending files".into(),
-        );
-    }
     let can_provision_fast_pair = paired
         && connected
         && has_fast_pair
         && fast_pair.is_some_and(|features| {
             features.model_id.is_some() && !features.authenticated_controls
         });
-    if !can_provision_fast_pair {
-        unsupported_reasons.insert(
-            "provision_fast_pair".into(),
-            "Fast Pair provisioning requires recent-pairing model metadata from a connected device"
-                .into(),
-        );
-    }
     let authenticated = fast_pair.is_some_and(|features| features.authenticated_controls);
     let can_set_multipoint = authenticated
         && fast_pair
             .and_then(|features| features.multipoint)
             .is_some_and(|multipoint| multipoint.supported && multipoint.configurable);
-    if !can_set_multipoint {
-        unsupported_reasons.insert(
-            "set_multipoint".into(),
-            "Authenticated configurable Fast Pair multipoint is unavailable".into(),
-        );
-    }
     let can_set_noise_control = authenticated
         && fast_pair
             .and_then(|features| features.noise_control.as_ref())
             .is_some_and(|noise| !noise.settable_modes.is_empty());
-    if !can_set_noise_control {
-        unsupported_reasons.insert(
-            "set_noise_control".into(),
-            "Authenticated Fast Pair noise control is unavailable".into(),
-        );
-    }
+    let unsupported_reasons = [
+        (paired, "pair", "Device is already paired"),
+        (connected, "connect", "Device is already connected"),
+        (!connected, "disconnect", "Device is not connected"),
+        (
+            wake_allowed.is_none(),
+            "wake",
+            "BlueZ does not expose wake control for this device",
+        ),
+        (!paired, "send_file", "Pair the device before sending files"),
+        (
+            !can_provision_fast_pair,
+            "provision_fast_pair",
+            "Fast Pair provisioning requires recent-pairing model metadata from a connected device",
+        ),
+        (
+            !can_set_multipoint,
+            "set_multipoint",
+            "Authenticated configurable Fast Pair multipoint is unavailable",
+        ),
+        (
+            !can_set_noise_control,
+            "set_noise_control",
+            "Authenticated Fast Pair noise control is unavailable",
+        ),
+    ]
+    .into_iter()
+    .filter(|(unsupported, _, _)| *unsupported)
+    .map(|(_, operation, reason)| (operation.into(), reason.into()))
+    .collect();
     DeviceCapabilities {
         can_pair: !paired && !blocked,
         can_connect: !connected && !blocked,

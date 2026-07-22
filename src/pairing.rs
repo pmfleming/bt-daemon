@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::{identity::DeviceIdentityRegistry, params::Params};
+use crate::{backend::Params, identity::DeviceIdentityRegistry};
 
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -214,49 +214,28 @@ impl PairingBroker {
         Ok(accept)
     }
 
-    async fn request_pin(self: &Arc<Self>, adapter: String, device: Address) -> ReqResult<String> {
-        let (sender, receiver) = oneshot::channel();
-        let id = self.insert_request(
-            "pin-code",
-            &adapter,
-            device,
-            PendingResponse::Pin(sender),
-            None,
-            None,
-        );
-        self.wait_for_response(id, receiver).await
+    async fn request_input<T>(
+        self: &Arc<Self>,
+        kind: &str,
+        adapter: String,
+        device: Address,
+        pending: impl FnOnce(oneshot::Sender<ReqResult<T>>) -> PendingResponse,
+    ) -> ReqResult<T> {
+        self.request_value(kind, adapter, device, None, None, pending)
+            .await
     }
 
-    async fn request_passkey(self: &Arc<Self>, adapter: String, device: Address) -> ReqResult<u32> {
-        let (sender, receiver) = oneshot::channel();
-        let id = self.insert_request(
-            "passkey",
-            &adapter,
-            device,
-            PendingResponse::Passkey(sender),
-            None,
-            None,
-        );
-        self.wait_for_response(id, receiver).await
-    }
-
-    async fn request_unit(
+    async fn request_value<T>(
         self: &Arc<Self>,
         kind: &str,
         adapter: String,
         device: Address,
         value: Option<String>,
         service: Option<String>,
-    ) -> ReqResult<()> {
+        pending: impl FnOnce(oneshot::Sender<ReqResult<T>>) -> PendingResponse,
+    ) -> ReqResult<T> {
         let (sender, receiver) = oneshot::channel();
-        let id = self.insert_request(
-            kind,
-            &adapter,
-            device,
-            PendingResponse::Unit(sender),
-            value,
-            service,
-        );
+        let id = self.insert_request(kind, &adapter, device, pending(sender), value, service);
         self.wait_for_response(id, receiver).await
     }
 
@@ -419,17 +398,18 @@ macro_rules! pairing_callbacks {
 
 pairing_callbacks! {
     callback_pin(RequestPinCode) -> bluer::agent::RequestPinCodeFn |broker, request|
-        broker.request_pin(request.adapter, request.device).await;
+        broker.request_input("pin-code", request.adapter, request.device, PendingResponse::Pin).await;
     callback_passkey(RequestPasskey) -> bluer::agent::RequestPasskeyFn |broker, request|
-        broker.request_passkey(request.adapter, request.device).await;
+        broker.request_input("passkey", request.adapter, request.device, PendingResponse::Passkey).await;
     callback_confirmation(RequestConfirmation) -> bluer::agent::RequestConfirmationFn |broker, request|
-        broker.request_unit("confirmation", request.adapter, request.device,
-            Some(format!("{:06}", request.passkey)), None).await;
+        broker.request_value("confirmation", request.adapter, request.device,
+            Some(format!("{:06}", request.passkey)), None, PendingResponse::Unit).await;
     callback_authorization(RequestAuthorization) -> bluer::agent::RequestAuthorizationFn |broker, request|
-        broker.request_unit("authorization", request.adapter, request.device, None, None).await;
+        broker.request_value("authorization", request.adapter, request.device,
+            None, None, PendingResponse::Unit).await;
     callback_service(AuthorizeService) -> bluer::agent::AuthorizeServiceFn |broker, request|
-        broker.request_unit("service-authorization", request.adapter, request.device,
-            None, Some(request.service.to_string())).await;
+        broker.request_value("service-authorization", request.adapter, request.device,
+            None, Some(request.service.to_string()), PendingResponse::Unit).await;
 }
 
 fn callback_display_pin(broker: Arc<PairingBroker>) -> bluer::agent::DisplayPinCodeFn {
@@ -483,7 +463,7 @@ mod tests {
     use bluer::agent::{ReqError, ReqResult};
     use tokio::{sync::broadcast, task::JoinHandle};
 
-    use super::{PairingBroker, PairingEvent};
+    use super::{PairingBroker, PairingEvent, PendingResponse};
 
     fn confirmation_request(
         broker: &Arc<PairingBroker>,
@@ -494,7 +474,14 @@ mod tests {
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let request = tokio::spawn(async move {
             request_broker
-                .request_unit("confirmation", "hci0".into(), address, value, None)
+                .request_value(
+                    "confirmation",
+                    "hci0".into(),
+                    address,
+                    value,
+                    None,
+                    PendingResponse::Unit,
+                )
                 .await
         });
         (events, request)
@@ -506,10 +493,11 @@ mod tests {
         let mut events = broker.subscribe();
         let request_broker = broker.clone();
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let request =
-            tokio::spawn(
-                async move { request_broker.request_passkey("hci0".into(), address).await },
-            );
+        let request = tokio::spawn(async move {
+            request_broker
+                .request_input("passkey", "hci0".into(), address, PendingResponse::Passkey)
+                .await
+        });
         let event = events.recv().await.unwrap();
         let result = broker
             .respond(&json!({ "request_id": event.request_id, "accept": true, "value": "12x" }))
