@@ -71,6 +71,19 @@ pub struct Battery {
     pub confidence: String,
 }
 
+impl Battery {
+    pub(crate) fn bluez_aggregate(percentage: u8) -> Self {
+        Self {
+            id: "aggregate".into(),
+            label: "Battery".into(),
+            component: "main".into(),
+            percentage,
+            source: "bluez".into(),
+            confidence: "standard".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FastPairFeatures {
     pub model_id: Option<String>,

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bluer::{
     Adapter as BluezAdapter, Device as BluezDevice, Session,
@@ -509,17 +509,7 @@ async fn adapter_devices(
         let device = adapter
             .device(address)
             .backend_context("open BlueZ device")?;
-        if let Some(snapshot) = device_snapshot(
-            adapter,
-            &device,
-            adapter_key,
-            &backend.identities,
-            &backend.device_cache,
-            &backend.system_bus,
-            backend.fast_pair.as_deref(),
-        )
-        .await?
-        {
+        if let Some(snapshot) = device_snapshot(backend, adapter, &device, adapter_key).await? {
             included.insert(snapshot.key.clone());
             devices.push(snapshot);
         }
@@ -578,33 +568,24 @@ async fn run_device_operation(
     params: &Value,
     fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<()> {
+    use DeviceOperation::{
+        ProvisionFastPair, SetAlias, SetBlocked, SetMultipoint, SetNoiseControl, SetTrusted,
+        SetWakeAllowed,
+    };
     match operation {
         DeviceOperation::Pair => {
             pair_device(device, params).await?;
-            provision_after_pair(adapter, device, params, fast_pair).await?;
+            provision_after_pair(adapter, device, params, fast_pair).await
         }
-        DeviceOperation::Connect => connect_device(device, "connect Bluetooth device").await?,
+        DeviceOperation::Connect => connect_device(device, "connect Bluetooth device").await,
         DeviceOperation::Disconnect => {
-            disconnect_device(device, "disconnect Bluetooth device").await?
+            disconnect_device(device, "disconnect Bluetooth device").await
         }
-        DeviceOperation::Remove => remove_device(adapter, device).await?,
-        DeviceOperation::SetTrusted => device
-            .set_trusted(params.require_bool("trusted")?)
-            .await
-            .backend_context("set trusted state")?,
-        DeviceOperation::SetBlocked => device
-            .set_blocked(params.require_bool("blocked")?)
-            .await
-            .backend_context("set blocked state")?,
-        DeviceOperation::SetWakeAllowed => device
-            .set_wake_allowed(params.require_bool("wake_allowed")?)
-            .await
-            .backend_context("set wake permission")?,
-        DeviceOperation::SetAlias => device
-            .set_alias(params.require_string("alias")?.to_string())
-            .await
-            .backend_context("set device alias")?,
-        DeviceOperation::ProvisionFastPair => {
+        DeviceOperation::Remove => remove_device(adapter, device).await,
+        SetTrusted | SetBlocked | SetWakeAllowed | SetAlias => {
+            run_property_operation(device, operation, params).await
+        }
+        ProvisionFastPair => {
             fast_pair
                 .context("Fast Pair provider is unavailable")?
                 .provision_account_key(
@@ -612,22 +593,47 @@ async fn run_device_operation(
                     device,
                     params.require_string("anti_spoofing_public_key")?,
                 )
-                .await?;
+                .await
         }
-        DeviceOperation::SetMultipoint => {
+        SetMultipoint => {
             fast_pair
                 .context("Fast Pair provider is unavailable")?
                 .set_multipoint(device, params.require_bool("enabled")?)
-                .await?;
+                .await
         }
-        DeviceOperation::SetNoiseControl => {
+        SetNoiseControl => {
             fast_pair
                 .context("Fast Pair provider is unavailable")?
                 .set_noise_control(device, params.require_string("mode")?)
-                .await?;
+                .await
         }
     }
-    Ok(())
+}
+
+async fn run_property_operation(
+    device: &BluezDevice,
+    operation: DeviceOperation,
+    params: &Value,
+) -> Result<()> {
+    match operation {
+        DeviceOperation::SetTrusted => device
+            .set_trusted(params.require_bool("trusted")?)
+            .await
+            .backend_context("set trusted state"),
+        DeviceOperation::SetBlocked => device
+            .set_blocked(params.require_bool("blocked")?)
+            .await
+            .backend_context("set blocked state"),
+        DeviceOperation::SetWakeAllowed => device
+            .set_wake_allowed(params.require_bool("wake_allowed")?)
+            .await
+            .backend_context("set wake permission"),
+        DeviceOperation::SetAlias => device
+            .set_alias(params.require_string("alias")?.to_string())
+            .await
+            .backend_context("set device alias"),
+        _ => bail!("invalid property operation group"),
+    }
 }
 
 async fn provision_after_pair(
@@ -741,22 +747,20 @@ impl DeviceMetadata {
 }
 
 async fn device_snapshot(
+    backend: &BluezBackend,
     adapter: &BluezAdapter,
     device: &BluezDevice,
     adapter_key: &str,
-    identities: &DeviceIdentityRegistry,
-    device_cache: &Mutex<HashMap<String, CachedDevice>>,
-    system_bus: &zbus::Connection,
-    fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<Option<Device>> {
     let paired = bluez_result(device.is_paired().await, "read device paired state")?;
     let connected = bluez_result(device.is_connected().await, "read device connected state")?;
     let live_rssi = bluez_result(device.rssi().await, "read device signal strength")?;
     let present = live_rssi.is_some() || connected;
     let identity = device.address();
-    let key = identities.device_key(adapter.name(), identity);
+    let key = backend.identities.device_key(adapter.name(), identity);
     let now_ms = unix_time_ms();
-    let cached = device_cache
+    let cached = backend
+        .device_cache
         .lock()
         .await
         .get(&key)
@@ -771,7 +775,7 @@ async fn device_snapshot(
         device.is_wake_allowed().await,
         "read device wake permission",
     )?;
-    let mut metadata = DeviceMetadata::read(device).await?;
+    let metadata = DeviceMetadata::read(device).await?;
     let services = metadata
         .uuids
         .iter()
@@ -780,32 +784,23 @@ async fn device_snapshot(
             label: service_label(uuid).to_string(),
         })
         .collect();
-    let last_seen_ms = if present {
-        Some(now_ms)
-    } else {
+    let last_seen_ms = present.then_some(now_ms).or_else(|| {
         cached
             .as_ref()
             .and_then(|cached| cached.device.last_seen_ms)
-    };
+    });
     let rssi = live_rssi.or_else(|| cached.as_ref().and_then(|cached| cached.device.rssi));
-    let mut battery = device_batteries(device, identity, connected, fast_pair).await?;
-    if paired {
-        let (remembered_icon, remembered_battery) =
-            identities.remember_presentation(&key, metadata.icon.as_deref(), &battery);
-        if metadata
-            .icon
-            .as_deref()
-            .is_none_or(|icon| icon.trim().is_empty())
-        {
-            metadata.icon = remembered_icon;
-        }
-        if !connected && battery.is_empty() {
-            battery = remembered_battery;
-        }
-    } else {
-        identities.forget_presentation(&key);
-    }
-    let fast_pair_features = match (connected, fast_pair) {
+    let observed_battery =
+        device_batteries(device, identity, connected, backend.fast_pair.as_deref()).await?;
+    let (icon, battery) = presentation(
+        &backend.identities,
+        &key,
+        paired,
+        connected,
+        metadata.icon,
+        observed_battery,
+    );
+    let fast_pair_features = match (connected, backend.fast_pair.as_deref()) {
         (true, Some(provider)) => provider.features(device).await,
         _ => None,
     };
@@ -828,9 +823,9 @@ async fn device_snapshot(
         alias: metadata.alias,
         address: identity.to_string(),
         address_type: metadata.address_type,
-        icon: metadata.icon,
+        icon,
         paired,
-        bonded: bonded_property(system_bus, adapter.name(), identity).await,
+        bonded: bonded_property(&backend.system_bus, adapter.name(), identity).await,
         connected,
         services_resolved: metadata.services_resolved,
         trusted,
@@ -850,7 +845,7 @@ async fn device_snapshot(
         capabilities,
     };
     if present {
-        device_cache.lock().await.insert(
+        backend.device_cache.lock().await.insert(
             key,
             CachedDevice {
                 device: snapshot.clone(),
@@ -859,6 +854,31 @@ async fn device_snapshot(
         );
     }
     Ok(Some(snapshot))
+}
+
+fn presentation(
+    identities: &DeviceIdentityRegistry,
+    key: &str,
+    paired: bool,
+    connected: bool,
+    icon: Option<String>,
+    battery: Vec<Battery>,
+) -> (Option<String>, Vec<Battery>) {
+    if !paired {
+        identities.forget_presentation(key);
+        return (icon, battery);
+    }
+    let (remembered_icon, remembered_battery) =
+        identities.remember_presentation(key, icon.as_deref(), &battery);
+    let icon = icon
+        .filter(|icon| !icon.trim().is_empty())
+        .or(remembered_icon);
+    let battery = if !connected && battery.is_empty() {
+        remembered_battery
+    } else {
+        battery
+    };
+    (icon, battery)
 }
 
 fn cached_device_view(cached: &CachedDevice) -> Device {
@@ -911,21 +931,10 @@ async fn device_batteries(
     }
     Ok(
         bluez_result(device.battery_percentage().await, "read device battery")?
-            .map(aggregate_battery)
+            .map(Battery::bluez_aggregate)
             .into_iter()
             .collect(),
     )
-}
-
-fn aggregate_battery(percentage: u8) -> Battery {
-    Battery {
-        id: "aggregate".into(),
-        label: "Battery".into(),
-        component: "main".into(),
-        percentage,
-        source: "bluez".into(),
-        confidence: "standard".into(),
-    }
 }
 
 fn device_capabilities(

@@ -1,18 +1,15 @@
 use std::{
     collections::HashMap,
-    fs,
-    fs::OpenOptions,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use bluer::Address;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::Battery;
+use crate::{model::Battery, state};
 
 const REGISTRY_VERSION: u8 = 1;
 
@@ -41,35 +38,36 @@ pub struct DeviceIdentityRegistry {
 
 impl DeviceIdentityRegistry {
     pub fn load_default() -> Result<Arc<Self>> {
-        let path = state_directory()?.join("device-identities.json");
+        let path = state::directory()?.join("device-identities.json");
         Self::load(Some(path))
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Arc<Self> {
-        Self::load(None).expect("create in-memory identity registry")
+        Arc::new(Self {
+            path: None,
+            state: Mutex::new(RegistryFile {
+                version: REGISTRY_VERSION,
+                ..RegistryFile::default()
+            }),
+        })
     }
 
     fn load(path: Option<PathBuf>) -> Result<Arc<Self>> {
-        let state = match path.as_deref() {
-            Some(path) if path.exists() => {
-                let bytes = fs::read(path)
-                    .with_context(|| format!("read identity registry {}", path.display()))?;
-                let state: RegistryFile = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("decode identity registry {}", path.display()))?;
-                if state.version != REGISTRY_VERSION {
-                    bail!(
-                        "unsupported Bluetooth identity registry version {}",
-                        state.version
-                    );
-                }
-                state
-            }
-            _ => RegistryFile {
+        let stored: Option<RegistryFile> = path
+            .as_deref()
+            .map(|path| state::read_json(path, "identity registry"))
+            .transpose()?
+            .flatten();
+        let state = match stored {
+            Some(state) if state.version != REGISTRY_VERSION => bail!(
+                "unsupported Bluetooth identity registry version {}",
+                state.version
+            ),
+            Some(state) => state,
+            None => RegistryFile {
                 version: REGISTRY_VERSION,
-                adapters: HashMap::new(),
-                devices: HashMap::new(),
-                presentations: HashMap::new(),
+                ..RegistryFile::default()
             },
         };
         Ok(Arc::new(Self {
@@ -79,10 +77,7 @@ impl DeviceIdentityRegistry {
     }
 
     pub fn register_adapter(&self, adapter: &str, stable_identity: &str) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state();
         let previous = state.adapters.get(adapter).cloned();
         if previous.as_deref() == Some(stable_identity) {
             return;
@@ -91,34 +86,13 @@ impl DeviceIdentityRegistry {
             .adapters
             .insert(adapter.to_string(), stable_identity.to_string());
         if previous.is_none() {
-            let legacy_prefix = format!("{adapter}:");
-            let legacy = state
-                .devices
-                .iter()
-                .filter(|(identity, _)| identity.starts_with(&legacy_prefix))
-                .map(|(identity, key)| (identity.clone(), key.clone()))
-                .collect::<Vec<_>>();
-            for (identity, key) in legacy {
-                state.devices.remove(&identity);
-                let address = &identity[legacy_prefix.len()..];
-                state
-                    .devices
-                    .entry(format!("{stable_identity}:{address}"))
-                    .or_insert(key);
-            }
+            migrate_legacy_devices(&mut state, adapter, stable_identity);
         }
-        if let Some(path) = &self.path
-            && let Err(error) = persist(path, &state)
-        {
-            tracing::warn!(%error, "could not persist Bluetooth adapter identity");
-        }
+        self.persist(&state, "adapter identity");
     }
 
     pub fn device_key(&self, adapter: &str, address: Address) -> String {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state();
         let adapter_identity = state.adapters.get(adapter).map_or(adapter, String::as_str);
         let identity = format!("{adapter_identity}:{address}");
         if let Some(key) = state.devices.get(&identity) {
@@ -126,11 +100,7 @@ impl DeviceIdentityRegistry {
         }
         let key = format!("device-{}", Uuid::new_v4().simple());
         state.devices.insert(identity, key.clone());
-        if let Some(path) = &self.path
-            && let Err(error) = persist(path, &state)
-        {
-            tracing::warn!(%error, "could not persist Bluetooth device identity");
-        }
+        self.persist(&state, "device identity");
         key
     }
 
@@ -140,90 +110,75 @@ impl DeviceIdentityRegistry {
         icon: Option<&str>,
         battery: &[Battery],
     ) -> (Option<String>, Vec<Battery>) {
-        let icon = icon.filter(|value| !value.trim().is_empty());
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state();
         let presentation = state
             .presentations
             .entry(device_key.to_string())
             .or_default();
-        let mut changed = false;
-        if let Some(icon) = icon
-            && presentation.icon.as_deref() != Some(icon)
-        {
-            presentation.icon = Some(icon.to_string());
-            changed = true;
-        }
-        if !battery.is_empty() && presentation.battery != battery {
-            presentation.battery = battery.to_vec();
-            changed = true;
-        }
+        let changed = presentation.update(icon, battery);
         let remembered = presentation.clone();
-        if changed
-            && let Some(path) = &self.path
-            && let Err(error) = persist(path, &state)
-        {
-            tracing::warn!(%error, "could not persist Bluetooth device presentation");
-        }
+        self.persist_if(changed, &state, "device presentation");
         (remembered.icon, remembered.battery)
     }
 
     pub fn forget_presentation(&self, device_key: &str) {
-        let mut state = self
-            .state
+        let mut state = self.state();
+        let changed = state.presentations.remove(device_key).is_some();
+        self.persist_if(changed, &state, "forgotten device presentation");
+    }
+
+    fn state(&self) -> MutexGuard<'_, RegistryFile> {
+        self.state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if state.presentations.remove(device_key).is_none() {
-            return;
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn persist_if(&self, changed: bool, state: &RegistryFile, description: &str) {
+        if changed {
+            self.persist(state, description);
         }
+    }
+
+    fn persist(&self, state: &RegistryFile, description: &str) {
         if let Some(path) = &self.path
-            && let Err(error) = persist(path, &state)
+            && let Err(error) = state::write_json(path, state, "identity registry")
         {
-            tracing::warn!(%error, "could not forget Bluetooth device presentation");
+            tracing::warn!(%error, %description, "could not persist Bluetooth registry state");
         }
     }
 }
 
-pub(crate) fn state_directory() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BT_DAEMON_STATE_DIR") {
-        return Ok(PathBuf::from(path));
+impl RememberedPresentation {
+    fn update(&mut self, icon: Option<&str>, battery: &[Battery]) -> bool {
+        let icon = icon.filter(|value| !value.trim().is_empty());
+        let icon_changed = icon.is_some_and(|icon| self.icon.as_deref() != Some(icon));
+        if icon_changed {
+            self.icon = icon.map(str::to_string);
+        }
+        let battery_changed = !battery.is_empty() && self.battery != battery;
+        if battery_changed {
+            self.battery = battery.to_vec();
+        }
+        icon_changed || battery_changed
     }
-    if let Some(path) = std::env::var_os("STATE_DIRECTORY") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path).join("bt-daemon"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is unavailable for identity storage")?;
-    Ok(PathBuf::from(home).join(".local/state/bt-daemon"))
 }
 
-fn persist(path: &Path, state: &RegistryFile) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("identity registry path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create identity registry directory {}", parent.display()))?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("secure identity registry directory {}", parent.display()))?;
-    let temporary = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(state).context("serialize identity registry")?;
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true).mode(0o600);
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("open identity registry {}", temporary.display()))?;
-    use std::io::Write;
-    file.write_all(&bytes)
-        .with_context(|| format!("write identity registry {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("sync identity registry {}", temporary.display()))?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("secure identity registry {}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .with_context(|| format!("replace identity registry {}", path.display()))
+fn migrate_legacy_devices(state: &mut RegistryFile, adapter: &str, stable_identity: &str) {
+    let legacy_prefix = format!("{adapter}:");
+    let legacy = state
+        .devices
+        .iter()
+        .filter(|(identity, _)| identity.starts_with(&legacy_prefix))
+        .map(|(identity, key)| (identity.clone(), key.clone()))
+        .collect::<Vec<_>>();
+    for (identity, key) in legacy {
+        state.devices.remove(&identity);
+        let address = &identity[legacy_prefix.len()..];
+        state
+            .devices
+            .entry(format!("{stable_identity}:{address}"))
+            .or_insert(key);
+    }
 }
 
 #[cfg(test)]
@@ -235,14 +190,7 @@ mod tests {
     use super::DeviceIdentityRegistry;
 
     fn battery(percentage: u8) -> Battery {
-        Battery {
-            id: "aggregate".into(),
-            label: "Battery".into(),
-            component: "main".into(),
-            percentage,
-            source: "bluez".into(),
-            confidence: "standard".into(),
-        }
+        Battery::bluez_aggregate(percentage)
     }
 
     #[test]
@@ -266,44 +214,25 @@ mod tests {
     }
 
     #[test]
-    fn keys_survive_registry_reload() {
+    fn registry_state_is_compatible_and_survives_reload() {
         let directory = std::env::temp_dir().join(format!("bt-daemon-{}", uuid::Uuid::new_v4()));
         let path = directory.join("identities.json");
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let first = DeviceIdentityRegistry::load(Some(path.clone()))
-            .unwrap()
-            .device_key("hci0", address);
-        let second = DeviceIdentityRegistry::load(Some(path))
-            .unwrap()
-            .device_key("hci0", address);
-        assert_eq!(first, second);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn registries_without_presentations_remain_compatible() {
-        let directory = std::env::temp_dir().join(format!("bt-daemon-{}", uuid::Uuid::new_v4()));
-        let path = directory.join("identities.json");
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(&path, r#"{"version":1,"adapters":{},"devices":{}}"#).unwrap();
-
-        DeviceIdentityRegistry::load(Some(path)).unwrap();
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn presentation_survives_registry_reload_and_empty_observations() {
-        let directory = std::env::temp_dir().join(format!("bt-daemon-{}", uuid::Uuid::new_v4()));
-        let path = directory.join("identities.json");
         let registry = DeviceIdentityRegistry::load(Some(path.clone())).unwrap();
+        let key = registry.device_key("hci0", address);
         let expected_battery = vec![battery(64)];
         registry.remember_presentation("device-known", Some("audio-headphones"), &expected_battery);
         drop(registry);
 
         let registry = DeviceIdentityRegistry::load(Some(path)).unwrap();
+        assert_eq!(key, registry.device_key("hci0", address));
         let (icon, remembered_battery) = registry.remember_presentation("device-known", None, &[]);
         assert_eq!(icon.as_deref(), Some("audio-headphones"));
         assert_eq!(remembered_battery, expected_battery);
+
+        let legacy_path = directory.join("legacy.json");
+        fs::write(&legacy_path, r#"{"version":1,"adapters":{},"devices":{}}"#).unwrap();
+        DeviceIdentityRegistry::load(Some(legacy_path)).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 

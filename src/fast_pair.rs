@@ -34,14 +34,7 @@ use crate::{
 };
 
 mod keys {
-    use std::{
-        collections::HashMap,
-        fs::{self, OpenOptions},
-        io::Write,
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-        path::{Path, PathBuf},
-        sync::Mutex,
-    };
+    use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
     use anyhow::{Context, Result, bail};
     use rand::{RngCore, rngs::OsRng};
@@ -64,19 +57,18 @@ mod keys {
     impl AccountKeyStore {
         pub(super) fn load_default() -> Result<Self> {
             Self::load(Some(
-                crate::identity::state_directory()?.join("fast-pair-account-keys.json"),
+                crate::state::directory()?.join("fast-pair-account-keys.json"),
             ))
         }
 
         fn load(path: Option<PathBuf>) -> Result<Self> {
             let mut keys = HashMap::new();
-            if let Some(path) = path.as_deref().filter(|path| path.exists()) {
-                let bytes = fs::read(path).with_context(|| {
-                    format!("read Fast Pair account key store {}", path.display())
-                })?;
-                let file: KeyFile = serde_json::from_slice(&bytes).with_context(|| {
-                    format!("decode Fast Pair account key store {}", path.display())
-                })?;
+            if let Some(file) = path
+                .as_deref()
+                .map(|path| crate::state::read_json::<KeyFile>(path, "Fast Pair account key store"))
+                .transpose()?
+                .flatten()
+            {
                 if file.version != STORE_VERSION {
                     bail!(
                         "unsupported Fast Pair account key store version {}",
@@ -129,45 +121,17 @@ mod keys {
                 .unwrap_or_else(|poison| poison.into_inner());
             keys.insert(device_key, key);
             if let Some(path) = &self.path {
-                persist(path, &keys)?;
+                let file = KeyFile {
+                    version: STORE_VERSION,
+                    account_keys: keys
+                        .iter()
+                        .map(|(device, key)| (device.clone(), hex::encode(key)))
+                        .collect(),
+                };
+                crate::state::write_json(path, &file, "Fast Pair account key store")?;
             }
             Ok(())
         }
-    }
-
-    fn persist(path: &Path, keys: &HashMap<String, [u8; 16]>) -> Result<()> {
-        let parent = path
-            .parent()
-            .context("Fast Pair account key store path has no parent")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create Fast Pair state directory {}", parent.display()))?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("secure Fast Pair state directory {}", parent.display()))?;
-        let file = KeyFile {
-            version: STORE_VERSION,
-            account_keys: keys
-                .iter()
-                .map(|(device, key)| (device.clone(), hex::encode(key)))
-                .collect(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file).context("serialize Fast Pair account keys")?;
-        let temporary = path.with_extension("json.tmp");
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(true).write(true).mode(0o600);
-        let mut output = options
-            .open(&temporary)
-            .with_context(|| format!("open Fast Pair account key store {}", temporary.display()))?;
-        output.write_all(&bytes).with_context(|| {
-            format!("write Fast Pair account key store {}", temporary.display())
-        })?;
-        output
-            .sync_all()
-            .with_context(|| format!("sync Fast Pair account key store {}", temporary.display()))?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).with_context(|| {
-            format!("secure Fast Pair account key store {}", temporary.display())
-        })?;
-        fs::rename(&temporary, path)
-            .with_context(|| format!("replace Fast Pair account key store {}", path.display()))
     }
 
     #[cfg(test)]
@@ -456,16 +420,16 @@ fn message_mac(
     outer.update(outer_key);
     outer.update(inner);
     let digest = outer.finalize();
-    digest[..8]
-        .try_into()
-        .expect("SHA-256 has at least 8 bytes")
+    let mut mac = [0; 8];
+    mac.copy_from_slice(&digest[..8]);
+    mac
 }
 
 fn derive_aes_key(shared_secret: &[u8]) -> [u8; 16] {
     let digest = Sha256::digest(shared_secret);
-    digest[..16]
-        .try_into()
-        .expect("SHA-256 contains a 16-byte AES key")
+    let mut key = [0; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
 }
 
 fn crypt_block(key: &[u8; 16], block: &mut [u8; 16], encrypt: bool) {
@@ -479,12 +443,7 @@ fn crypt_block(key: &[u8; 16], block: &mut [u8; 16], encrypt: bool) {
 }
 
 fn address_bytes(address: Address) -> [u8; 6] {
-    let bytes = address
-        .to_string()
-        .split(':')
-        .map(|part| u8::from_str_radix(part, 16).expect("BlueZ address is hexadecimal"))
-        .collect::<Vec<_>>();
-    bytes.try_into().expect("BlueZ address has six octets")
+    address.0
 }
 
 fn parse_anti_spoofing_public_key(encoded: &str) -> Result<PublicKey> {
@@ -709,78 +668,105 @@ async fn apply_frames(
     mut frames: mpsc::Receiver<Frame>,
 ) -> Result<()> {
     while let Some(frame) = frames.recv().await {
-        match (frame.group, frame.code) {
-            (DEVICE_INFORMATION_GROUP, BATTERY_UPDATED_CODE) => {
-                provider
-                    .update_report(address, BatteryReport::from_payload(&frame.payload)?)
-                    .await;
-            }
-            (DEVICE_INFORMATION_GROUP, SESSION_NONCE_CODE) => {
-                let nonce: [u8; 8] = frame.payload.as_slice().try_into().map_err(|_| {
-                    anyhow::anyhow!(
-                        "Fast Pair session nonce has {} bytes instead of 8",
-                        frame.payload.len()
-                    )
-                })?;
-                provider
-                    .update_runtime(address, |state| state.session_nonce = Some(nonce))
-                    .await;
-            }
-            (DEVICE_INFORMATION_GROUP, MODEL_ID_CODE) => {
-                let model_id: [u8; 3] = frame.payload.as_slice().try_into().map_err(|_| {
-                    anyhow::anyhow!(
-                        "Fast Pair model ID has {} bytes instead of 3",
-                        frame.payload.len()
-                    )
-                })?;
-                provider
-                    .update_runtime(address, |state| state.model_id = Some(model_id))
-                    .await;
-            }
-            (DEVICE_INFORMATION_GROUP, BLE_ADDRESS_CODE) => {
-                let ble_address = decode_address(&frame.payload)?;
-                provider
-                    .update_runtime(address, |state| state.ble_address = Some(ble_address))
-                    .await;
-            }
-            (AUDIO_SWITCH_GROUP, AUDIO_SWITCH_CAPABILITY_CODE) => {
-                let capability = decode_audio_switch_capability(&frame.payload)?;
-                provider
-                    .update_runtime(address, |state| state.multipoint = Some(capability))
-                    .await;
-            }
-            (HEARABLE_CONTROLS_GROUP, ANC_STATE_CODE) => {
-                let noise_control = decode_anc_state(&frame.payload)?;
-                provider
-                    .update_runtime(address, |state| state.noise_control = Some(noise_control))
-                    .await;
-            }
-            (ACKNOWLEDGEMENT_GROUP, ACK_CODE) => {
-                if frame.payload.len() >= 2 {
-                    provider
-                        .resolve_command(address, frame.payload[0], frame.payload[1], Ok(()))
-                        .await;
-                }
-            }
-            (ACKNOWLEDGEMENT_GROUP, NAK_CODE) => {
-                if frame.payload.len() >= 3 {
-                    let reason = nak_reason(frame.payload[0]);
-                    provider
-                        .resolve_command(
-                            address,
-                            frame.payload[1],
-                            frame.payload[2],
-                            Err(reason.to_string()),
-                        )
-                        .await;
-                }
-            }
-            _ => {
-                tracing::trace!(%address, group = frame.group, code = frame.code, "ignored Fast Pair frame");
-            }
-        }
+        apply_frame(&provider, address, frame).await?;
     }
     Ok(())
+}
+
+async fn apply_frame(
+    provider: &FastPairBatteryProvider,
+    address: Address,
+    frame: Frame,
+) -> Result<()> {
+    match frame.group {
+        DEVICE_INFORMATION_GROUP => {
+            apply_device_information(provider, address, frame.code, &frame.payload).await
+        }
+        AUDIO_SWITCH_GROUP if frame.code == AUDIO_SWITCH_CAPABILITY_CODE => {
+            let capability = decode_audio_switch_capability(&frame.payload)?;
+            provider
+                .update_runtime(address, |state| state.multipoint = Some(capability))
+                .await;
+            Ok(())
+        }
+        HEARABLE_CONTROLS_GROUP if frame.code == ANC_STATE_CODE => {
+            let noise_control = decode_anc_state(&frame.payload)?;
+            provider
+                .update_runtime(address, |state| state.noise_control = Some(noise_control))
+                .await;
+            Ok(())
+        }
+        ACKNOWLEDGEMENT_GROUP => {
+            apply_acknowledgement(provider, address, frame.code, &frame.payload).await;
+            Ok(())
+        }
+        _ => {
+            tracing::trace!(%address, group = frame.group, code = frame.code, "ignored Fast Pair frame");
+            Ok(())
+        }
+    }
+}
+
+async fn apply_device_information(
+    provider: &FastPairBatteryProvider,
+    address: Address,
+    code: u8,
+    payload: &[u8],
+) -> Result<()> {
+    match code {
+        BATTERY_UPDATED_CODE => {
+            provider
+                .update_report(address, BatteryReport::from_payload(payload)?)
+                .await;
+        }
+        SESSION_NONCE_CODE => {
+            let nonce = decode_fixed(payload, "session nonce")?;
+            provider
+                .update_runtime(address, |state| state.session_nonce = Some(nonce))
+                .await;
+        }
+        MODEL_ID_CODE => {
+            let model_id = decode_fixed(payload, "model ID")?;
+            provider
+                .update_runtime(address, |state| state.model_id = Some(model_id))
+                .await;
+        }
+        BLE_ADDRESS_CODE => {
+            let ble_address = decode_address(payload)?;
+            provider
+                .update_runtime(address, |state| state.ble_address = Some(ble_address))
+                .await;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn apply_acknowledgement(
+    provider: &FastPairBatteryProvider,
+    address: Address,
+    code: u8,
+    payload: &[u8],
+) {
+    let (group, message, result) = match (code, payload) {
+        (ACK_CODE, [group, message, ..]) => (*group, *message, Ok(())),
+        (NAK_CODE, [reason, group, message, ..]) => {
+            (*group, *message, Err(nak_reason(*reason).to_string()))
+        }
+        _ => return,
+    };
+    provider
+        .resolve_command(address, group, message, result)
+        .await;
+}
+
+fn decode_fixed<const N: usize>(payload: &[u8], label: &str) -> Result<[u8; N]> {
+    payload.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "Fast Pair {label} has {} bytes instead of {N}",
+            payload.len()
+        )
+    })
 }
 
 fn nak_reason(reason: u8) -> &'static str {
@@ -795,28 +781,7 @@ fn nak_reason(reason: u8) -> &'static str {
 }
 
 async fn resolve_ble_device(adapter: &Adapter, address: Address) -> Result<Device> {
-    if !adapter
-        .device_addresses()
-        .await
-        .context("list devices before Fast Pair BLE discovery")?
-        .contains(&address)
-    {
-        let events = adapter
-            .discover_devices()
-            .await
-            .context("start discovery for Fast Pair BLE address")?;
-        futures::pin_mut!(events);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while let Some(event) = events.next().await {
-                if matches!(event, bluer::AdapterEvent::DeviceAdded(found) if found == address) {
-                    return Ok(());
-                }
-            }
-            bail!("Bluetooth discovery ended before the Fast Pair BLE address appeared")
-        })
-        .await
-        .context("Fast Pair BLE address was not discovered")??;
-    }
+    discover_address(adapter, address).await?;
     let device = adapter
         .device(address)
         .context("open discovered Fast Pair BLE device")?;
@@ -847,40 +812,109 @@ async fn resolve_ble_device(adapter: &Adapter, address: Address) -> Result<Devic
     Ok(device)
 }
 
-async fn find_service(device: &Device, uuid: Uuid) -> Result<Option<Service>> {
-    for service in device
-        .services()
+async fn discover_address(adapter: &Adapter, address: Address) -> Result<()> {
+    if adapter
+        .device_addresses()
         .await
-        .context("list Fast Pair GATT services")?
+        .context("list devices before Fast Pair BLE discovery")?
+        .contains(&address)
     {
-        if service
-            .uuid()
-            .await
-            .context("read Fast Pair service UUID")?
-            == uuid
-        {
-            return Ok(Some(service));
-        }
+        return Ok(());
     }
-    Ok(None)
+    let events = adapter
+        .discover_devices()
+        .await
+        .context("start discovery for Fast Pair BLE address")?;
+    futures::pin_mut!(events);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.next().await {
+            if matches!(event, bluer::AdapterEvent::DeviceAdded(found) if found == address) {
+                return Ok(());
+            }
+        }
+        bail!("Bluetooth discovery ended before the Fast Pair BLE address appeared")
+    })
+    .await
+    .context("Fast Pair BLE address was not discovered")?
 }
 
-async fn find_characteristic(service: &Service, uuid: Uuid) -> Result<Option<Characteristic>> {
-    for characteristic in service
-        .characteristics()
-        .await
-        .context("list Fast Pair GATT characteristics")?
-    {
-        if characteristic
-            .uuid()
-            .await
-            .context("read Fast Pair characteristic UUID")?
-            == uuid
-        {
-            return Ok(Some(characteristic));
+macro_rules! gatt_lookup {
+    ($name:ident, $parent:ty, $child:ty, $items:ident) => {
+        async fn $name(parent: &$parent, uuid: Uuid) -> Result<Option<$child>> {
+            for item in parent
+                .$items()
+                .await
+                .context(concat!("list Fast Pair GATT ", stringify!($items)))?
+            {
+                if item.uuid().await.context("read Fast Pair GATT UUID")? == uuid {
+                    return Ok(Some(item));
+                }
+            }
+            Ok(None)
         }
-    }
-    Ok(None)
+    };
+}
+
+gatt_lookup!(find_service, Device, Service, services);
+gatt_lookup!(
+    find_characteristic,
+    Service,
+    Characteristic,
+    characteristics
+);
+
+fn provisioning_request(
+    anti_spoofing_key: &str,
+    remote_address: Address,
+    local_address: Address,
+) -> Result<([u8; 16], Vec<u8>)> {
+    let provider_key = parse_anti_spoofing_public_key(anti_spoofing_key)?;
+    let ephemeral = EphemeralSecret::random(&mut OsRng);
+    let seeker_public = PublicKey::from(&ephemeral).to_encoded_point(false);
+    let shared = ephemeral.diffie_hellman(&provider_key);
+    let shared_key = derive_aes_key(shared.raw_secret_bytes());
+    let mut request = [0_u8; 16];
+    request[0] = 0x00;
+    request[1] = 0x10;
+    request[2..8].copy_from_slice(&address_bytes(remote_address));
+    request[8..14].copy_from_slice(&address_bytes(local_address));
+    OsRng.fill_bytes(&mut request[14..]);
+    crypt_block(&shared_key, &mut request, true);
+    let mut write = request.to_vec();
+    write.extend_from_slice(&seeker_public.as_bytes()[1..]);
+    Ok((shared_key, write))
+}
+
+async fn complete_key_pairing(
+    pairing: &Characteristic,
+    request: &[u8],
+    shared_key: &[u8; 16],
+    device_address: Address,
+) -> Result<()> {
+    let notifications = pairing
+        .notify()
+        .await
+        .context("subscribe to Fast Pair key-based pairing response")?;
+    futures::pin_mut!(notifications);
+    pairing
+        .write(request)
+        .await
+        .context("write Fast Pair retroactive key-based pairing request")?;
+    let response = tokio::time::timeout(Duration::from_secs(5), notifications.next())
+        .await
+        .context("Fast Pair key-based pairing response timed out")?
+        .context("Fast Pair key-based pairing notification stream ended")?;
+    let mut response = decode_fixed(&response, "key-based pairing response")?;
+    crypt_block(shared_key, &mut response, false);
+    ensure!(
+        response[0] == 0x01,
+        "Fast Pair provider returned an invalid key-based pairing response"
+    );
+    ensure!(
+        response[1..7] == address_bytes(device_address),
+        "Fast Pair provider response did not match the paired Bluetooth device"
+    );
+    Ok(())
 }
 
 impl FastPairBatteryProvider {
@@ -1026,53 +1060,13 @@ impl FastPairBatteryProvider {
             .await?
             .context("Fast Pair account key characteristic is unavailable")?;
 
-        let provider_key = parse_anti_spoofing_public_key(anti_spoofing_key)?;
-        let ephemeral = EphemeralSecret::random(&mut OsRng);
-        let seeker_public = PublicKey::from(&ephemeral).to_encoded_point(false);
-        let shared = ephemeral.diffie_hellman(&provider_key);
-        let shared_key = derive_aes_key(shared.raw_secret_bytes());
-        let mut request = [0_u8; 16];
-        request[0] = 0x00;
-        request[1] = 0x10;
-        request[2..8].copy_from_slice(&address_bytes(ble_address));
-        request[8..14].copy_from_slice(&address_bytes(
-            adapter
-                .address()
-                .await
-                .context("read local address for Fast Pair provisioning")?,
-        ));
-        OsRng.fill_bytes(&mut request[14..]);
-        crypt_block(&shared_key, &mut request, true);
-        let mut write = request.to_vec();
-        write.extend_from_slice(&seeker_public.as_bytes()[1..]);
-        let notifications = pairing
-            .notify()
+        let local_address = adapter
+            .address()
             .await
-            .context("subscribe to Fast Pair key-based pairing response")?;
-        futures::pin_mut!(notifications);
-        pairing
-            .write(&write)
-            .await
-            .context("write Fast Pair retroactive key-based pairing request")?;
-        let response = tokio::time::timeout(Duration::from_secs(5), notifications.next())
-            .await
-            .context("Fast Pair key-based pairing response timed out")?
-            .context("Fast Pair key-based pairing notification stream ended")?;
-        let mut response: [u8; 16] = response.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "Fast Pair key-based pairing response has {} bytes instead of 16",
-                response.len()
-            )
-        })?;
-        crypt_block(&shared_key, &mut response, false);
-        ensure!(
-            response[0] == 0x01,
-            "Fast Pair provider returned an invalid key-based pairing response"
-        );
-        ensure!(
-            response[1..7] == address_bytes(device.address()),
-            "Fast Pair provider response did not match the paired Bluetooth device"
-        );
+            .context("read local address for Fast Pair provisioning")?;
+        let (shared_key, request) =
+            provisioning_request(anti_spoofing_key, ble_address, local_address)?;
+        complete_key_pairing(&pairing, &request, &shared_key, device.address()).await?;
 
         let account_key = AccountKeyStore::generate();
         let mut encrypted_account_key = account_key;

@@ -12,4 +12,5 @@ pub mod model;
 pub mod obex;
 pub mod pairing;
 pub mod protocol;
+mod state;
 mod task;

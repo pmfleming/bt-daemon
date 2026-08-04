@@ -19,6 +19,18 @@ use pw::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+macro_rules! bind_or_return {
+    ($registry:expr, $global:expr, $kind:ty) => {
+        match $registry.bind::<$kind, _>($global) {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                tracing::warn!(id = $global.id, %error, kind = stringify!($kind), "could not bind PipeWire object");
+                return;
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AudioDevice {
     pub pipewire_id: u32,
@@ -395,13 +407,7 @@ impl ProbeState {
         global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
         properties: &pw::spa::utils::dict::DictRef,
     ) {
-        let device = match registry.bind::<Device, _>(global) {
-            Ok(device) => device,
-            Err(error) => {
-                tracing::warn!(id = global.id, %error, "could not bind PipeWire Bluetooth device");
-                return;
-            }
-        };
+        let device = bind_or_return!(registry, global, Device);
         self.devices.borrow_mut().insert(
             global.id,
             AudioDevice {
@@ -478,13 +484,7 @@ impl ProbeState {
                 is_default: false,
             },
         );
-        let node = match registry.bind::<Node, _>(global) {
-            Ok(node) => node,
-            Err(error) => {
-                tracing::warn!(id = global.id, %error, "could not bind PipeWire Bluetooth node");
-                return;
-            }
-        };
+        let node = bind_or_return!(registry, global, Node);
         let endpoints_for_info = Rc::clone(&self.endpoints);
         let listener = node
             .add_listener_local()
@@ -504,13 +504,7 @@ impl ProbeState {
         registry: &pw::registry::RegistryRc,
         global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
     ) {
-        let metadata = match registry.bind::<Metadata, _>(global) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                tracing::warn!(id = global.id, %error, "could not bind PipeWire default metadata");
-                return;
-            }
-        };
+        let metadata = bind_or_return!(registry, global, Metadata);
         let defaults_for_events = Rc::clone(&self.defaults);
         let listener = metadata
             .add_listener_local()

@@ -26,6 +26,12 @@ pub(super) fn start_monitor(events: broadcast::Sender<()>) -> Result<()> {
     Ok(())
 }
 
+async fn devices() -> Result<Vec<audio::AudioDevice>> {
+    tokio::task::spawn_blocking(audio::probe)
+        .await
+        .context("PipeWire audio probe task failed")?
+}
+
 fn device_address(device: &audio::AudioDevice) -> Option<bluer::Address> {
     match device.address.parse() {
         Ok(address) => Some(address),
@@ -41,10 +47,9 @@ pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) ->
         Ok(params) => params,
         Err(error) => return api::error("validation-error", error.to_string()),
     };
-    let devices = match tokio::task::spawn_blocking(audio::probe).await {
-        Ok(Ok(devices)) => devices,
-        Ok(Err(error)) => return api::error("audio-unavailable", format!("{error:#}")),
-        Err(error) => return api::error("audio-unavailable", error.to_string()),
+    let devices = match devices().await {
+        Ok(devices) => devices,
+        Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
     };
     let selection = devices.into_iter().find_map(|device| {
         let address = device_address(&device)?;
@@ -70,10 +75,9 @@ pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) ->
 }
 
 pub(super) async fn snapshot(pairing: Arc<PairingBroker>) -> Value {
-    let devices = match tokio::task::spawn_blocking(audio::probe).await {
-        Ok(Ok(devices)) => devices,
-        Ok(Err(error)) => return api::error("audio-unavailable", format!("{error:#}")),
-        Err(error) => return api::error("audio-unavailable", error.to_string()),
+    let devices = match devices().await {
+        Ok(devices) => devices,
+        Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
     };
     let devices = devices
         .into_iter()
