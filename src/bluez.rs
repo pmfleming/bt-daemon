@@ -390,6 +390,7 @@ impl BluetoothBackend for BluezBackend {
         .await?;
         if operation == DeviceOperation::Remove {
             self.device_cache.lock().await.remove(device_key);
+            self.identities.forget_presentation(device_key);
         }
         self.snapshot().await
     }
@@ -770,7 +771,7 @@ async fn device_snapshot(
         device.is_wake_allowed().await,
         "read device wake permission",
     )?;
-    let metadata = DeviceMetadata::read(device).await?;
+    let mut metadata = DeviceMetadata::read(device).await?;
     let services = metadata
         .uuids
         .iter()
@@ -787,7 +788,23 @@ async fn device_snapshot(
             .and_then(|cached| cached.device.last_seen_ms)
     };
     let rssi = live_rssi.or_else(|| cached.as_ref().and_then(|cached| cached.device.rssi));
-    let battery = device_batteries(device, identity, connected, fast_pair).await?;
+    let mut battery = device_batteries(device, identity, connected, fast_pair).await?;
+    if paired {
+        let (remembered_icon, remembered_battery) =
+            identities.remember_presentation(&key, metadata.icon.as_deref(), &battery);
+        if metadata
+            .icon
+            .as_deref()
+            .is_none_or(|icon| icon.trim().is_empty())
+        {
+            metadata.icon = remembered_icon;
+        }
+        if !connected && battery.is_empty() {
+            battery = remembered_battery;
+        }
+    } else {
+        identities.forget_presentation(&key);
+    }
     let fast_pair_features = match (connected, fast_pair) {
         (true, Some(provider)) => provider.features(device).await,
         _ => None,

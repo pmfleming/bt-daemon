@@ -12,7 +12,17 @@ use bluer::Address;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::model::Battery;
+
 const REGISTRY_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct RememberedPresentation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    battery: Vec<Battery>,
+}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct RegistryFile {
@@ -20,6 +30,8 @@ struct RegistryFile {
     #[serde(default)]
     adapters: HashMap<String, String>,
     devices: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    presentations: HashMap<String, RememberedPresentation>,
 }
 
 pub struct DeviceIdentityRegistry {
@@ -57,6 +69,7 @@ impl DeviceIdentityRegistry {
                 version: REGISTRY_VERSION,
                 adapters: HashMap::new(),
                 devices: HashMap::new(),
+                presentations: HashMap::new(),
             },
         };
         Ok(Arc::new(Self {
@@ -120,6 +133,57 @@ impl DeviceIdentityRegistry {
         }
         key
     }
+
+    pub fn remember_presentation(
+        &self,
+        device_key: &str,
+        icon: Option<&str>,
+        battery: &[Battery],
+    ) -> (Option<String>, Vec<Battery>) {
+        let icon = icon.filter(|value| !value.trim().is_empty());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let presentation = state
+            .presentations
+            .entry(device_key.to_string())
+            .or_default();
+        let mut changed = false;
+        if let Some(icon) = icon
+            && presentation.icon.as_deref() != Some(icon)
+        {
+            presentation.icon = Some(icon.to_string());
+            changed = true;
+        }
+        if !battery.is_empty() && presentation.battery != battery {
+            presentation.battery = battery.to_vec();
+            changed = true;
+        }
+        let remembered = presentation.clone();
+        if changed
+            && let Some(path) = &self.path
+            && let Err(error) = persist(path, &state)
+        {
+            tracing::warn!(%error, "could not persist Bluetooth device presentation");
+        }
+        (remembered.icon, remembered.battery)
+    }
+
+    pub fn forget_presentation(&self, device_key: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.presentations.remove(device_key).is_none() {
+            return;
+        }
+        if let Some(path) = &self.path
+            && let Err(error) = persist(path, &state)
+        {
+            tracing::warn!(%error, "could not forget Bluetooth device presentation");
+        }
+    }
 }
 
 pub(crate) fn state_directory() -> Result<PathBuf> {
@@ -166,7 +230,20 @@ fn persist(path: &Path, state: &RegistryFile) -> Result<()> {
 mod tests {
     use std::fs;
 
+    use crate::model::Battery;
+
     use super::DeviceIdentityRegistry;
+
+    fn battery(percentage: u8) -> Battery {
+        Battery {
+            id: "aggregate".into(),
+            label: "Battery".into(),
+            component: "main".into(),
+            percentage,
+            source: "bluez".into(),
+            confidence: "standard".into(),
+        }
+    }
 
     #[test]
     fn keys_are_opaque_and_stable_in_memory() {
@@ -201,5 +278,47 @@ mod tests {
             .device_key("hci0", address);
         assert_eq!(first, second);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn registries_without_presentations_remain_compatible() {
+        let directory = std::env::temp_dir().join(format!("bt-daemon-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("identities.json");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&path, r#"{"version":1,"adapters":{},"devices":{}}"#).unwrap();
+
+        DeviceIdentityRegistry::load(Some(path)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn presentation_survives_registry_reload_and_empty_observations() {
+        let directory = std::env::temp_dir().join(format!("bt-daemon-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("identities.json");
+        let registry = DeviceIdentityRegistry::load(Some(path.clone())).unwrap();
+        let expected_battery = vec![battery(64)];
+        registry.remember_presentation("device-known", Some("audio-headphones"), &expected_battery);
+        drop(registry);
+
+        let registry = DeviceIdentityRegistry::load(Some(path)).unwrap();
+        let (icon, remembered_battery) = registry.remember_presentation("device-known", None, &[]);
+        assert_eq!(icon.as_deref(), Some("audio-headphones"));
+        assert_eq!(remembered_battery, expected_battery);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_presentation_keeps_the_stable_device_key() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let key = registry.device_key("hci0", address);
+        registry.remember_presentation(&key, Some("input-mouse"), &[battery(80)]);
+        registry.forget_presentation(&key);
+
+        assert_eq!(key, registry.device_key("hci0", address));
+        assert_eq!(
+            registry.remember_presentation(&key, None, &[]),
+            (None, vec![])
+        );
     }
 }
