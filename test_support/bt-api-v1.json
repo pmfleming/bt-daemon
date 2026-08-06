@@ -148,6 +148,19 @@
         "stream": "bluetooth.changed"
       },
       {
+        "name": "bluetooth.management.update",
+        "params_example": {
+          "launch_state": "remember",
+          "reconnect_on_resume": true,
+          "trust_after_pair": true,
+          "preferred_adapter_key": "adapter-opaque",
+          "show_blocked_devices": false,
+          "show_recent_devices": false
+        },
+        "response_key": "snapshot",
+        "stream": "bluetooth.changed"
+      },
+      {
         "name": "bluetooth.obex.snapshot",
         "params_example": {},
         "response_key": "obex",
@@ -360,9 +373,29 @@
             "uuids": [
               "0000110b-0000-1000-8000-00805f9b34fb"
             ],
-            "wake_allowed": null
+            "wake_allowed": null,
+            "remote_name": "Headphones",
+            "device_type": "Headset"
           }
-        ]
+        ],
+        "radio": {
+          "available": true,
+          "operational": true,
+          "powered": true,
+          "adapter_count": 1,
+          "rfkill_present": true,
+          "soft_blocked": false,
+          "hard_blocked": false
+        },
+        "management": {
+          "version": 1,
+          "launch_state": "remember",
+          "reconnect_on_resume": true,
+          "trust_after_pair": true,
+          "preferred_adapter_key": "adapter-opaque",
+          "show_blocked_devices": false,
+          "show_recent_devices": false
+        }
       }
     },
     "ok": true,

@@ -175,6 +175,7 @@ operation_enum!(DeviceOperation, "device", {
     SetBlocked => "set-blocked",
     SetWakeAllowed => "set-wake-allowed",
     SetAlias => "set-alias",
+    ResetAlias => "reset-alias",
     ProvisionFastPair => "provision-fast-pair",
     SetMultipoint => "set-multipoint",
     SetNoiseControl => "set-noise-control",
@@ -204,6 +205,7 @@ pub trait BluetoothBackend: Send + Sync {
         operation: AdapterOperation,
         params: &Value,
     ) -> Result<Snapshot>;
+    async fn update_management(&self, params: &Value) -> Result<Snapshot>;
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget>;
     async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote>;
     async fn device_operation(

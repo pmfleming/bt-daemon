@@ -24,7 +24,9 @@ use crate::{
     },
     fast_pair::FastPairBatteryProvider,
     identity::DeviceIdentityRegistry,
+    management::ManagementStore,
     model::{Device, Snapshot},
+    rfkill,
 };
 
 mod snapshot;
@@ -45,6 +47,7 @@ pub struct BluezBackend {
     device_cache: Mutex<HashMap<String, CachedDevice>>,
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
+    management: ManagementStore,
 }
 
 impl BluezBackend {
@@ -56,6 +59,7 @@ impl BluezBackend {
             .await
             .context("open system D-Bus for BlueZ compatibility properties")?;
         let identities = DeviceIdentityRegistry::load_default()?;
+        let management = ManagementStore::load_default()?;
         for name in session
             .adapter_names()
             .await
@@ -92,6 +96,7 @@ impl BluezBackend {
             device_cache: Mutex::new(HashMap::new()),
             system_bus,
             fast_pair,
+            management,
         })
     }
 
@@ -104,6 +109,98 @@ impl BluezBackend {
             .register_agent(agent)
             .await
             .backend_context("register BlueZ pairing agent")
+    }
+
+    pub async fn apply_startup_policy(&self) {
+        let policy = self.management.policy();
+        let result = match policy.launch_state.as_str() {
+            "enable" => self.set_powered(None, true).await.map(|_| ()),
+            "disable" => self.set_powered(None, false).await.map(|_| ()),
+            _ => self.restore_runtime_state().await,
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, launch_state = %policy.launch_state, "could not apply Bluetooth startup policy");
+        }
+    }
+
+    pub fn start_lifecycle_monitoring(self: &Arc<Self>) {
+        let backend = Arc::clone(self);
+        crate::task::spawn("logind-bluetooth-lifecycle", async move {
+            if let Err(error) = backend.monitor_sleep_events().await {
+                tracing::warn!(%error, "Bluetooth suspend/resume monitoring stopped");
+            }
+        });
+    }
+
+    async fn monitor_sleep_events(&self) -> Result<()> {
+        let connection = zbus::Connection::system()
+            .await
+            .context("connect Bluetooth lifecycle monitor to system D-Bus")?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        .context("create logind Bluetooth lifecycle proxy")?;
+        let mut events = proxy
+            .receive_signal("PrepareForSleep")
+            .await
+            .context("subscribe to logind sleep events")?;
+        while let Some(message) = events.next().await {
+            let (sleeping,): (bool,) = message
+                .body()
+                .deserialize()
+                .context("decode logind sleep event")?;
+            if sleeping {
+                self.remember_runtime_state().await;
+            } else if let Err(error) = self.restore_runtime_state().await {
+                tracing::warn!(%error, "could not restore Bluetooth state after resume");
+            }
+        }
+        bail!("logind sleep event stream ended")
+    }
+
+    async fn remember_runtime_state(&self) {
+        match snapshot::build(self).await {
+            Ok(snapshot) => self.management.remember_snapshot(&snapshot),
+            Err(error) => tracing::warn!(%error, "could not capture Bluetooth runtime state"),
+        }
+    }
+
+    async fn restore_runtime_state(&self) -> Result<()> {
+        let runtime = self.management.runtime();
+        for adapter in self.adapters().await? {
+            let address = adapter
+                .address()
+                .await
+                .backend_context("read adapter identity during restore")?;
+            let key = opaque_key("adapter", &address.to_string());
+            if let Some(powered) = runtime.adapter_power().get(&key) {
+                adapter
+                    .set_powered(*powered)
+                    .await
+                    .backend_context("restore adapter power")?;
+            }
+        }
+        if self.management.policy().reconnect_on_resume {
+            for device_key in runtime.connected_device_keys() {
+                let Ok((_, device)) = self.find_device(device_key).await else {
+                    continue;
+                };
+                if !bluez_result(device.is_connected().await, "read reconnect device state")? {
+                    match tokio::time::timeout(Duration::from_secs(15), device.connect()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, %device_key, "could not reconnect Bluetooth device")
+                        }
+                        Err(_) => tracing::warn!(%device_key, "Bluetooth reconnect timed out"),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn start_monitoring(self: &Arc<Self>) {
@@ -260,17 +357,56 @@ impl BluetoothBackend for BluezBackend {
                 self.stop_discovery(Some(adapter.name())).await;
             }
         } else {
-            for adapter in self.adapters().await? {
-                adapter
-                    .set_powered(powered)
-                    .await
-                    .backend_context("set adapter power")?;
+            let before = self.snapshot().await?;
+            if powered && before.radio.hard_blocked {
+                return Err(BackendError::new(
+                    BackendErrorKind::Rejected,
+                    "Bluetooth is disabled by a hardware radio switch",
+                )
+                .into());
+            }
+            if powered {
+                let adapters = self.adapters().await?;
+                if before.radio.rfkill_present
+                    && before.radio.soft_blocked
+                    && let Err(error) = rfkill::set_bluetooth_soft_blocked(false)
+                {
+                    if adapters.is_empty() {
+                        return Err(BackendError::new(
+                            BackendErrorKind::Rejected,
+                            format!("could not unblock Bluetooth through rfkill: {error:#}"),
+                        )
+                        .into());
+                    }
+                    tracing::warn!(%error, "direct rfkill unblock failed; asking BlueZ to power available adapters");
+                }
+                for adapter in adapters {
+                    adapter
+                        .set_powered(true)
+                        .await
+                        .backend_context("enable adapter power")?;
+                }
+            } else {
+                for adapter in self.adapters().await? {
+                    adapter
+                        .set_powered(false)
+                        .await
+                        .backend_context("disable adapter power")?;
+                }
+                if before.radio.rfkill_present
+                    && !before.radio.soft_blocked
+                    && let Err(error) = rfkill::set_bluetooth_soft_blocked(true)
+                {
+                    tracing::warn!(%error, "could not soft-block Bluetooth; adapters are powered off");
+                }
             }
         }
         if !powered && adapter_key.is_none() {
             self.stop_discovery(None).await;
         }
-        self.snapshot().await
+        let snapshot = self.snapshot().await?;
+        self.management.remember_snapshot(&snapshot);
+        Ok(snapshot)
     }
 
     async fn set_scanning(&self, adapter_key: Option<&str>, enabled: bool) -> Result<Snapshot> {
@@ -320,6 +456,11 @@ impl BluetoothBackend for BluezBackend {
         self.snapshot().await
     }
 
+    async fn update_management(&self, params: &Value) -> Result<Snapshot> {
+        self.management.update(params)?;
+        self.snapshot().await
+    }
+
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
         tracing::debug!(%device_key, "resolving outgoing OBEX target");
         let (adapter, device) = self.find_device(device_key).await?;
@@ -361,7 +502,9 @@ impl BluetoothBackend for BluezBackend {
             self.device_cache.lock().await.remove(device_key);
             self.identities.forget_presentation(device_key);
         }
-        self.snapshot().await
+        let snapshot = self.snapshot().await?;
+        self.management.remember_snapshot(&snapshot);
+        Ok(snapshot)
     }
 }
 
@@ -471,8 +614,8 @@ async fn run_device_operation(
     fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<()> {
     use DeviceOperation::{
-        ProvisionFastPair, SetAlias, SetBlocked, SetMultipoint, SetNoiseControl, SetTrusted,
-        SetWakeAllowed,
+        ProvisionFastPair, ResetAlias, SetAlias, SetBlocked, SetMultipoint, SetNoiseControl,
+        SetTrusted, SetWakeAllowed,
     };
     match operation {
         DeviceOperation::Pair => {
@@ -484,7 +627,7 @@ async fn run_device_operation(
             disconnect_device(device, "disconnect Bluetooth device").await
         }
         DeviceOperation::Remove => remove_device(adapter, device).await,
-        SetTrusted | SetBlocked | SetWakeAllowed | SetAlias => {
+        SetTrusted | SetBlocked | SetWakeAllowed | SetAlias | ResetAlias => {
             run_property_operation(device, operation, params).await
         }
         ProvisionFastPair => {
@@ -534,6 +677,10 @@ async fn run_property_operation(
             .set_alias(params.require_string("alias")?.to_string())
             .await
             .backend_context("set device alias"),
+        DeviceOperation::ResetAlias => device
+            .set_alias(String::new())
+            .await
+            .backend_context("reset device alias"),
         _ => bail!("invalid property operation group"),
     }
 }

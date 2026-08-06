@@ -23,6 +23,7 @@ enum BackendRequest<'a> {
         key: &'a str,
         operation: AdapterOperation,
     },
+    UpdateManagement,
     DeviceOperation {
         key: &'a str,
         operation: DeviceOperation,
@@ -48,6 +49,7 @@ impl BackendRequest<'_> {
             Self::AdapterOperation { key, operation } => {
                 backend.adapter_operation(key, operation, params).await
             }
+            Self::UpdateManagement => backend.update_management(params).await,
             Self::DeviceOperation { key, operation } => {
                 backend.device_operation(key, operation, params).await
             }
@@ -96,6 +98,7 @@ fn parse_backend_request<'a>(method: &str, params: &'a Value) -> Result<BackendR
             let (key, operation) = typed_operation(params).map_err(validation_error)?;
             Ok(BackendRequest::AdapterOperation { key, operation })
         }
+        "bluetooth.management.update" => Ok(BackendRequest::UpdateManagement),
         "bluetooth.device.operation" => {
             let (key, operation) = typed_operation(params).map_err(validation_error)?;
             Ok(BackendRequest::DeviceOperation { key, operation })

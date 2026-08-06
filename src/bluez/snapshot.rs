@@ -45,6 +45,9 @@ pub(super) async fn build(backend: &BluezBackend) -> Result<Snapshot> {
             device.name.to_lowercase(),
         )
     });
+    let powered = snapshot.adapters.iter().any(|adapter| adapter.powered);
+    snapshot.radio = crate::rfkill::radio_state(snapshot.adapters.len(), powered);
+    snapshot.management = backend.management.policy();
     tracing::debug!(
         adapters = snapshot.adapters.len(),
         devices = snapshot.devices.len(),
@@ -122,6 +125,7 @@ async fn adapter_snapshot(adapter: &BluezAdapter, key: &str) -> Result<Adapter> 
 
 struct DeviceMetadata {
     alias: String,
+    remote_name: Option<String>,
     address_type: String,
     icon: Option<String>,
     services_resolved: bool,
@@ -140,6 +144,7 @@ impl DeviceMetadata {
         uuids.sort();
         Ok(Self {
             alias: bluez_result(device.alias().await, "read device alias")?,
+            remote_name: bluez_result(device.name().await, "read remote device name")?,
             address_type: bluez_result(device.address_type().await, "read device address type")?
                 .to_string(),
             icon: bluez_result(device.icon().await, "read device icon")?,
@@ -234,6 +239,8 @@ async fn device_snapshot(
         adapter_key: adapter_key.to_string(),
         name: metadata.alias.clone(),
         alias: metadata.alias,
+        remote_name: metadata.remote_name,
+        device_type: device_type(icon.as_deref()),
         address: identity.to_string(),
         address_type: metadata.address_type,
         icon,
@@ -424,6 +431,38 @@ fn device_capabilities(
         can_set_noise_control,
         unsupported_reasons,
     }
+}
+
+fn device_type(icon: Option<&str>) -> String {
+    let icon = icon.unwrap_or_default().to_ascii_lowercase();
+    let kind = if icon.contains("headset") {
+        "Headset"
+    } else if icon.contains("headphone") {
+        "Headphones"
+    } else if icon.contains("audio") || icon.contains("speaker") {
+        "Audio device"
+    } else if icon.contains("keyboard") {
+        "Keyboard"
+    } else if icon.contains("mouse") {
+        "Mouse"
+    } else if icon.contains("game") || icon.contains("joystick") {
+        "Game controller"
+    } else if icon.contains("tablet") {
+        "Tablet"
+    } else if icon.contains("phone") {
+        "Phone"
+    } else if icon.contains("computer") || icon.contains("laptop") {
+        "Computer"
+    } else if icon.contains("printer") {
+        "Printer"
+    } else if icon.contains("camera") {
+        "Camera"
+    } else if icon.contains("watch") || icon.contains("wearable") {
+        "Wearable"
+    } else {
+        "Bluetooth device"
+    };
+    kind.to_string()
 }
 
 fn service_label(uuid: &str) -> &'static str {

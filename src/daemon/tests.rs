@@ -34,6 +34,7 @@ impl BluetoothBackend for TestBackend {
         Ok(Snapshot {
             adapters: vec![test_adapter("adapter-1"), test_adapter("adapter-2")],
             devices: vec![],
+            ..Snapshot::default()
         })
     }
 
@@ -50,6 +51,10 @@ impl BluetoothBackend for TestBackend {
     }
 
     async fn adapter_operation(&self, _: &str, _: AdapterOperation, _: &Value) -> Result<Snapshot> {
+        self.snapshot().await
+    }
+
+    async fn update_management(&self, _: &Value) -> Result<Snapshot> {
         self.snapshot().await
     }
 

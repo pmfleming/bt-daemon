@@ -2,10 +2,25 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::management::ManagementPolicy;
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
+    pub radio: RadioState,
+    pub management: ManagementPolicy,
     pub adapters: Vec<Adapter>,
     pub devices: Vec<Device>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RadioState {
+    pub available: bool,
+    pub operational: bool,
+    pub powered: bool,
+    pub adapter_count: usize,
+    pub rfkill_present: bool,
+    pub soft_blocked: bool,
+    pub hard_blocked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,6 +45,8 @@ pub struct Device {
     pub adapter_key: String,
     pub name: String,
     pub alias: String,
+    pub remote_name: Option<String>,
+    pub device_type: String,
     pub address: String,
     pub address_type: String,
     pub icon: Option<String>,

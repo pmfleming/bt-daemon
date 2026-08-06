@@ -37,6 +37,12 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         "snapshot",
         Some(stream::CHANGED),
     ),
+    (
+        "bluetooth.management.update",
+        r#"{"launch_state":"remember","reconnect_on_resume":true,"trust_after_pair":true,"preferred_adapter_key":"adapter-opaque","show_blocked_devices":false,"show_recent_devices":false}"#,
+        "snapshot",
+        Some(stream::CHANGED),
+    ),
     ("bluetooth.obex.snapshot", "{}", "obex", None),
     (
         "bluetooth.obex.send",
