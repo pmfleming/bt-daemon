@@ -17,6 +17,8 @@ const REGISTRY_VERSION: u8 = 1;
 struct RememberedPresentation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_type: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     battery: Vec<Battery>,
 }
@@ -109,7 +111,7 @@ impl DeviceIdentityRegistry {
         device_key: &str,
         icon: Option<&str>,
         battery: &[Battery],
-    ) -> (Option<String>, Vec<Battery>) {
+    ) -> (Option<String>, Vec<Battery>, String) {
         let mut state = self.state();
         let presentation = state
             .presentations
@@ -118,7 +120,10 @@ impl DeviceIdentityRegistry {
         let changed = presentation.update(icon, battery);
         let remembered = presentation.clone();
         self.persist_if(changed, &state, "device presentation");
-        (remembered.icon, remembered.battery)
+        let device_type = remembered
+            .device_type
+            .unwrap_or_else(|| presentation_type(remembered.icon.as_deref(), &remembered.battery));
+        (remembered.icon, remembered.battery, device_type)
     }
 
     pub fn forget_presentation(&self, device_key: &str) {
@@ -151,6 +156,21 @@ impl DeviceIdentityRegistry {
 impl RememberedPresentation {
     fn update(&mut self, icon: Option<&str>, battery: &[Battery]) -> bool {
         let icon = icon.filter(|value| !value.trim().is_empty());
+        let remembered_type = self
+            .device_type
+            .clone()
+            .unwrap_or_else(|| presentation_type(self.icon.as_deref(), &self.battery));
+        let observed_type = presentation_type(icon, battery);
+        let resolved_type = if type_confidence(&observed_type) > type_confidence(&remembered_type) {
+            observed_type
+        } else {
+            remembered_type
+        };
+        let type_changed = resolved_type != "Bluetooth device"
+            && self.device_type.as_deref() != Some(resolved_type.as_str());
+        if type_changed {
+            self.device_type = Some(resolved_type);
+        }
         let icon_changed = icon.is_some_and(|icon| self.icon.as_deref() != Some(icon));
         if icon_changed {
             self.icon = icon.map(str::to_string);
@@ -159,7 +179,56 @@ impl RememberedPresentation {
         if battery_changed {
             self.battery = battery.to_vec();
         }
-        icon_changed || battery_changed
+        type_changed || icon_changed || battery_changed
+    }
+}
+
+pub(crate) fn presentation_type(icon: Option<&str>, battery: &[Battery]) -> String {
+    if battery.iter().any(|report| {
+        report.component.eq_ignore_ascii_case("left")
+            || report.component.eq_ignore_ascii_case("right")
+    }) {
+        return "Earbuds".to_string();
+    }
+    let icon = icon.unwrap_or_default().to_ascii_lowercase();
+    let kind = if icon.contains("headset") {
+        "Headset"
+    } else if icon.contains("headphone") {
+        "Headphones"
+    } else if icon.contains("speaker") {
+        "Speaker"
+    } else if icon.contains("audio") {
+        "Audio device"
+    } else if icon.contains("keyboard") {
+        "Keyboard"
+    } else if icon.contains("mouse") {
+        "Mouse"
+    } else if icon.contains("game") || icon.contains("joystick") {
+        "Game controller"
+    } else if icon.contains("tablet") {
+        "Tablet"
+    } else if icon.contains("phone") {
+        "Phone"
+    } else if icon.contains("computer") || icon.contains("laptop") {
+        "Computer"
+    } else if icon.contains("printer") {
+        "Printer"
+    } else if icon.contains("camera") {
+        "Camera"
+    } else if icon.contains("watch") || icon.contains("wearable") {
+        "Wearable"
+    } else {
+        "Bluetooth device"
+    };
+    kind.to_string()
+}
+
+fn type_confidence(device_type: &str) -> u8 {
+    match device_type {
+        "Earbuds" => 3,
+        "Bluetooth device" => 0,
+        "Audio device" => 1,
+        _ => 2,
     }
 }
 
@@ -226,9 +295,11 @@ mod tests {
 
         let registry = DeviceIdentityRegistry::load(Some(path)).unwrap();
         assert_eq!(key, registry.device_key("hci0", address));
-        let (icon, remembered_battery) = registry.remember_presentation("device-known", None, &[]);
+        let (icon, remembered_battery, device_type) =
+            registry.remember_presentation("device-known", None, &[]);
         assert_eq!(icon.as_deref(), Some("audio-headphones"));
         assert_eq!(remembered_battery, expected_battery);
+        assert_eq!(device_type, "Headphones");
 
         let legacy_path = directory.join("legacy.json");
         fs::write(&legacy_path, r#"{"version":1,"adapters":{},"devices":{}}"#).unwrap();
@@ -247,7 +318,57 @@ mod tests {
         assert_eq!(key, registry.device_key("hci0", address));
         assert_eq!(
             registry.remember_presentation(&key, None, &[]),
-            (None, vec![])
+            (None, vec![], "Bluetooth device".to_string())
+        );
+    }
+
+    #[test]
+    fn known_device_type_ignores_weaker_transient_observations() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        let component_battery = vec![Battery {
+            id: "left".into(),
+            label: "Left".into(),
+            component: "left".into(),
+            percentage: 80,
+            source: "test".into(),
+            confidence: "standard".into(),
+        }];
+        assert_eq!(
+            registry
+                .remember_presentation("device-known", Some("audio-headset"), &component_battery)
+                .2,
+            "Earbuds"
+        );
+        assert_eq!(
+            registry
+                .remember_presentation("device-known", Some("audio-headphones"), &[battery(79)])
+                .2,
+            "Earbuds"
+        );
+    }
+
+    #[test]
+    fn stronger_type_evidence_can_refine_a_known_generic_type() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        assert_eq!(
+            registry
+                .remember_presentation("device-known", Some("audio-headphones"), &[])
+                .2,
+            "Headphones"
+        );
+        let component_battery = vec![Battery {
+            id: "right".into(),
+            label: "Right".into(),
+            component: "right".into(),
+            percentage: 75,
+            source: "test".into(),
+            confidence: "standard".into(),
+        }];
+        assert_eq!(
+            registry
+                .remember_presentation("device-known", None, &component_battery)
+                .2,
+            "Earbuds"
         );
     }
 }

@@ -5,7 +5,7 @@ use bluer::{Adapter as BluezAdapter, Device as BluezDevice};
 
 use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
-    identity::DeviceIdentityRegistry,
+    identity::{DeviceIdentityRegistry, presentation_type},
     model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
 };
 
@@ -210,7 +210,7 @@ async fn device_snapshot(
     let rssi = live_rssi.or_else(|| cached.as_ref().and_then(|cached| cached.device.rssi));
     let observed_battery =
         device_batteries(device, identity, connected, backend.fast_pair.as_deref()).await?;
-    let (icon, battery) = presentation(
+    let (icon, battery, device_type) = presentation(
         &backend.identities,
         &key,
         paired,
@@ -240,7 +240,7 @@ async fn device_snapshot(
         name: metadata.alias.clone(),
         alias: metadata.alias,
         remote_name: metadata.remote_name,
-        device_type: device_type(icon.as_deref()),
+        device_type,
         address: identity.to_string(),
         address_type: metadata.address_type,
         icon,
@@ -283,12 +283,13 @@ fn presentation(
     connected: bool,
     icon: Option<String>,
     battery: Vec<Battery>,
-) -> (Option<String>, Vec<Battery>) {
+) -> (Option<String>, Vec<Battery>, String) {
     if !paired {
         identities.forget_presentation(key);
-        return (icon, battery);
+        let device_type = presentation_type(icon.as_deref(), &battery);
+        return (icon, battery, device_type);
     }
-    let (remembered_icon, remembered_battery) =
+    let (remembered_icon, remembered_battery, device_type) =
         identities.remember_presentation(key, icon.as_deref(), &battery);
     let icon = icon.filter(|icon| !icon.trim().is_empty());
     let restored_icon = icon.is_none() && remembered_icon.is_some();
@@ -304,7 +305,7 @@ fn presentation(
     } else {
         battery
     };
-    (icon.or(remembered_icon), battery)
+    (icon.or(remembered_icon), battery, device_type)
 }
 
 fn cached_device_view(cached: &CachedDevice) -> Device {
@@ -431,38 +432,6 @@ fn device_capabilities(
         can_set_noise_control,
         unsupported_reasons,
     }
-}
-
-fn device_type(icon: Option<&str>) -> String {
-    let icon = icon.unwrap_or_default().to_ascii_lowercase();
-    let kind = if icon.contains("headset") {
-        "Headset"
-    } else if icon.contains("headphone") {
-        "Headphones"
-    } else if icon.contains("audio") || icon.contains("speaker") {
-        "Audio device"
-    } else if icon.contains("keyboard") {
-        "Keyboard"
-    } else if icon.contains("mouse") {
-        "Mouse"
-    } else if icon.contains("game") || icon.contains("joystick") {
-        "Game controller"
-    } else if icon.contains("tablet") {
-        "Tablet"
-    } else if icon.contains("phone") {
-        "Phone"
-    } else if icon.contains("computer") || icon.contains("laptop") {
-        "Computer"
-    } else if icon.contains("printer") {
-        "Printer"
-    } else if icon.contains("camera") {
-        "Camera"
-    } else if icon.contains("watch") || icon.contains("wearable") {
-        "Wearable"
-    } else {
-        "Bluetooth device"
-    };
-    kind.to_string()
 }
 
 fn service_label(uuid: &str) -> &'static str {
