@@ -100,6 +100,45 @@ pub struct TransferUpdate {
     pub size: u64,
 }
 
+impl TransferUpdate {
+    fn apply(&mut self, properties: &HashMap<String, OwnedValue>) {
+        self.apply_values(
+            properties.get("Status").and_then(value_string),
+            properties.get("Transferred").and_then(value_u64),
+            properties.get("Size").and_then(value_u64),
+        );
+    }
+
+    fn apply_changed(&mut self, properties: &HashMap<&str, Value<'_>>) {
+        self.apply_values(
+            properties.get("Status").and_then(borrowed_string),
+            properties.get("Transferred").and_then(borrowed_u64),
+            None,
+        );
+    }
+
+    fn apply_values(
+        &mut self,
+        status: Option<String>,
+        transferred: Option<u64>,
+        size: Option<u64>,
+    ) {
+        if let Some(status) = status {
+            self.status = status;
+        }
+        if let Some(transferred) = transferred {
+            self.transferred = transferred;
+        }
+        if let Some(size) = size {
+            self.size = size;
+        }
+    }
+
+    fn terminal(&self) -> bool {
+        matches!(self.status.as_str(), "complete" | "error" | "cancelled")
+    }
+}
+
 pub struct ActiveTransfer {
     connection: zbus::Connection,
     session_path: OwnedObjectPath,
@@ -592,7 +631,7 @@ impl ActiveTransfer {
                 size: self.size,
             };
             update(current.clone());
-            if !matches!(current.status.as_str(), "complete" | "error") {
+            if !current.terminal() {
                 let transfer = zbus::Proxy::new(
                     &self.connection,
                     BUS_NAME,
@@ -607,7 +646,7 @@ impl ActiveTransfer {
                     .build()
                     .await?;
                 let mut changes = properties.receive_properties_changed().await?;
-                while !matches!(current.status.as_str(), "complete" | "error") {
+                while !current.terminal() {
                     tokio::select! {
                         _ = &mut cancel => {
                             transfer.call::<_, _, ()>("Cancel", &()).await.context("cancel OBEX transfer")?;
@@ -619,12 +658,7 @@ impl ActiveTransfer {
                             let signal = signal.context("OBEX property stream ended")?;
                             let args = signal.args()?;
                             if args.interface_name() != TRANSFER_INTERFACE { continue; }
-                            if let Some(status) = args.changed_properties().get("Status").and_then(borrowed_string) {
-                                current.status = status;
-                            }
-                            if let Some(value) = args.changed_properties().get("Transferred").and_then(borrowed_u64) {
-                                current.transferred = value;
-                            }
+                            current.apply_changed(args.changed_properties());
                             update(current.clone());
                         }
                     }
@@ -733,13 +767,19 @@ async fn monitor_incoming(
         .await?;
     let mut changes = properties.receive_properties_changed().await?;
     let initial = properties.get_all(TRANSFER_INTERFACE.try_into()?).await?;
-    event.status = property_string(&initial, "Status").unwrap_or_else(|| "queued".into());
-    event.transferred = property_u64(&initial, "Transferred").unwrap_or(0);
-    event.size = property_u64(&initial, "Size").unwrap_or(event.size);
+    let mut current = TransferUpdate {
+        status: "queued".into(),
+        transferred: 0,
+        size: event.size,
+    };
+    current.apply(&initial);
+    event.status.clone_from(&current.status);
+    event.transferred = current.transferred;
+    event.size = current.size;
     event.event = lifecycle_event(&event.status).into();
     tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
     let _ = events.send(event.clone());
-    while !matches!(event.status.as_str(), "complete" | "error" | "cancelled") {
+    while !current.terminal() {
         tokio::select! {
             _ = &mut cancel => {
                 transfer.call::<_, _, ()>("Cancel", &()).await.context("cancel incoming OBEX transfer")?;
@@ -752,12 +792,9 @@ async fn monitor_incoming(
                 let signal = signal.context("incoming OBEX property stream ended")?;
                 let args = signal.args()?;
                 if args.interface_name() != TRANSFER_INTERFACE { continue; }
-                if let Some(status) = args.changed_properties().get("Status").and_then(borrowed_string) {
-                    event.status = status;
-                }
-                if let Some(value) = args.changed_properties().get("Transferred").and_then(borrowed_u64) {
-                    event.transferred = value;
-                }
+                current.apply_changed(args.changed_properties());
+                event.status.clone_from(&current.status);
+                event.transferred = current.transferred;
                 event.event = lifecycle_event(&event.status).into();
                 tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
                 let _ = events.send(event.clone());
