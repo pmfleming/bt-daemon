@@ -38,7 +38,7 @@ use keys::AccountKeyStore;
 
 pub const MESSAGE_STREAM_UUID: &str = "df21fe2c-2515-4fdb-8886-f12c4d67927c";
 pub const FAST_PAIR_SERVICE_UUID: &str = "0000fe2c-0000-1000-8000-00805f9b34fb";
-pub const MESSAGE_STREAM_PSM_UUID: &str = "fe2c1239-8366-4814-8eb0-01de32100bea";
+const MESSAGE_STREAM_PSM_UUID: &str = "fe2c1239-8366-4814-8eb0-01de32100bea";
 const DEVICE_INFORMATION_GROUP: u8 = 0x03;
 const MODEL_ID_CODE: u8 = 0x01;
 const BLE_ADDRESS_CODE: u8 = 0x02;
