@@ -17,7 +17,10 @@ use pw::{
     types::ObjectType,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+
+mod profile;
+use profile::parse_profile;
+pub use profile::profile_key;
 
 macro_rules! bind_or_return {
     ($registry:expr, $global:expr, $kind:ty) => {
@@ -650,80 +653,10 @@ fn default_node_name(value: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-pub fn profile_key(device_key: &str, profile_name: &str) -> String {
-    let digest = Sha256::digest(format!("{device_key}:{profile_name}").as_bytes());
-    format!("audio-profile-{}", hex::encode(&digest[..12]))
-}
-
 fn adapter_from_bluez_path(path: &str) -> Option<String> {
     path.split('/')
         .find(|part| part.starts_with("hci"))
         .map(str::to_string)
-}
-
-fn parse_profile(pod: &pw::spa::pod::Pod) -> Option<AudioProfile> {
-    use pw::spa::pod::{Value, deserialize::PodDeserializer};
-
-    let (_, Value::Object(object)) =
-        PodDeserializer::deserialize_from::<Value>(pod.as_bytes()).ok()?
-    else {
-        return None;
-    };
-    let mut index = None;
-    let mut name = None;
-    let mut description = None;
-    let mut available = true;
-    let mut priority = 0;
-    for property in object.properties {
-        match (property.key, property.value) {
-            (key, Value::Int(value)) if key == pw::spa::sys::SPA_PARAM_PROFILE_index => {
-                index = u32::try_from(value).ok();
-            }
-            (key, Value::String(value)) if key == pw::spa::sys::SPA_PARAM_PROFILE_name => {
-                name = Some(value);
-            }
-            (key, Value::String(value)) if key == pw::spa::sys::SPA_PARAM_PROFILE_description => {
-                description = Some(value);
-            }
-            (key, Value::Id(value)) if key == pw::spa::sys::SPA_PARAM_PROFILE_available => {
-                available = value.0 != pw::spa::sys::SPA_PARAM_AVAILABILITY_no;
-            }
-            (key, Value::Int(value)) if key == pw::spa::sys::SPA_PARAM_PROFILE_priority => {
-                priority = value;
-            }
-            _ => {}
-        }
-    }
-    let name = name.unwrap_or_default();
-    let description = description.unwrap_or_default();
-    Some(AudioProfile {
-        index: index?,
-        mode: profile_mode(&name).to_string(),
-        codec: profile_codec(&description),
-        name,
-        description,
-        available,
-        priority,
-    })
-}
-
-fn profile_mode(name: &str) -> &'static str {
-    if name.starts_with("a2dp-") {
-        "high-fidelity"
-    } else if name.starts_with("headset-") || name.starts_with("handsfree-") {
-        "headset"
-    } else if name == "off" {
-        "off"
-    } else {
-        "other"
-    }
-}
-
-fn profile_codec(description: &str) -> Option<String> {
-    let marker = "codec ";
-    let start = description.rfind(marker)? + marker.len();
-    let value = description[start..].trim_end_matches(')').trim();
-    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[cfg(test)]
@@ -733,7 +666,8 @@ mod tests {
     use super::{
         AudioDevice, AudioEndpoint, AudioProfile, Defaults, DeviceEndpoints,
         adapter_from_bluez_path, default_node_name, endpoint_kind, finalize_devices, node_state,
-        profile_codec, profile_key, profile_mode, update_profile,
+        profile::{profile_codec, profile_mode},
+        profile_key, update_profile,
     };
 
     #[test]
