@@ -9,7 +9,10 @@ use bluer::Address;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{model::Battery, state};
+use crate::{
+    model::{Battery, presentation_type},
+    state,
+};
 
 const REGISTRY_VERSION: u8 = 1;
 
@@ -80,14 +83,18 @@ impl DeviceIdentityRegistry {
 
     pub fn register_adapter(&self, adapter: &str, stable_identity: &str) {
         let mut state = self.state();
-        let previous = state.adapters.get(adapter).cloned();
-        if previous.as_deref() == Some(stable_identity) {
+        if state
+            .adapters
+            .get(adapter)
+            .is_some_and(|identity| identity == stable_identity)
+        {
             return;
         }
+        let first_registration = !state.adapters.contains_key(adapter);
         state
             .adapters
-            .insert(adapter.to_string(), stable_identity.to_string());
-        if previous.is_none() {
+            .insert(adapter.into(), stable_identity.into());
+        if first_registration {
             migrate_legacy_devices(&mut state, adapter, stable_identity);
         }
         self.persist(&state, "adapter identity");
@@ -113,17 +120,15 @@ impl DeviceIdentityRegistry {
         battery: &[Battery],
     ) -> (Option<String>, Vec<Battery>, String) {
         let mut state = self.state();
-        let presentation = state
-            .presentations
-            .entry(device_key.to_string())
-            .or_default();
-        let changed = presentation.update(icon, battery);
-        let remembered = presentation.clone();
+        let (changed, remembered) = {
+            let presentation = state
+                .presentations
+                .entry(device_key.to_string())
+                .or_default();
+            (presentation.update(icon, battery), presentation.values())
+        };
         self.persist_if(changed, &state, "device presentation");
-        let device_type = remembered
-            .device_type
-            .unwrap_or_else(|| presentation_type(remembered.icon.as_deref(), &remembered.battery));
-        (remembered.icon, remembered.battery, device_type)
+        remembered
     }
 
     pub fn forget_presentation(&self, device_key: &str) {
@@ -156,71 +161,56 @@ impl DeviceIdentityRegistry {
 impl RememberedPresentation {
     fn update(&mut self, icon: Option<&str>, battery: &[Battery]) -> bool {
         let icon = icon.filter(|value| !value.trim().is_empty());
-        let remembered_type = self
-            .device_type
-            .clone()
-            .unwrap_or_else(|| presentation_type(self.icon.as_deref(), &self.battery));
         let observed_type = presentation_type(icon, battery);
-        let resolved_type = if type_confidence(&observed_type) > type_confidence(&remembered_type) {
-            observed_type
-        } else {
-            remembered_type
-        };
+        let resolved_type = self.resolved_type(observed_type).to_string();
         let type_changed = resolved_type != "Bluetooth device"
             && self.device_type.as_deref() != Some(resolved_type.as_str());
         if type_changed {
             self.device_type = Some(resolved_type);
         }
-        let icon_changed = icon.is_some_and(|icon| self.icon.as_deref() != Some(icon));
-        if icon_changed {
-            self.icon = icon.map(str::to_string);
-        }
-        let battery_changed = !battery.is_empty() && self.battery != battery;
-        if battery_changed {
-            self.battery = battery.to_vec();
-        }
+        let icon_changed = self.update_icon(icon);
+        let battery_changed = self.update_battery(battery);
         type_changed || icon_changed || battery_changed
     }
-}
 
-pub(crate) fn presentation_type(icon: Option<&str>, battery: &[Battery]) -> String {
-    if battery.iter().any(|report| {
-        report.component.eq_ignore_ascii_case("left")
-            || report.component.eq_ignore_ascii_case("right")
-    }) {
-        return "Earbuds".to_string();
+    fn resolved_type<'a>(&'a self, observed: &'a str) -> &'a str {
+        let remembered = self.device_type();
+        if type_confidence(observed) > type_confidence(remembered) {
+            observed
+        } else {
+            remembered
+        }
     }
-    let icon = icon.unwrap_or_default().to_ascii_lowercase();
-    let kind = if icon.contains("headset") {
-        "Headset"
-    } else if icon.contains("headphone") {
-        "Headphones"
-    } else if icon.contains("speaker") {
-        "Speaker"
-    } else if icon.contains("audio") {
-        "Audio device"
-    } else if icon.contains("keyboard") {
-        "Keyboard"
-    } else if icon.contains("mouse") {
-        "Mouse"
-    } else if icon.contains("game") || icon.contains("joystick") {
-        "Game controller"
-    } else if icon.contains("tablet") {
-        "Tablet"
-    } else if icon.contains("phone") {
-        "Phone"
-    } else if icon.contains("computer") || icon.contains("laptop") {
-        "Computer"
-    } else if icon.contains("printer") {
-        "Printer"
-    } else if icon.contains("camera") {
-        "Camera"
-    } else if icon.contains("watch") || icon.contains("wearable") {
-        "Wearable"
-    } else {
-        "Bluetooth device"
-    };
-    kind.to_string()
+
+    fn device_type(&self) -> &str {
+        self.device_type
+            .as_deref()
+            .unwrap_or_else(|| presentation_type(self.icon.as_deref(), &self.battery))
+    }
+
+    fn update_icon(&mut self, icon: Option<&str>) -> bool {
+        if icon.is_none_or(|icon| self.icon.as_deref() == Some(icon)) {
+            return false;
+        }
+        self.icon = icon.map(Into::into);
+        true
+    }
+
+    fn update_battery(&mut self, battery: &[Battery]) -> bool {
+        if battery.is_empty() || self.battery == battery {
+            return false;
+        }
+        self.battery = battery.to_vec();
+        true
+    }
+
+    fn values(&self) -> (Option<String>, Vec<Battery>, String) {
+        (
+            self.icon.clone(),
+            self.battery.clone(),
+            self.device_type().into(),
+        )
+    }
 }
 
 fn type_confidence(device_type: &str) -> u8 {

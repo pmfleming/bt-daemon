@@ -5,8 +5,8 @@ use bluer::{Adapter as BluezAdapter, Device as BluezDevice};
 
 use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
-    identity::{DeviceIdentityRegistry, presentation_type},
-    model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot},
+    identity::DeviceIdentityRegistry,
+    model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot, presentation_type},
 };
 
 use super::{
@@ -134,6 +134,35 @@ struct DeviceMetadata {
     uuids: Vec<String>,
 }
 
+struct DeviceState {
+    paired: bool,
+    connected: bool,
+    trusted: bool,
+    blocked: bool,
+    wake_allowed: Option<bool>,
+    live_rssi: Option<i16>,
+}
+
+impl DeviceState {
+    async fn read(device: &BluezDevice) -> Result<Self> {
+        Ok(Self {
+            paired: bluez_result(device.is_paired().await, "read device paired state")?,
+            connected: bluez_result(device.is_connected().await, "read device connected state")?,
+            trusted: bluez_result(device.is_trusted().await, "read device trusted state")?,
+            blocked: bluez_result(device.is_blocked().await, "read device blocked state")?,
+            wake_allowed: bluez_result(
+                device.is_wake_allowed().await,
+                "read device wake permission",
+            )?,
+            live_rssi: bluez_result(device.rssi().await, "read device signal strength")?,
+        })
+    }
+
+    fn present(&self) -> bool {
+        self.live_rssi.is_some() || self.connected
+    }
+}
+
 impl DeviceMetadata {
     async fn read(device: &BluezDevice) -> Result<Self> {
         let mut uuids = bluez_result(device.uuids().await, "read device UUIDs")?
@@ -169,10 +198,8 @@ async fn device_snapshot(
     device: &BluezDevice,
     adapter_key: &str,
 ) -> Result<Option<Device>> {
-    let paired = bluez_result(device.is_paired().await, "read device paired state")?;
-    let connected = bluez_result(device.is_connected().await, "read device connected state")?;
-    let live_rssi = bluez_result(device.rssi().await, "read device signal strength")?;
-    let present = live_rssi.is_some() || connected;
+    let state = DeviceState::read(device).await?;
+    let present = state.present();
     let identity = device.address();
     let key = backend.identities.device_key(adapter.name(), identity);
     let now_ms = unix_time_ms();
@@ -183,16 +210,10 @@ async fn device_snapshot(
         .get(&key)
         .filter(|cached| cache_entry_is_fresh(cached.observed_at_ms, now_ms))
         .cloned();
-    if !should_include_device(paired, present, cached.is_some()) {
-        tracing::trace!(device_key = %key, paired, present, "device omitted from snapshot");
+    if !should_include_device(state.paired, present, cached.is_some()) {
+        tracing::trace!(device_key = %key, paired = state.paired, present, "device omitted from snapshot");
         return Ok(None);
     }
-    let trusted = bluez_result(device.is_trusted().await, "read device trusted state")?;
-    let blocked = bluez_result(device.is_blocked().await, "read device blocked state")?;
-    let wake_allowed = bluez_result(
-        device.is_wake_allowed().await,
-        "read device wake permission",
-    )?;
     let metadata = DeviceMetadata::read(device).await?;
     let services = metadata
         .uuids
@@ -207,18 +228,25 @@ async fn device_snapshot(
             .as_ref()
             .and_then(|cached| cached.device.last_seen_ms)
     });
-    let rssi = live_rssi.or_else(|| cached.as_ref().and_then(|cached| cached.device.rssi));
-    let observed_battery =
-        device_batteries(device, identity, connected, backend.fast_pair.as_deref()).await?;
+    let rssi = state
+        .live_rssi
+        .or_else(|| cached.as_ref().and_then(|cached| cached.device.rssi));
+    let observed_battery = device_batteries(
+        device,
+        identity,
+        state.connected,
+        backend.fast_pair.as_deref(),
+    )
+    .await?;
     let (icon, battery, device_type) = presentation(
         &backend.identities,
         &key,
-        paired,
-        connected,
+        state.paired,
+        state.connected,
         metadata.icon,
         observed_battery,
     );
-    let fast_pair_features = match (connected, backend.fast_pair.as_deref()) {
+    let fast_pair_features = match (state.connected, backend.fast_pair.as_deref()) {
         (true, Some(provider)) => provider.features(device).await,
         _ => None,
     };
@@ -227,10 +255,10 @@ async fn device_snapshot(
             || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
     });
     let capabilities = device_capabilities(
-        paired,
-        connected,
-        blocked,
-        wake_allowed,
+        state.paired,
+        state.connected,
+        state.blocked,
+        state.wake_allowed,
         has_fast_pair,
         fast_pair_features.as_ref(),
     );
@@ -244,13 +272,13 @@ async fn device_snapshot(
         address: identity.to_string(),
         address_type: metadata.address_type,
         icon,
-        paired,
+        paired: state.paired,
         bonded: bonded_property(&backend.system_bus, adapter.name(), identity).await,
-        connected,
+        connected: state.connected,
         services_resolved: metadata.services_resolved,
-        trusted,
-        blocked,
-        wake_allowed,
+        trusted: state.trusted,
+        blocked: state.blocked,
+        wake_allowed: state.wake_allowed,
         legacy_pairing: metadata.legacy_pairing,
         modalias: metadata.modalias,
         uuids: metadata.uuids,
@@ -259,7 +287,7 @@ async fn device_snapshot(
         fast_pair: fast_pair_features,
         rssi,
         signal_strength: rssi.map(signal_strength),
-        signal_live: live_rssi.is_some(),
+        signal_live: state.live_rssi.is_some(),
         present,
         last_seen_ms,
         capabilities,
@@ -286,7 +314,7 @@ fn presentation(
 ) -> (Option<String>, Vec<Battery>, String) {
     if !paired {
         identities.forget_presentation(key);
-        let device_type = presentation_type(icon.as_deref(), &battery);
+        let device_type = presentation_type(icon.as_deref(), &battery).into();
         return (icon, battery, device_type);
     }
     let (remembered_icon, remembered_battery, device_type) =
@@ -387,7 +415,39 @@ fn device_capabilities(
         && fast_pair
             .and_then(|features| features.noise_control.as_ref())
             .is_some_and(|noise| !noise.settable_modes.is_empty());
-    let unsupported_reasons = [
+    DeviceCapabilities {
+        can_pair: !paired && !blocked,
+        can_connect: !connected && !blocked,
+        can_disconnect: connected,
+        can_remove: paired,
+        can_trust: paired,
+        can_block: true,
+        can_wake: wake_allowed.is_some(),
+        can_rename: true,
+        can_send_file: paired && !blocked,
+        can_provision_fast_pair,
+        can_set_multipoint,
+        can_set_noise_control,
+        unsupported_reasons: unsupported_reasons(
+            paired,
+            connected,
+            wake_allowed,
+            can_provision_fast_pair,
+            can_set_multipoint,
+            can_set_noise_control,
+        ),
+    }
+}
+
+fn unsupported_reasons(
+    paired: bool,
+    connected: bool,
+    wake_allowed: Option<bool>,
+    can_provision_fast_pair: bool,
+    can_set_multipoint: bool,
+    can_set_noise_control: bool,
+) -> std::collections::HashMap<String, String> {
+    [
         (paired, "pair", "Device is already paired"),
         (connected, "connect", "Device is already connected"),
         (!connected, "disconnect", "Device is not connected"),
@@ -416,22 +476,7 @@ fn device_capabilities(
     .into_iter()
     .filter(|(unsupported, _, _)| *unsupported)
     .map(|(_, operation, reason)| (operation.into(), reason.into()))
-    .collect();
-    DeviceCapabilities {
-        can_pair: !paired && !blocked,
-        can_connect: !connected && !blocked,
-        can_disconnect: connected,
-        can_remove: paired,
-        can_trust: paired,
-        can_block: true,
-        can_wake: wake_allowed.is_some(),
-        can_rename: true,
-        can_send_file: paired && !blocked,
-        can_provision_fast_pair,
-        can_set_multipoint,
-        can_set_noise_control,
-        unsupported_reasons,
-    }
+    .collect()
 }
 
 fn service_label(uuid: &str) -> &'static str {

@@ -171,34 +171,77 @@ impl BluezBackend {
 
     async fn restore_runtime_state(&self) -> Result<()> {
         let runtime = self.management.runtime();
+        self.restore_adapter_power(runtime.adapter_power()).await?;
+        if self.management.policy().reconnect_on_resume {
+            for device_key in runtime.connected_device_keys() {
+                self.reconnect_device(device_key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn restore_adapter_power(&self, power: &HashMap<String, bool>) -> Result<()> {
         for adapter in self.adapters().await? {
             let address = adapter
                 .address()
                 .await
                 .backend_context("read adapter identity during restore")?;
-            let key = opaque_key("adapter", &address.to_string());
-            if let Some(powered) = runtime.adapter_power().get(&key) {
+            if let Some(powered) = power.get(&opaque_key("adapter", &address.to_string())) {
                 adapter
                     .set_powered(*powered)
                     .await
                     .backend_context("restore adapter power")?;
             }
         }
-        if self.management.policy().reconnect_on_resume {
-            for device_key in runtime.connected_device_keys() {
-                let Ok((_, device)) = self.find_device(device_key).await else {
-                    continue;
-                };
-                if !bluez_result(device.is_connected().await, "read reconnect device state")? {
-                    match tokio::time::timeout(Duration::from_secs(15), device.connect()).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            tracing::warn!(%error, %device_key, "could not reconnect Bluetooth device")
-                        }
-                        Err(_) => tracing::warn!(%device_key, "Bluetooth reconnect timed out"),
-                    }
-                }
+        Ok(())
+    }
+
+    async fn reconnect_device(&self, device_key: &str) -> Result<()> {
+        let Ok((_, device)) = self.find_device(device_key).await else {
+            return Ok(());
+        };
+        if bluez_result(device.is_connected().await, "read reconnect device state")? {
+            return Ok(());
+        }
+        match tokio::time::timeout(Duration::from_secs(15), device.connect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, %device_key, "could not reconnect Bluetooth device")
             }
+            Err(_) => tracing::warn!(%device_key, "Bluetooth reconnect timed out"),
+        }
+        Ok(())
+    }
+
+    async fn set_one_adapter_power(&self, key: &str, powered: bool) -> Result<()> {
+        let adapter = self.find_adapter(key).await?;
+        adapter
+            .set_powered(powered)
+            .await
+            .backend_context("set adapter power")?;
+        if !powered {
+            self.stop_discovery(Some(adapter.name())).await;
+        }
+        Ok(())
+    }
+
+    async fn set_all_adapter_power(&self, powered: bool) -> Result<()> {
+        let before = self.snapshot().await?;
+        if powered && before.radio.hard_blocked {
+            return Err(BackendError::new(
+                BackendErrorKind::Rejected,
+                "Bluetooth is disabled by a hardware radio switch",
+            )
+            .into());
+        }
+        let adapters = self.adapters().await?;
+        if powered {
+            unblock_rfkill(&before, adapters.is_empty())?;
+        }
+        set_adapters_power(adapters, powered).await?;
+        update_rfkill(&before, powered);
+        if !powered {
+            self.stop_discovery(None).await;
         }
         Ok(())
     }
@@ -347,62 +390,9 @@ impl BluetoothBackend for BluezBackend {
 
     async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot> {
         tracing::info!(?adapter_key, powered, "setting Bluetooth adapter power");
-        if let Some(key) = adapter_key {
-            let adapter = self.find_adapter(key).await?;
-            adapter
-                .set_powered(powered)
-                .await
-                .backend_context("set adapter power")?;
-            if !powered {
-                self.stop_discovery(Some(adapter.name())).await;
-            }
-        } else {
-            let before = self.snapshot().await?;
-            if powered && before.radio.hard_blocked {
-                return Err(BackendError::new(
-                    BackendErrorKind::Rejected,
-                    "Bluetooth is disabled by a hardware radio switch",
-                )
-                .into());
-            }
-            if powered {
-                let adapters = self.adapters().await?;
-                if before.radio.rfkill_present
-                    && before.radio.soft_blocked
-                    && let Err(error) = rfkill::set_bluetooth_soft_blocked(false)
-                {
-                    if adapters.is_empty() {
-                        return Err(BackendError::new(
-                            BackendErrorKind::Rejected,
-                            format!("could not unblock Bluetooth through rfkill: {error:#}"),
-                        )
-                        .into());
-                    }
-                    tracing::warn!(%error, "direct rfkill unblock failed; asking BlueZ to power available adapters");
-                }
-                for adapter in adapters {
-                    adapter
-                        .set_powered(true)
-                        .await
-                        .backend_context("enable adapter power")?;
-                }
-            } else {
-                for adapter in self.adapters().await? {
-                    adapter
-                        .set_powered(false)
-                        .await
-                        .backend_context("disable adapter power")?;
-                }
-                if before.radio.rfkill_present
-                    && !before.radio.soft_blocked
-                    && let Err(error) = rfkill::set_bluetooth_soft_blocked(true)
-                {
-                    tracing::warn!(%error, "could not soft-block Bluetooth; adapters are powered off");
-                }
-            }
-        }
-        if !powered && adapter_key.is_none() {
-            self.stop_discovery(None).await;
+        match adapter_key {
+            Some(key) => self.set_one_adapter_power(key, powered).await?,
+            None => self.set_all_adapter_power(powered).await?,
         }
         let snapshot = self.snapshot().await?;
         self.management.remember_snapshot(&snapshot);
@@ -589,6 +579,48 @@ async fn append_adapter_event_streams(
         }
     }
     Ok(())
+}
+
+fn unblock_rfkill(before: &Snapshot, no_adapters: bool) -> Result<()> {
+    if !before.radio.rfkill_present || !before.radio.soft_blocked {
+        return Ok(());
+    }
+    let Err(error) = rfkill::set_bluetooth_soft_blocked(false) else {
+        return Ok(());
+    };
+    if no_adapters {
+        return Err(BackendError::new(
+            BackendErrorKind::Rejected,
+            format!("could not unblock Bluetooth through rfkill: {error:#}"),
+        )
+        .into());
+    }
+    tracing::warn!(%error, "direct rfkill unblock failed; asking BlueZ to power available adapters");
+    Ok(())
+}
+
+async fn set_adapters_power(adapters: Vec<BluezAdapter>, powered: bool) -> Result<()> {
+    let operation = if powered {
+        "enable adapter power"
+    } else {
+        "disable adapter power"
+    };
+    for adapter in adapters {
+        adapter
+            .set_powered(powered)
+            .await
+            .backend_context(operation)?;
+    }
+    Ok(())
+}
+
+fn update_rfkill(before: &Snapshot, powered: bool) {
+    if powered || !before.radio.rfkill_present || before.radio.soft_blocked {
+        return;
+    }
+    if let Err(error) = rfkill::set_bluetooth_soft_blocked(true) {
+        tracing::warn!(%error, "could not soft-block Bluetooth; adapters are powered off");
+    }
 }
 
 async fn set_adapter_scanning(

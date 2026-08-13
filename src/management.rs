@@ -133,45 +133,9 @@ impl ManagementStore {
         let object = values
             .as_object()
             .context("management update must be an object")?;
-        let allowed = [
-            "launch_state",
-            "reconnect_on_resume",
-            "trust_after_pair",
-            "preferred_adapter_key",
-            "show_blocked_devices",
-            "show_recent_devices",
-        ];
-        if let Some(name) = object.keys().find(|name| !allowed.contains(&name.as_str())) {
-            bail!("unsupported management setting '{name}'");
-        }
+        validate_setting_names(object)?;
         let mut policy = self.policy_lock();
-        if let Some(value) = object.get("launch_state") {
-            let value = value.as_str().context("launch_state must be a string")?;
-            validate_launch_state(value)?;
-            policy.launch_state = value.to_string();
-        }
-        update_bool(
-            object,
-            "reconnect_on_resume",
-            &mut policy.reconnect_on_resume,
-        )?;
-        update_bool(object, "trust_after_pair", &mut policy.trust_after_pair)?;
-        update_bool(
-            object,
-            "show_blocked_devices",
-            &mut policy.show_blocked_devices,
-        )?;
-        update_bool(
-            object,
-            "show_recent_devices",
-            &mut policy.show_recent_devices,
-        )?;
-        if let Some(value) = object.get("preferred_adapter_key") {
-            policy.preferred_adapter_key = value
-                .as_str()
-                .context("preferred_adapter_key must be a string")?
-                .to_string();
-        }
+        policy.apply(object)?;
         self.persist_policy(&policy)?;
         Ok(policy.clone())
     }
@@ -225,6 +189,31 @@ impl ManagementStore {
     }
 }
 
+impl ManagementPolicy {
+    fn apply(&mut self, object: &serde_json::Map<String, Value>) -> Result<()> {
+        if let Some(value) = object.get("launch_state") {
+            let value = value.as_str().context("launch_state must be a string")?;
+            validate_launch_state(value)?;
+            self.launch_state = value.into();
+        }
+        for (name, target) in [
+            ("reconnect_on_resume", &mut self.reconnect_on_resume),
+            ("trust_after_pair", &mut self.trust_after_pair),
+            ("show_blocked_devices", &mut self.show_blocked_devices),
+            ("show_recent_devices", &mut self.show_recent_devices),
+        ] {
+            update_bool(object, name, target)?;
+        }
+        if let Some(value) = object.get("preferred_adapter_key") {
+            self.preferred_adapter_key = value
+                .as_str()
+                .context("preferred_adapter_key must be a string")?
+                .into();
+        }
+        Ok(())
+    }
+}
+
 impl RuntimeState {
     pub fn adapter_power(&self) -> &HashMap<String, bool> {
         &self.adapter_power
@@ -232,6 +221,21 @@ impl RuntimeState {
     pub fn connected_device_keys(&self) -> &[String] {
         &self.connected_device_keys
     }
+}
+
+fn validate_setting_names(object: &serde_json::Map<String, Value>) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "launch_state",
+        "reconnect_on_resume",
+        "trust_after_pair",
+        "preferred_adapter_key",
+        "show_blocked_devices",
+        "show_recent_devices",
+    ];
+    if let Some(name) = object.keys().find(|name| !ALLOWED.contains(&name.as_str())) {
+        bail!("unsupported management setting '{name}'");
+    }
+    Ok(())
 }
 
 fn update_bool(

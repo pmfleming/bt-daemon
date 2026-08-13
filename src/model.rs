@@ -101,6 +101,39 @@ impl Battery {
     }
 }
 
+pub(crate) fn presentation_type(icon: Option<&str>, battery: &[Battery]) -> &'static str {
+    if battery.iter().any(is_earbud_component) {
+        return "Earbuds";
+    }
+    let icon = icon.unwrap_or_default().to_ascii_lowercase();
+    TYPE_RULES
+        .iter()
+        .find(|(terms, _)| terms.iter().any(|term| icon.contains(term)))
+        .map_or("Bluetooth device", |(_, device_type)| device_type)
+}
+
+fn is_earbud_component(report: &Battery) -> bool {
+    ["left", "right"]
+        .iter()
+        .any(|component| report.component.eq_ignore_ascii_case(component))
+}
+
+const TYPE_RULES: &[(&[&str], &str)] = &[
+    (&["headset"], "Headset"),
+    (&["headphone"], "Headphones"),
+    (&["speaker"], "Speaker"),
+    (&["audio"], "Audio device"),
+    (&["keyboard"], "Keyboard"),
+    (&["mouse"], "Mouse"),
+    (&["game", "joystick"], "Game controller"),
+    (&["tablet"], "Tablet"),
+    (&["phone"], "Phone"),
+    (&["computer", "laptop"], "Computer"),
+    (&["printer"], "Printer"),
+    (&["camera"], "Camera"),
+    (&["watch", "wearable"], "Wearable"),
+];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FastPairFeatures {
     pub model_id: Option<String>,
