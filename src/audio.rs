@@ -64,16 +64,21 @@ pub struct AudioProfile {
     pub codec: Option<String>,
 }
 
+type RetainedObject = (Box<dyn ProxyT>, Box<dyn Listener>);
+
 #[derive(Default)]
 struct Objects {
-    proxies: Vec<Box<dyn ProxyT>>,
-    listeners: Vec<Box<dyn Listener>>,
+    retained: HashMap<u32, RetainedObject>,
 }
 
 impl Objects {
-    fn retain(&mut self, proxy: impl ProxyT + 'static, listener: impl Listener + 'static) {
-        self.proxies.push(Box::new(proxy));
-        self.listeners.push(Box::new(listener));
+    fn retain(&mut self, id: u32, proxy: impl ProxyT + 'static, listener: impl Listener + 'static) {
+        self.retained
+            .insert(id, (Box::new(proxy), Box::new(listener)));
+    }
+
+    fn remove(&mut self, id: u32) {
+        self.retained.remove(&id);
     }
 }
 
@@ -131,14 +136,14 @@ fn bind_monitor_object(
                 .info(move |_| info_event())
                 .param(move |_, _, _, _, _| event())
                 .register();
-            objects.borrow_mut().retain(device, listener);
+            objects.borrow_mut().retain(global.id, device, listener);
         }
         ObjectType::Node => {
             let node = registry
                 .bind::<Node, _>(global)
                 .context("bind PipeWire Bluetooth monitor node")?;
             let listener = node.add_listener_local().info(move |_| event()).register();
-            objects.borrow_mut().retain(node, listener);
+            objects.borrow_mut().retain(global.id, node, listener);
         }
         ObjectType::Metadata => {
             let metadata = registry
@@ -151,7 +156,7 @@ fn bind_monitor_object(
                     0
                 })
                 .register();
-            objects.borrow_mut().retain(metadata, listener);
+            objects.borrow_mut().retain(global.id, metadata, listener);
         }
         _ => {}
     }
@@ -175,6 +180,7 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
     let relevant_ids = Rc::new(RefCell::new(HashSet::new()));
     let relevant_for_global = Rc::clone(&relevant_ids);
     let relevant_for_remove = Rc::clone(&relevant_ids);
+    let objects_for_remove = Rc::clone(&objects);
     let changes_for_global = std::sync::Arc::clone(&on_change);
     let changes_for_remove = std::sync::Arc::clone(&on_change);
     let _listener = registry
@@ -201,6 +207,7 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
         })
         .global_remove(move |id| {
             if relevant_for_remove.borrow_mut().remove(&id) {
+                objects_for_remove.borrow_mut().remove(id);
                 tracing::debug!(id, "PipeWire Bluetooth object removed");
                 changes_for_remove();
             }
@@ -311,7 +318,7 @@ fn apply_profile(
         .register();
     device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
     device.enum_params(1, Some(pw::spa::param::ParamType::Profile), 0, 1);
-    objects.borrow_mut().retain(device, listener);
+    objects.borrow_mut().retain(global.id, device, listener);
     Ok(())
 }
 
@@ -459,7 +466,7 @@ impl ProbeState {
             .register();
         device.enum_params(1, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
         device.enum_params(2, Some(pw::spa::param::ParamType::Profile), 0, 1);
-        self.retain(device, listener);
+        self.retain(global.id, device, listener);
     }
 
     fn bind_node(
@@ -499,7 +506,7 @@ impl ProbeState {
                 endpoint.state = node_state(info.state()).to_string();
             })
             .register();
-        self.retain(node, listener);
+        self.retain(global.id, node, listener);
     }
 
     fn bind_metadata(
@@ -518,11 +525,11 @@ impl ProbeState {
                 0
             })
             .register();
-        self.retain(metadata, listener);
+        self.retain(global.id, metadata, listener);
     }
 
-    fn retain(&self, proxy: impl ProxyT + 'static, listener: impl Listener + 'static) {
-        self.objects.borrow_mut().retain(proxy, listener);
+    fn retain(&self, id: u32, proxy: impl ProxyT + 'static, listener: impl Listener + 'static) {
+        self.objects.borrow_mut().retain(id, proxy, listener);
     }
 
     fn finish(&self) -> Vec<AudioDevice> {

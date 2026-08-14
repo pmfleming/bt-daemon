@@ -200,6 +200,14 @@ async fn forward_events<T>(
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, %stream, skipped, "subscription events were dropped");
+                emit_stream(
+                    &emitter,
+                    stream,
+                    &subscription_id,
+                    "lagged",
+                    &json!({ "skipped": skipped }),
+                )
+                .await;
             }
             Err(broadcast::error::RecvError::Closed) => {
                 tracing::warn!(%subscription_id, %stream, "subscription event source closed");

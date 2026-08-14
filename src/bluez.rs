@@ -331,11 +331,11 @@ impl BluezBackend {
         .into())
     }
 
-    async fn start_discovery(&self, adapter: BluezAdapter) -> Result<()> {
+    async fn start_discovery(&self, adapter: BluezAdapter) -> Result<bool> {
         let name = adapter.name().to_string();
         let mut tasks = self.discovery_tasks.lock().await;
         if tasks.get(&name).is_some_and(|task| !task.is_finished()) {
-            return Ok(());
+            return Ok(false);
         }
         let mut events = adapter
             .discover_devices_with_changes()
@@ -347,7 +347,13 @@ impl BluezBackend {
                 while events.next().await.is_some() {}
             }),
         );
-        Ok(())
+        Ok(true)
+    }
+
+    async fn rollback_discovery(&self, adapter_names: &[String]) {
+        for name in adapter_names {
+            self.stop_discovery(Some(name)).await;
+        }
     }
 
     async fn stop_discovery(&self, adapter_name: Option<&str>) {
@@ -404,8 +410,35 @@ impl BluetoothBackend for BluezBackend {
         if let Some(key) = adapter_key {
             set_adapter_scanning(self, self.find_adapter(key).await?, enabled).await?;
         } else if enabled {
+            let mut started = Vec::new();
+            let mut eligible = 0_u32;
             for adapter in self.adapters().await? {
-                set_adapter_scanning(self, adapter, true).await?;
+                let name = adapter.name().to_string();
+                let powered = match bluez_result(adapter.is_powered().await, "read adapter power") {
+                    Ok(powered) => powered,
+                    Err(error) => {
+                        self.rollback_discovery(&started).await;
+                        return Err(error);
+                    }
+                };
+                if powered {
+                    eligible += 1;
+                    match self.start_discovery(adapter).await {
+                        Ok(true) => started.push(name),
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.rollback_discovery(&started).await;
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            if eligible == 0 {
+                return Err(BackendError::new(
+                    BackendErrorKind::Rejected,
+                    "Bluetooth discovery requires at least one powered adapter",
+                )
+                .into());
             }
         } else {
             self.stop_discovery(None).await;
@@ -454,6 +487,12 @@ impl BluetoothBackend for BluezBackend {
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
         tracing::debug!(%device_key, "resolving outgoing OBEX target");
         let (adapter, device) = self.find_device(device_key).await?;
+        let paired = bluez_result(device.is_paired().await, "read outgoing OBEX paired state")?;
+        let blocked = bluez_result(
+            device.is_blocked().await,
+            "read outgoing OBEX blocked state",
+        )?;
+        validate_obex_send_state(paired, blocked)?;
         Ok(ObexTarget {
             source: adapter
                 .address()
@@ -480,12 +519,14 @@ impl BluetoothBackend for BluezBackend {
     ) -> Result<Snapshot> {
         tracing::info!(%device_key, %operation, "Bluetooth device operation started");
         let (adapter, device) = self.find_device(device_key).await?;
+        let trust_after_pair = self.management.policy().trust_after_pair;
         run_device_operation(
             &adapter,
             &device,
             operation,
             params,
             self.fast_pair.as_deref(),
+            trust_after_pair,
         )
         .await?;
         if operation == DeviceOperation::Remove {
@@ -517,6 +558,24 @@ async fn find_adapter_address(
         "incoming OBEX adapter is unavailable",
     )
     .into())
+}
+
+fn validate_obex_send_state(paired: bool, blocked: bool) -> Result<()> {
+    if !paired {
+        return Err(BackendError::new(
+            BackendErrorKind::Rejected,
+            "outgoing transfers require a paired Bluetooth device",
+        )
+        .into());
+    }
+    if blocked {
+        return Err(BackendError::new(
+            BackendErrorKind::Rejected,
+            "outgoing transfers are disabled for blocked Bluetooth devices",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn parse_obex_address(value: &str, role: &str) -> Result<bluer::Address> {
@@ -629,9 +688,14 @@ async fn set_adapter_scanning(
     enabled: bool,
 ) -> Result<()> {
     if enabled {
-        if bluez_result(adapter.is_powered().await, "read adapter power")? {
-            backend.start_discovery(adapter).await?;
+        if !bluez_result(adapter.is_powered().await, "read adapter power")? {
+            return Err(BackendError::new(
+                BackendErrorKind::Rejected,
+                "Bluetooth discovery requires a powered adapter",
+            )
+            .into());
         }
+        backend.start_discovery(adapter).await?;
     } else {
         backend.stop_discovery(Some(adapter.name())).await;
     }
@@ -644,6 +708,7 @@ async fn run_device_operation(
     operation: DeviceOperation,
     params: &Value,
     fast_pair: Option<&FastPairBatteryProvider>,
+    default_trust_after_pair: bool,
 ) -> Result<()> {
     use DeviceOperation::{
         ProvisionFastPair, ResetAlias, SetAlias, SetBlocked, SetMultipoint, SetNoiseControl,
@@ -651,8 +716,13 @@ async fn run_device_operation(
     };
     match operation {
         DeviceOperation::Pair => {
-            pair_device(device, params).await?;
-            provision_after_pair(adapter, device, params, fast_pair).await
+            let trust_after_pair = trust_after_pair(params, default_trust_after_pair)?;
+            let public_key = params.optional_string("fast_pair_anti_spoofing_public_key")?;
+            if public_key.is_some() && fast_pair.is_none() {
+                bail!("Fast Pair provider is unavailable");
+            }
+            pair_device(device, trust_after_pair).await?;
+            provision_after_pair(adapter, device, public_key, fast_pair).await
         }
         DeviceOperation::Connect => connect_device(device, "connect Bluetooth device").await,
         DeviceOperation::Disconnect => {
@@ -720,13 +790,10 @@ async fn run_property_operation(
 async fn provision_after_pair(
     adapter: &BluezAdapter,
     device: &BluezDevice,
-    params: &Value,
+    public_key: Option<&str>,
     fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<()> {
-    if let Some(public_key) = params
-        .get("fast_pair_anti_spoofing_public_key")
-        .and_then(Value::as_str)
-    {
+    if let Some(public_key) = public_key {
         fast_pair
             .context("Fast Pair provider is unavailable")?
             .provision_account_key(adapter, device, public_key)
@@ -735,18 +802,18 @@ async fn provision_after_pair(
     Ok(())
 }
 
-async fn pair_device(device: &BluezDevice, params: &Value) -> Result<()> {
+fn trust_after_pair(params: &Value, default: bool) -> Result<bool> {
+    Ok(params.optional_bool("trust_after_pair")?.unwrap_or(default))
+}
+
+async fn pair_device(device: &BluezDevice, trust_after_pair: bool) -> Result<()> {
     operation_timeout(
         Duration::from_secs(75),
         "pair Bluetooth device",
         device.pair(),
     )
     .await?;
-    if params
-        .get("trust_after_pair")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
+    if trust_after_pair {
         device
             .set_trusted(true)
             .await
@@ -845,7 +912,7 @@ async fn operation_timeout<T>(
 mod tests {
     use crate::backend::{BackendError, BackendErrorKind};
 
-    use super::{bluez_result, opaque_key};
+    use super::{bluez_result, opaque_key, trust_after_pair, validate_obex_send_state};
 
     #[test]
     fn adapter_keys_are_opaque_and_deterministic() {
@@ -854,6 +921,19 @@ mod tests {
             opaque_key("adapter", "hci0:AA")
         );
         assert!(!opaque_key("adapter", "hci0:AA").contains("AA"));
+    }
+
+    #[test]
+    fn pairing_defaults_and_obex_policy_are_enforced() {
+        assert!(!trust_after_pair(&serde_json::json!({}), false).unwrap());
+        assert!(trust_after_pair(&serde_json::json!({ "trust_after_pair": true }), false).unwrap());
+        assert!(
+            trust_after_pair(&serde_json::json!({ "trust_after_pair": "false" }), true).is_err()
+        );
+
+        assert!(validate_obex_send_state(true, false).is_ok());
+        assert!(validate_obex_send_state(false, false).is_err());
+        assert!(validate_obex_send_state(true, true).is_err());
     }
 
     #[test]

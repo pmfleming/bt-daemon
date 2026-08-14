@@ -61,6 +61,7 @@ impl fmt::Display for BackendError {
 impl Error for BackendError {}
 
 pub(crate) trait Params {
+    fn optional_bool(&self, name: &str) -> Result<Option<bool>>;
     fn optional_string(&self, name: &str) -> Result<Option<&str>>;
     fn require_bool(&self, name: &str) -> Result<bool>;
     fn require_string(&self, name: &str) -> Result<&str>;
@@ -72,6 +73,18 @@ pub(crate) trait Params {
 }
 
 impl Params for Value {
+    fn optional_bool(&self, name: &str) -> Result<Option<bool>> {
+        match self.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(value)) => Ok(Some(*value)),
+            _ => Err(BackendError::new(
+                BackendErrorKind::InvalidInput,
+                format!("invalid optional boolean parameter '{name}'"),
+            )
+            .into()),
+        }
+    }
+
     fn optional_string(&self, name: &str) -> Result<Option<&str>> {
         match self.get(name) {
             None | Some(Value::Null) => Ok(None),
@@ -234,6 +247,22 @@ mod tests {
             None
         );
         assert!(params.require_bool("enabled").is_err());
+        assert_eq!(params.optional_bool("enabled").unwrap(), None);
+        assert!(
+            json!({ "enabled": "yes" })
+                .optional_bool("enabled")
+                .is_err()
+        );
+        assert_eq!(
+            json!({ "enabled": null }).optional_bool("enabled").unwrap(),
+            None
+        );
+        assert_eq!(
+            json!({ "enabled": false })
+                .optional_bool("enabled")
+                .unwrap(),
+            Some(false)
+        );
         assert!(params.require_u32("count").is_err());
     }
 }

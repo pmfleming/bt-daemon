@@ -14,10 +14,13 @@ lint:
 test:
     cargo test --all-features
 
-coverage:
-    cargo llvm-cov --all-features --fail-under-lines 30
+audit:
+    cargo audit
 
-check: fmt-check lint test coverage
+coverage:
+    cargo llvm-cov --all-features --fail-under-lines 34
+
+check: fmt-check lint test audit coverage
 
 probe:
     cargo run -- probe-bluez

@@ -58,6 +58,7 @@
           packages = with pkgs; [
             bluez
             cargo
+            cargo-audit
             cargo-llvm-cov
             clippy
             dbus

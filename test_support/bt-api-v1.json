@@ -233,7 +233,8 @@
         "events": [
           "requested",
           "display",
-          "cancelled"
+          "cancelled",
+          "lagged"
         ],
         "name": "pairing.request"
       },
@@ -242,7 +243,8 @@
           "started",
           "completed",
           "failed",
-          "cancelled"
+          "cancelled",
+          "lagged"
         ],
         "name": "bluetooth.operation"
       },
@@ -251,7 +253,8 @@
           "started",
           "completed",
           "failed",
-          "cancelled"
+          "cancelled",
+          "lagged"
         ],
         "name": "bluetooth.scan"
       },
@@ -262,7 +265,8 @@
           "progress",
           "completed",
           "failed",
-          "cancelled"
+          "cancelled",
+          "lagged"
         ],
         "name": "bluetooth.obex.transfer"
       },

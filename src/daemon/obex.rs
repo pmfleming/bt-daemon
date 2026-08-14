@@ -62,7 +62,13 @@ impl OutgoingTransfers {
             Ok(target) => target,
             Err(error) => {
                 tracing::warn!(%device_key, error = %error, error_chain = %format!("{error:#}"), "could not resolve outgoing OBEX target");
-                return api::error("device-unavailable", format!("{error:#}"));
+                let details = api::error_value(&error);
+                return json!({
+                    "protocol": api::PROTOCOL,
+                    "version": api::VERSION,
+                    "ok": false,
+                    "error": details,
+                });
             }
         };
         let transfer = match obex::start_file(&target.source, &target.destination, path).await {

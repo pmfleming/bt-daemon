@@ -21,6 +21,7 @@ type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
 
 struct TestBackend {
     complete: bool,
+    fail_scan_stop: bool,
     scanning: ScanningCalls,
 }
 
@@ -47,6 +48,9 @@ impl BluetoothBackend for TestBackend {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .push((adapter.map(str::to_string), enabled));
+        if !enabled && self.fail_scan_stop {
+            anyhow::bail!("simulated scan stop failure");
+        }
         self.snapshot().await
     }
 
@@ -89,7 +93,7 @@ fn test_adapter(key: &str) -> Adapter {
         address: "00:00:00:00:00:00".into(),
         address_type: "public".into(),
         powered: true,
-        discovering: false,
+        discovering: true,
         discoverable: false,
         pairable: true,
         discoverable_timeout: 0,
@@ -109,6 +113,7 @@ fn daemon(
     let (obex_events, _) = broadcast::channel(8);
     let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
         complete,
+        fail_scan_stop: false,
         scanning: Arc::new(StdMutex::new(Vec::new())),
     });
     let incoming_obex = crate::obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
@@ -205,6 +210,7 @@ async fn overlapping_global_scan_stops_only_uncovered_adapters() {
     let scanning = Arc::new(StdMutex::new(Vec::new()));
     let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
         complete: true,
+        fail_scan_stop: false,
         scanning: Arc::clone(&scanning),
     });
     let scans = ScanCoordinator::new(backend);
@@ -244,7 +250,7 @@ async fn scan_sessions_are_bounded_and_cancellable() {
     let response = daemon
         .scans
         .start(&json!({
-            "adapter_key": "adapter-opaque",
+            "adapter_key": "adapter-1",
             "enabled": true,
             "timeout_ms": 1000
         }))
@@ -255,4 +261,27 @@ async fn scan_sessions_are_bounded_and_cancellable() {
     assert_eq!(response["data"]["stopped"], request_id);
     assert_eq!(events.recv().await.unwrap().state, "cancelled");
     assert!(daemon.scans.is_empty().await);
+}
+
+#[tokio::test]
+async fn failed_scan_stop_is_reported_and_remains_retryable() {
+    let scanning = Arc::new(StdMutex::new(Vec::new()));
+    let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
+        complete: true,
+        fail_scan_stop: true,
+        scanning,
+    });
+    let scans = ScanCoordinator::new(backend);
+    let response = scans
+        .start(&json!({
+            "adapter_key": "adapter-1",
+            "enabled": true,
+            "timeout_ms": 60_000
+        }))
+        .await;
+    let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
+
+    let stopped = scans.stop(Some(request_id), "cancelled").await;
+    assert_eq!(stopped["error"]["code"], "scan-stop-failed");
+    assert!(scans.contains(request_id).await);
 }

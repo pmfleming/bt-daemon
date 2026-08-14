@@ -79,14 +79,17 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
 
 pub const STREAMS: &[(&str, &[&str])] = &[
     (stream::CHANGED, &["subscribed", "changed", "unavailable"]),
-    (stream::PAIRING, &["requested", "display", "cancelled"]),
+    (
+        stream::PAIRING,
+        &["requested", "display", "cancelled", "lagged"],
+    ),
     (
         stream::OPERATION,
-        &["started", "completed", "failed", "cancelled"],
+        &["started", "completed", "failed", "cancelled", "lagged"],
     ),
     (
         stream::SCAN,
-        &["started", "completed", "failed", "cancelled"],
+        &["started", "completed", "failed", "cancelled", "lagged"],
     ),
     (
         stream::OBEX,
@@ -97,6 +100,7 @@ pub const STREAMS: &[(&str, &[&str])] = &[
             "completed",
             "failed",
             "cancelled",
+            "lagged",
         ],
     ),
     (stream::AUDIO, &["subscribed", "changed", "unavailable"]),

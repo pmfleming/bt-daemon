@@ -126,16 +126,24 @@ impl ScanCoordinator {
             }
         };
         let snapshot = Arc::new(snapshot);
-        let adapter_keys = adapter_key.clone().map_or_else(
-            || {
-                snapshot
-                    .adapters
-                    .iter()
-                    .map(|adapter| adapter.key.clone())
-                    .collect()
-            },
-            |key| vec![key],
-        );
+        let adapter_keys = powered_adapter_keys(&snapshot, adapter_key.as_deref());
+        if adapter_keys.is_empty() {
+            tracing::warn!(
+                ?adapter_key,
+                "Bluetooth scan did not enter discovery on a powered adapter"
+            );
+            if let Err(error) = self
+                .backend
+                .set_scanning(adapter_key.as_deref(), false)
+                .await
+            {
+                tracing::warn!(%error, "could not roll back an unconfirmed Bluetooth scan start");
+            }
+            return api::error(
+                "scan-start-failed",
+                "Bluetooth discovery did not start on a powered adapter".to_string(),
+            );
+        }
         let request_id = format!("scan-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
         tracing::info!(%request_id, ?adapter_key, timeout_ms, "Bluetooth scan started");
         let running = ScanEvent {
@@ -172,30 +180,75 @@ impl ScanCoordinator {
         let events = self.events.clone();
         crate::task::spawn("scan-timeout", async move {
             tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-            let _transition = transition.lock().await;
-            let adapters = removable_adapters(&tasks, &task_id).await;
-            let result = crate::task::catch(
-                "Bluetooth scan completion",
-                stop_adapters(&backend, &adapters),
-            )
-            .await
-            .and_then(|result| result);
-            let terminal = terminal_event(task_id, task_adapter, result);
-            let _ = events.send(terminal);
+            let mut failure_emitted = false;
+            loop {
+                let _transition = transition.lock().await;
+                let Some(adapters) = removable_adapters(&tasks, &task_id).await else {
+                    return;
+                };
+                let result = crate::task::catch(
+                    "Bluetooth scan completion",
+                    stop_adapters(&backend, &adapters),
+                )
+                .await
+                .and_then(|result| result);
+                match result {
+                    Ok(snapshot) => {
+                        tasks.lock().await.remove(&task_id);
+                        if failure_emitted {
+                            tracing::info!(%task_id, "Bluetooth scan cleanup eventually succeeded");
+                        } else {
+                            let terminal = terminal_event(task_id, task_adapter, Ok(snapshot));
+                            let _ = events.send(terminal);
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        if !failure_emitted {
+                            let terminal =
+                                terminal_event(task_id.clone(), task_adapter.clone(), Err(error));
+                            let _ = events.send(terminal);
+                            failure_emitted = true;
+                        } else {
+                            tracing::warn!(%task_id, "Bluetooth scan cleanup is retrying");
+                        }
+                    }
+                }
+                drop(_transition);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         })
     }
 
     pub(super) async fn stop(&self, request_id: Option<&str>, event: &str) -> Value {
         let _transition = self.transition.lock().await;
-        let removed = {
-            let mut tasks = self.tasks.lock().await;
-            if let Some(request_id) = request_id {
-                tasks.remove(request_id).into_iter().collect::<Vec<_>>()
-            } else {
-                tasks.drain().map(|(_, task)| task).collect::<Vec<_>>()
-            }
+        let (selected_ids, adapters_to_stop) = {
+            let tasks = self.tasks.lock().await;
+            let selected_ids = match request_id {
+                Some(request_id) if tasks.contains_key(request_id) => vec![request_id.to_string()],
+                Some(_) => Vec::new(),
+                None => tasks.keys().cloned().collect::<Vec<_>>(),
+            };
+            let selected = selected_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            let active_adapters = tasks
+                .iter()
+                .filter(|(id, _)| !selected.contains(*id))
+                .flat_map(|(_, task)| task.event.adapter_keys.iter().cloned())
+                .collect::<std::collections::HashSet<_>>();
+            let adapters = selected_ids
+                .iter()
+                .filter_map(|id| tasks.get(id))
+                .flat_map(|task| task.event.adapter_keys.iter().cloned())
+                .filter(|adapter| !active_adapters.contains(adapter))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            (selected_ids, adapters)
         };
-        if removed.is_empty() {
+        if selected_ids.is_empty() {
             tracing::warn!(
                 ?request_id,
                 "Bluetooth scan stop did not match an active scan"
@@ -205,37 +258,28 @@ impl ScanCoordinator {
                 "No matching scan is active".to_string(),
             );
         }
-        tracing::info!(?request_id, count = removed.len(), %event, "stopping Bluetooth scan sessions");
-        let active_adapters = {
-            let tasks = self.tasks.lock().await;
-            tasks
-                .values()
-                .flat_map(|task| task.event.adapter_keys.iter().cloned())
-                .collect::<std::collections::HashSet<_>>()
-        };
-        let adapters_to_stop = removed
-            .iter()
-            .flat_map(|task| task.event.adapter_keys.iter().cloned())
-            .filter(|adapter| !active_adapters.contains(adapter))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        for task in &removed {
-            task.handle.abort();
-        }
+        tracing::info!(?request_id, count = selected_ids.len(), %event, "stopping Bluetooth scan sessions");
         let last_snapshot = match stop_adapters(&self.backend, &adapters_to_stop).await {
-            Ok(snapshot) => Some(Arc::new(snapshot)),
+            Ok(snapshot) => Arc::new(snapshot),
             Err(error) => {
-                tracing::warn!(%error, "could not stop Bluetooth discovery");
-                None
+                tracing::warn!(%error, error_chain = %format!("{error:#}"), "could not stop Bluetooth discovery");
+                return api::error("scan-stop-failed", format!("{error:#}"));
             }
         };
+        let removed = {
+            let mut tasks = self.tasks.lock().await;
+            selected_ids
+                .iter()
+                .filter_map(|id| tasks.remove(id))
+                .collect::<Vec<_>>()
+        };
         for task in removed {
+            task.handle.abort();
             let mut terminal = task.event;
             terminal.event = event.into();
             terminal.state = event.into();
             terminal.timeout_ms = None;
-            terminal.snapshot = last_snapshot.as_ref().map(Arc::clone);
+            terminal.snapshot = Some(Arc::clone(&last_snapshot));
             let _ = self.events.send(terminal);
         }
         api::success(json!({ "stopped": request_id, "snapshot": last_snapshot }))
@@ -250,20 +294,22 @@ impl ScanCoordinator {
 async fn removable_adapters(
     tasks: &Mutex<HashMap<String, ScanTask>>,
     request_id: &str,
-) -> Vec<String> {
-    let mut active = tasks.lock().await;
-    active.remove(request_id).map_or_else(Vec::new, |finished| {
+) -> Option<Vec<String>> {
+    let active = tasks.lock().await;
+    let finished = active.get(request_id)?;
+    Some(
         finished
             .event
             .adapter_keys
-            .into_iter()
+            .iter()
             .filter(|adapter| {
                 !active
-                    .values()
-                    .any(|task| task.event.adapter_keys.contains(adapter))
+                    .iter()
+                    .any(|(id, task)| id != request_id && task.event.adapter_keys.contains(adapter))
             })
-            .collect()
-    })
+            .cloned()
+            .collect(),
+    )
 }
 
 fn terminal_event(
@@ -293,6 +339,17 @@ fn terminal_event(
     }
 }
 
+fn powered_adapter_keys(snapshot: &crate::model::Snapshot, requested: Option<&str>) -> Vec<String> {
+    snapshot
+        .adapters
+        .iter()
+        .filter(|adapter| {
+            adapter.powered && adapter.discovering && requested.is_none_or(|key| adapter.key == key)
+        })
+        .map(|adapter| adapter.key.clone())
+        .collect()
+}
+
 async fn stop_adapters(
     backend: &Arc<dyn BluetoothBackend>,
     adapter_keys: &[String],
@@ -313,5 +370,50 @@ async fn stop_adapters(
             Some(snapshot) => Ok(snapshot),
             None => backend.snapshot().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::{Adapter, Snapshot};
+
+    use super::powered_adapter_keys;
+
+    fn adapter(key: &str, powered: bool, discovering: bool) -> Adapter {
+        Adapter {
+            key: key.into(),
+            name: key.into(),
+            alias: key.into(),
+            address: "00:00:00:00:00:00".into(),
+            address_type: "public".into(),
+            powered,
+            discovering,
+            discoverable: false,
+            pairable: true,
+            discoverable_timeout: 0,
+            pairable_timeout: 0,
+            modalias: None,
+        }
+    }
+
+    #[test]
+    fn scans_require_a_matching_powered_adapter() {
+        let snapshot = Snapshot {
+            adapters: vec![
+                adapter("adapter-off", false, false),
+                adapter("adapter-idle", true, false),
+                adapter("adapter-on", true, true),
+            ],
+            ..Snapshot::default()
+        };
+        assert_eq!(powered_adapter_keys(&snapshot, None), vec!["adapter-on"]);
+        assert!(powered_adapter_keys(&snapshot, Some("adapter-off")).is_empty());
+        assert!(powered_adapter_keys(&snapshot, Some("adapter-idle")).is_empty());
+        assert!(powered_adapter_keys(&snapshot, Some("adapter-missing")).is_empty());
+        assert_eq!(
+            powered_adapter_keys(&snapshot, Some("adapter-on")),
+            vec!["adapter-on"]
+        );
+        assert!(powered_adapter_keys(&Snapshot::default(), None).is_empty());
     }
 }

@@ -135,9 +135,11 @@ impl ManagementStore {
             .context("management update must be an object")?;
         validate_setting_names(object)?;
         let mut policy = self.policy_lock();
-        policy.apply(object)?;
-        self.persist_policy(&policy)?;
-        Ok(policy.clone())
+        let mut updated = policy.clone();
+        updated.apply(object)?;
+        self.persist_policy(&updated)?;
+        *policy = updated.clone();
+        Ok(updated)
     }
 
     pub fn remember_snapshot(&self, snapshot: &Snapshot) {
@@ -297,6 +299,22 @@ mod tests {
                 .is_err()
         );
         assert!(store.update(&json!({ "unknown": true })).is_err());
+    }
+
+    #[test]
+    fn invalid_updates_do_not_partially_mutate_the_live_policy() {
+        let store = ManagementStore::in_memory();
+        assert!(
+            store
+                .update(&json!({
+                    "launch_state": "disable",
+                    "reconnect_on_resume": "yes"
+                }))
+                .is_err()
+        );
+        let policy = store.policy();
+        assert_eq!(policy.launch_state, "remember");
+        assert!(policy.reconnect_on_resume);
     }
 
     #[test]
