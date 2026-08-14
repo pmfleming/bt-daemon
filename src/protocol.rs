@@ -2,7 +2,6 @@ use serde_json::{Value, json};
 
 pub const NAME: &str = "bt-api";
 pub const VERSION: u8 = 1;
-
 pub mod stream {
     pub const CHANGED: &str = "bluetooth.changed";
     pub const PAIRING: &str = "pairing.request";
@@ -125,8 +124,10 @@ pub fn registry() -> Value {
 
 /// Return the checked-in contract used by consumers and compatibility tests.
 pub fn contract_fixture() -> Value {
-    serde_json::from_str(include_str!("../test_support/bt-api-v1.json"))
-        .expect("checked-in protocol fixture must be valid JSON")
+    match serde_json::from_str(include_str!("../test_support/bt-api-v1.json")) {
+        Ok(fixture) => fixture,
+        Err(error) => json!({ "fixture_error": error.to_string() }),
+    }
 }
 
 #[cfg(test)]

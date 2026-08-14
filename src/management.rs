@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{model::Snapshot, state};
@@ -92,12 +92,8 @@ impl ManagementStore {
     }
 
     fn load(policy_path: Option<PathBuf>, runtime_path: Option<PathBuf>) -> Result<Self> {
-        let policy: ManagementPolicy = policy_path
-            .as_deref()
-            .map(|path| state::read_json(path, "Bluetooth management policy"))
-            .transpose()?
-            .flatten()
-            .unwrap_or_default();
+        let policy: ManagementPolicy =
+            load_state(policy_path.as_deref(), "Bluetooth management policy")?;
         if policy.version != POLICY_VERSION {
             bail!(
                 "unsupported Bluetooth management policy version {}",
@@ -105,12 +101,7 @@ impl ManagementStore {
             );
         }
         validate_launch_state(&policy.launch_state)?;
-        let runtime: RuntimeState = runtime_path
-            .as_deref()
-            .map(|path| state::read_json(path, "Bluetooth runtime state"))
-            .transpose()?
-            .flatten()
-            .unwrap_or_default();
+        let runtime: RuntimeState = load_state(runtime_path.as_deref(), "Bluetooth runtime state")?;
         if runtime.version != RUNTIME_VERSION {
             bail!(
                 "unsupported Bluetooth runtime state version {}",
@@ -223,6 +214,15 @@ impl RuntimeState {
     pub fn connected_device_keys(&self) -> &[String] {
         &self.connected_device_keys
     }
+}
+
+fn load_state<T: DeserializeOwned + Default>(
+    path: Option<&std::path::Path>,
+    description: &str,
+) -> Result<T> {
+    path.map(|path| state::read_json(path, description))
+        .transpose()
+        .map(|value| value.flatten().unwrap_or_default())
 }
 
 fn validate_setting_names(object: &serde_json::Map<String, Value>) -> Result<()> {

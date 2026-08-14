@@ -63,16 +63,10 @@ const RETRY_DELAY: Duration = Duration::from_secs(15);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ComponentReading {
-    percentage: u8,
-    charging: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BatteryReport {
-    left: Option<ComponentReading>,
-    right: Option<ComponentReading>,
-    case: Option<ComponentReading>,
+    left: Option<u8>,
+    right: Option<u8>,
+    case: Option<u8>,
 }
 
 impl BatteryReport {
@@ -98,11 +92,11 @@ impl BatteryReport {
         ]
         .into_iter()
         .filter_map(|(id, label, component, reading)| {
-            reading.map(|reading| Battery {
+            reading.map(|percentage| Battery {
                 id: id.to_string(),
                 label: label.to_string(),
                 component: component.to_string(),
-                percentage: reading.percentage,
+                percentage,
                 source: "google-fast-pair-message-stream".to_string(),
                 confidence: "high".to_string(),
             })
@@ -198,7 +192,7 @@ fn decode_address(payload: &[u8]) -> Result<Address> {
         .context("decode Fast Pair BLE address")
 }
 
-fn decode_component(value: u8) -> Result<Option<ComponentReading>> {
+fn decode_component(value: u8) -> Result<Option<u8>> {
     let percentage = value & 0x7f;
     if percentage == 0x7f {
         return Ok(None);
@@ -206,10 +200,7 @@ fn decode_component(value: u8) -> Result<Option<ComponentReading>> {
     if percentage > 100 {
         bail!("invalid Fast Pair battery percentage {percentage}");
     }
-    Ok(Some(ComponentReading {
-        percentage,
-        charging: value & 0x80 != 0,
-    }))
+    Ok(Some(percentage))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1336,9 +1327,9 @@ impl FastPairBatteryProvider {
         if changed {
             tracing::debug!(
                 %address,
-                left = ?report.left.map(|value| value.percentage),
-                right = ?report.right.map(|value| value.percentage),
-                case = ?report.case.map(|value| value.percentage),
+                left = ?report.left,
+                right = ?report.right,
+                case = ?report.case,
                 "Fast Pair component battery updated"
             );
             let _ = self.changes.send(());
@@ -1386,8 +1377,8 @@ impl FastPairBatteryProvider {
 mod tests {
     use super::{
         AUDIO_SWITCH_CAPABILITY_CODE, AUDIO_SWITCH_GROUP, BATTERY_UPDATED_CODE, BatteryReport,
-        ComponentReading, DEVICE_INFORMATION_GROUP, Frame, FrameDecoder, MAX_FRAME_PAYLOAD,
-        MessageStreamTransport, PsmAvailability, anc_mode_flag, crypt_block, decode_anc_state,
+        DEVICE_INFORMATION_GROUP, Frame, FrameDecoder, MAX_FRAME_PAYLOAD, MessageStreamTransport,
+        PsmAvailability, anc_mode_flag, crypt_block, decode_anc_state,
         decode_audio_switch_capability, decode_component, decode_message_stream_psm,
         derive_aes_key, message_mac, select_transport,
     };
@@ -1454,14 +1445,8 @@ mod tests {
     }
 
     #[test]
-    fn battery_values_decode_charging_and_unknown_states() {
-        assert_eq!(
-            decode_component(0xe4).unwrap(),
-            Some(ComponentReading {
-                percentage: 100,
-                charging: true
-            })
-        );
+    fn battery_values_mask_charging_and_decode_unknown_states() {
+        assert_eq!(decode_component(0xe4).unwrap(), Some(100));
         assert_eq!(decode_component(0x7f).unwrap(), None);
         assert_eq!(decode_component(0xff).unwrap(), None);
         assert!(decode_component(0x7e).is_err());

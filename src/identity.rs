@@ -252,6 +252,17 @@ mod tests {
         Battery::bluez_aggregate(percentage)
     }
 
+    fn component_battery(component: &str, percentage: u8) -> Vec<Battery> {
+        vec![Battery {
+            id: component.into(),
+            label: component.into(),
+            component: component.into(),
+            percentage,
+            source: "test".into(),
+            confidence: "standard".into(),
+        }]
+    }
+
     #[test]
     fn keys_are_opaque_and_stable_in_memory() {
         let registry = DeviceIdentityRegistry::in_memory();
@@ -315,14 +326,7 @@ mod tests {
     #[test]
     fn known_device_type_ignores_weaker_transient_observations() {
         let registry = DeviceIdentityRegistry::in_memory();
-        let component_battery = vec![Battery {
-            id: "left".into(),
-            label: "Left".into(),
-            component: "left".into(),
-            percentage: 80,
-            source: "test".into(),
-            confidence: "standard".into(),
-        }];
+        let component_battery = component_battery("left", 80);
         assert_eq!(
             registry
                 .remember_presentation("device-known", Some("audio-headset"), &component_battery)
@@ -346,14 +350,7 @@ mod tests {
                 .2,
             "Headphones"
         );
-        let component_battery = vec![Battery {
-            id: "right".into(),
-            label: "Right".into(),
-            component: "right".into(),
-            percentage: 75,
-            source: "test".into(),
-            confidence: "standard".into(),
-        }];
+        let component_battery = component_battery("right", 75);
         assert_eq!(
             registry
                 .remember_presentation("device-known", None, &component_battery)

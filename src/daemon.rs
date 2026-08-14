@@ -16,7 +16,7 @@ use tokio::{
 };
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
-use crate::{api, backend::BluetoothBackend, obex as bluez_obex, pairing::PairingBroker};
+use crate::{api, backend::BluetoothBackend, pairing::PairingBroker};
 
 pub const BUS_NAME: &str = "org.laufan.BluetoothDaemon";
 pub const OBJECT_PATH: &str = "/org/laufan/BluetoothDaemon";
@@ -32,7 +32,7 @@ mod operation;
 mod scan;
 mod subscription;
 
-use self::{obex::OutgoingTransfers, operation::OperationCoordinator, scan::ScanCoordinator};
+use self::{obex::ObexCoordinator, operation::OperationCoordinator, scan::ScanCoordinator};
 
 pub struct BluetoothDaemon {
     backend: Arc<dyn BluetoothBackend>,
@@ -42,9 +42,7 @@ pub struct BluetoothDaemon {
     operations: OperationCoordinator,
     scans: ScanCoordinator,
     audio_events: broadcast::Sender<()>,
-    obex_events: broadcast::Sender<crate::obex::ObexEvent>,
-    outgoing_obex: OutgoingTransfers,
-    incoming_obex: Arc<crate::obex::IncomingBroker>,
+    obex: Arc<ObexCoordinator>,
 }
 
 impl BluetoothDaemon {
@@ -55,9 +53,9 @@ impl BluetoothDaemon {
     async fn dispatch_call(&self, method: &str, params: Value) -> Value {
         match method {
             "bluetooth.scan" => self.scans.start(&params).await,
-            "bluetooth.obex.send" => self.outgoing_obex.start(&params).await,
-            "bluetooth.obex.respond" => obex::respond(&self.incoming_obex, &params).await,
-            "bluetooth.obex.snapshot" => self.obex_snapshot().await,
+            "bluetooth.obex.send" => self.obex.outgoing.start(&params).await,
+            "bluetooth.obex.respond" => obex::respond(&self.obex.incoming, &params).await,
+            "bluetooth.obex.snapshot" => self.obex.snapshot().await,
             "bluetooth.audio.snapshot" => audio::snapshot(Arc::clone(&self.pairing)).await,
             "bluetooth.audio.setProfile" => audio::set_profile(&self.pairing, &params).await,
             "bluetooth.device.operation" => self.operations.start(params).await,
@@ -66,20 +64,6 @@ impl BluetoothDaemon {
                 Err(error) => api::error("pairing-response-rejected", format!("{error:#}")),
             },
             _ => api::dispatch(Arc::clone(&self.backend), method, params).await,
-        }
-    }
-
-    async fn obex_snapshot(&self) -> Value {
-        match bluez_obex::probe(self.incoming_obex.is_available()).await {
-            Ok(capabilities) => api::success(json!({ "obex": capabilities })),
-            Err(error) => api::success(json!({ "obex": {
-                "available": false,
-                "outgoing_object_push": false,
-                "incoming_authorization": false,
-                "transfer_progress": false,
-                "cancellation": false,
-                "reason": format!("{error:#}"),
-            }})),
         }
     }
 }
@@ -137,13 +121,8 @@ impl BluetoothDaemon {
             return api::success(json!({ "cancelled": request_id, "kind": "operation" }))
                 .to_string();
         }
-        if self.outgoing_obex.cancel(request_id).await {
-            return api::success(json!({ "cancelled": request_id, "kind": "obex-transfer" }))
-                .to_string();
-        }
-        if self.incoming_obex.cancel_transfer(request_id).await {
-            return api::success(json!({ "cancelled": request_id, "kind": "obex-transfer" }))
-                .to_string();
+        if let Some(kind) = self.obex.cancel(request_id).await {
+            return api::success(json!({ "cancelled": request_id, "kind": kind })).to_string();
         }
         tracing::warn!(%request_id, "cancellation target was not found");
         api::error(
@@ -240,11 +219,9 @@ async fn emit_audio(
 
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
     let (audio_events, _) = broadcast::channel(32);
-    let (obex_events, _) = broadcast::channel(32);
     let operations = OperationCoordinator::new(Arc::clone(&backend));
     let scans = ScanCoordinator::new(Arc::clone(&backend));
-    let outgoing_obex = OutgoingTransfers::new(Arc::clone(&backend), obex_events.clone());
-    let incoming_obex = bluez_obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
+    let obex = ObexCoordinator::new(Arc::clone(&backend));
     audio::start_monitor(audio_events.clone())?;
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
@@ -260,25 +237,16 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
                 operations,
                 scans,
                 audio_events,
-                obex_events,
-                outgoing_obex,
-                incoming_obex: Arc::clone(&incoming_obex),
+                obex: Arc::clone(&obex),
             },
         )
         .context("export bt-daemon D-Bus interface")?
-        .serve_at(
-            bluez_obex::AGENT_PATH,
-            bluez_obex::ObexAgent::new(Arc::clone(&incoming_obex)),
-        )
+        .serve_at(obex::AGENT_PATH, obex.agent())
         .context("export incoming OBEX agent")?
         .build()
         .await
         .context("start bt-daemon D-Bus service")?;
-    incoming_obex.set_connection(connection.clone());
-    if let Err(error) = bluez_obex::register_agent(&connection, &incoming_obex).await {
-        tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "incoming OBEX authorization is unavailable");
-    }
-    bluez_obex::monitor_agent_owner(connection, incoming_obex);
+    obex.activate(connection).await;
     tracing::info!(
         bus_name = BUS_NAME,
         object_path = OBJECT_PATH,

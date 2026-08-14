@@ -3,9 +3,7 @@ use std::sync::Arc;
 use anyhow::Error;
 use serde_json::{Value, json};
 
-use crate::backend::{
-    AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation, Params,
-};
+use crate::backend::{AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, Params};
 
 pub use crate::protocol::{NAME as PROTOCOL, VERSION};
 
@@ -15,19 +13,11 @@ enum BackendRequest<'a> {
         adapter_key: Option<&'a str>,
         powered: bool,
     },
-    SetScanning {
-        adapter_key: Option<&'a str>,
-        enabled: bool,
-    },
     AdapterOperation {
         key: &'a str,
         operation: AdapterOperation,
     },
     UpdateManagement,
-    DeviceOperation {
-        key: &'a str,
-        operation: DeviceOperation,
-    },
 }
 
 impl BackendRequest<'_> {
@@ -42,17 +32,10 @@ impl BackendRequest<'_> {
                 adapter_key,
                 powered,
             } => backend.set_powered(adapter_key, powered).await,
-            Self::SetScanning {
-                adapter_key,
-                enabled,
-            } => backend.set_scanning(adapter_key, enabled).await,
             Self::AdapterOperation { key, operation } => {
                 backend.adapter_operation(key, operation, params).await
             }
             Self::UpdateManagement => backend.update_management(params).await,
-            Self::DeviceOperation { key, operation } => {
-                backend.device_operation(key, operation, params).await
-            }
         }
     }
 }
@@ -90,19 +73,11 @@ fn parse_backend_request<'a>(method: &str, params: &'a Value) -> Result<BackendR
             adapter_key: adapter_key()?,
             powered: params.require_bool("powered").map_err(validation_error)?,
         }),
-        "bluetooth.scan" => Ok(BackendRequest::SetScanning {
-            adapter_key: adapter_key()?,
-            enabled: params.require_bool("enabled").map_err(validation_error)?,
-        }),
         "bluetooth.adapter.operation" => {
             let (key, operation) = typed_operation(params).map_err(validation_error)?;
             Ok(BackendRequest::AdapterOperation { key, operation })
         }
         "bluetooth.management.update" => Ok(BackendRequest::UpdateManagement),
-        "bluetooth.device.operation" => {
-            let (key, operation) = typed_operation(params).map_err(validation_error)?;
-            Ok(BackendRequest::DeviceOperation { key, operation })
-        }
         _ => Err(error(
             "unsupported-method",
             format!("Unsupported bt-api method: {method}"),

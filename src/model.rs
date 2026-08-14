@@ -23,7 +23,7 @@ pub struct RadioState {
     pub hard_blocked: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Adapter {
     pub key: String,
     pub name: String,

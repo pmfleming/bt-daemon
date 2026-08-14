@@ -400,21 +400,8 @@ fn device_capabilities(
     has_fast_pair: bool,
     fast_pair: Option<&crate::model::FastPairFeatures>,
 ) -> DeviceCapabilities {
-    let can_provision_fast_pair = paired
-        && connected
-        && has_fast_pair
-        && fast_pair.is_some_and(|features| {
-            features.model_id.is_some() && !features.authenticated_controls
-        });
-    let authenticated = fast_pair.is_some_and(|features| features.authenticated_controls);
-    let can_set_multipoint = authenticated
-        && fast_pair
-            .and_then(|features| features.multipoint)
-            .is_some_and(|multipoint| multipoint.supported && multipoint.configurable);
-    let can_set_noise_control = authenticated
-        && fast_pair
-            .and_then(|features| features.noise_control.as_ref())
-            .is_some_and(|noise| !noise.settable_modes.is_empty());
+    let (can_provision_fast_pair, can_set_multipoint, can_set_noise_control) =
+        fast_pair_capabilities(paired, connected, has_fast_pair, fast_pair);
     DeviceCapabilities {
         can_pair: !paired && !blocked,
         can_connect: !connected && !blocked,
@@ -437,6 +424,30 @@ fn device_capabilities(
             can_set_noise_control,
         ),
     }
+}
+
+fn fast_pair_capabilities(
+    paired: bool,
+    connected: bool,
+    has_fast_pair: bool,
+    features: Option<&crate::model::FastPairFeatures>,
+) -> (bool, bool, bool) {
+    let authenticated = features.is_some_and(|features| features.authenticated_controls);
+    let provision = paired
+        && connected
+        && has_fast_pair
+        && features.is_some_and(|features| {
+            features.model_id.is_some() && !features.authenticated_controls
+        });
+    let multipoint = authenticated
+        && features
+            .and_then(|features| features.multipoint)
+            .is_some_and(|multipoint| multipoint.supported && multipoint.configurable);
+    let noise_control = authenticated
+        && features
+            .and_then(|features| features.noise_control.as_ref())
+            .is_some_and(|noise| !noise.settable_modes.is_empty());
+    (provision, multipoint, noise_control)
 }
 
 fn unsupported_reasons(

@@ -76,7 +76,7 @@ pub(super) async fn start(
     let pairing_events = daemon.pairing.subscribe();
     let operation_events = daemon.operations.subscribe();
     let scan_events = daemon.scans.subscribe();
-    let obex_events = daemon.obex_events.subscribe();
+    let obex_events = daemon.obex.subscribe();
     let changes = daemon.backend.subscribe_changes();
     let audio_events = daemon.audio_events.subscribe();
 

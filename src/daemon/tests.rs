@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::{
-    BluetoothDaemon, OperationCoordinator, OutgoingTransfers, ScanCoordinator,
+    BluetoothDaemon, ObexCoordinator, OperationCoordinator, ScanCoordinator,
     operation::OperationEvent, scan::ScanEvent,
 };
 
@@ -90,16 +90,24 @@ fn test_adapter(key: &str) -> Adapter {
         key: key.into(),
         name: key.into(),
         alias: key.into(),
-        address: "00:00:00:00:00:00".into(),
         address_type: "public".into(),
         powered: true,
         discovering: true,
-        discoverable: false,
         pairable: true,
-        discoverable_timeout: 0,
-        pairable_timeout: 0,
-        modalias: None,
+        ..Adapter::default()
     }
+}
+
+fn test_backend(
+    complete: bool,
+    fail_scan_stop: bool,
+    scanning: ScanningCalls,
+) -> Arc<dyn BluetoothBackend> {
+    Arc::new(TestBackend {
+        complete,
+        fail_scan_stop,
+        scanning,
+    })
 }
 
 fn daemon(
@@ -110,18 +118,12 @@ fn daemon(
     broadcast::Receiver<ScanEvent>,
 ) {
     let (audio_events, _) = broadcast::channel(8);
-    let (obex_events, _) = broadcast::channel(8);
-    let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
-        complete,
-        fail_scan_stop: false,
-        scanning: Arc::new(StdMutex::new(Vec::new())),
-    });
-    let incoming_obex = crate::obex::IncomingBroker::new(Arc::clone(&backend), obex_events.clone());
+    let backend = test_backend(complete, false, Arc::new(StdMutex::new(Vec::new())));
     let operations = OperationCoordinator::new(Arc::clone(&backend));
     let receiver = operations.subscribe();
     let scans = ScanCoordinator::new(Arc::clone(&backend));
     let scan_receiver = scans.subscribe();
-    let outgoing_obex = OutgoingTransfers::new(Arc::clone(&backend), obex_events.clone());
+    let obex = ObexCoordinator::new(Arc::clone(&backend));
     (
         BluetoothDaemon {
             backend,
@@ -131,9 +133,7 @@ fn daemon(
             operations,
             scans,
             audio_events,
-            obex_events,
-            outgoing_obex,
-            incoming_obex,
+            obex,
         },
         receiver,
         scan_receiver,
@@ -144,6 +144,16 @@ async fn start_operation(daemon: &BluetoothDaemon, operation: &str) -> Value {
     daemon
         .operations
         .start(json!({ "key": "device-opaque", "operation": operation }))
+        .await
+}
+
+async fn start_scan(scans: &ScanCoordinator, adapter: &str, timeout_ms: u64) -> Value {
+    scans
+        .start(&json!({
+            "adapter_key": adapter,
+            "enabled": true,
+            "timeout_ms": timeout_ms
+        }))
         .await
 }
 
@@ -203,28 +213,19 @@ async fn scan_rejects_malformed_optional_parameters() {
     assert_eq!(response["error"]["code"], "validation-error");
     let response = daemon.scans.start(&json!({ "enabled": "yes" })).await;
     assert_eq!(response["error"]["code"], "validation-error");
+    assert_eq!(daemon.obex.cancel("missing-transfer").await, None);
 }
 
 #[tokio::test]
 async fn overlapping_global_scan_stops_only_uncovered_adapters() {
     let scanning = Arc::new(StdMutex::new(Vec::new()));
-    let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
-        complete: true,
-        fail_scan_stop: false,
-        scanning: Arc::clone(&scanning),
-    });
+    let backend = test_backend(true, false, Arc::clone(&scanning));
     let scans = ScanCoordinator::new(backend);
     let global = scans
         .start(&json!({ "enabled": true, "timeout_ms": 60_000 }))
         .await;
     let global_id = global["data"]["scan"]["request_id"].as_str().unwrap();
-    let targeted = scans
-        .start(&json!({
-            "adapter_key": "adapter-1",
-            "enabled": true,
-            "timeout_ms": 60_000
-        }))
-        .await;
+    let targeted = start_scan(&scans, "adapter-1", 60_000).await;
     let targeted_id = targeted["data"]["scan"]["request_id"].as_str().unwrap();
 
     scans.stop(Some(global_id), "cancelled").await;
@@ -247,14 +248,7 @@ async fn overlapping_global_scan_stops_only_uncovered_adapters() {
 #[tokio::test]
 async fn scan_sessions_are_bounded_and_cancellable() {
     let (daemon, _, mut events) = daemon(true);
-    let response = daemon
-        .scans
-        .start(&json!({
-            "adapter_key": "adapter-1",
-            "enabled": true,
-            "timeout_ms": 1000
-        }))
-        .await;
+    let response = start_scan(&daemon.scans, "adapter-1", 1000).await;
     let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
     assert_eq!(events.recv().await.unwrap().state, "running");
     let response: Value = serde_json::from_str(&daemon.cancel(request_id).await).unwrap();
@@ -266,19 +260,9 @@ async fn scan_sessions_are_bounded_and_cancellable() {
 #[tokio::test]
 async fn failed_scan_stop_is_reported_and_remains_retryable() {
     let scanning = Arc::new(StdMutex::new(Vec::new()));
-    let backend: Arc<dyn BluetoothBackend> = Arc::new(TestBackend {
-        complete: true,
-        fail_scan_stop: true,
-        scanning,
-    });
+    let backend = test_backend(true, true, scanning);
     let scans = ScanCoordinator::new(backend);
-    let response = scans
-        .start(&json!({
-            "adapter_key": "adapter-1",
-            "enabled": true,
-            "timeout_ms": 60_000
-        }))
-        .await;
+    let response = start_scan(&scans, "adapter-1", 60_000).await;
     let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
 
     let stopped = scans.stop(Some(request_id), "cancelled").await;

@@ -12,6 +12,58 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use crate::backend::Params;
 use crate::{api, backend::BluetoothBackend, obex};
 
+pub(super) const AGENT_PATH: &str = obex::AGENT_PATH;
+pub(super) use crate::obex::ObexEvent;
+pub(super) struct ObexCoordinator {
+    pub(super) outgoing: OutgoingTransfers,
+    pub(super) incoming: Arc<obex::IncomingBroker>,
+}
+
+impl ObexCoordinator {
+    pub(super) fn new(backend: Arc<dyn BluetoothBackend>) -> Arc<Self> {
+        let (events, _) = broadcast::channel(32);
+        Arc::new(Self {
+            outgoing: OutgoingTransfers::new(Arc::clone(&backend), events.clone()),
+            incoming: obex::IncomingBroker::new(backend, events.clone()),
+        })
+    }
+
+    pub(super) fn subscribe(&self) -> broadcast::Receiver<ObexEvent> {
+        self.outgoing.events.subscribe()
+    }
+
+    pub(super) fn agent(&self) -> obex::ObexAgent {
+        obex::ObexAgent::new(Arc::clone(&self.incoming))
+    }
+
+    pub(super) async fn activate(&self, connection: zbus::Connection) {
+        self.incoming.set_connection(connection.clone());
+        if let Err(error) = obex::register_agent(&connection, &self.incoming).await {
+            tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "incoming OBEX authorization is unavailable");
+        }
+        obex::monitor_agent_owner(connection, Arc::clone(&self.incoming));
+    }
+
+    pub(super) async fn snapshot(&self) -> Value {
+        match obex::probe(self.incoming.is_available()).await {
+            Ok(capabilities) => api::success(json!({ "obex": capabilities })),
+            Err(error) => api::success(json!({ "obex": {
+                "available": false,
+                "outgoing_object_push": false,
+                "incoming_authorization": false,
+                "transfer_progress": false,
+                "cancellation": false,
+                "reason": format!("{error:#}"),
+            }})),
+        }
+    }
+
+    pub(super) async fn cancel(&self, request_id: &str) -> Option<&'static str> {
+        (self.outgoing.cancel(request_id).await || self.incoming.cancel_transfer(request_id).await)
+            .then_some("obex-transfer")
+    }
+}
+
 pub(super) async fn respond(incoming: &obex::IncomingBroker, params: &Value) -> Value {
     let request = params
         .require_string("request_id")

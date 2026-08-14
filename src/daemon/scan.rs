@@ -382,17 +382,9 @@ mod tests {
     fn adapter(key: &str, powered: bool, discovering: bool) -> Adapter {
         Adapter {
             key: key.into(),
-            name: key.into(),
-            alias: key.into(),
-            address: "00:00:00:00:00:00".into(),
-            address_type: "public".into(),
             powered,
             discovering,
-            discoverable: false,
-            pairable: true,
-            discoverable_timeout: 0,
-            pairable_timeout: 0,
-            modalias: None,
+            ..Adapter::default()
         }
     }
 

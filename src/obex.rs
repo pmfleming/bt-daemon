@@ -773,12 +773,7 @@ async fn monitor_incoming(
         size: event.size,
     };
     current.apply(&initial);
-    event.status.clone_from(&current.status);
-    event.transferred = current.transferred;
-    event.size = current.size;
-    event.event = lifecycle_event(&event.status).into();
-    tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
-    let _ = events.send(event.clone());
+    publish_transfer_update(&mut event, &current, events);
     while !current.terminal() {
         tokio::select! {
             _ = &mut cancel => {
@@ -793,11 +788,7 @@ async fn monitor_incoming(
                 let args = signal.args()?;
                 if args.interface_name() != TRANSFER_INTERFACE { continue; }
                 current.apply_changed(args.changed_properties());
-                event.status.clone_from(&current.status);
-                event.transferred = current.transferred;
-                event.event = lifecycle_event(&event.status).into();
-                tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
-                let _ = events.send(event.clone());
+                publish_transfer_update(&mut event, &current, events);
             }
         }
     }
@@ -805,6 +796,19 @@ async fn monitor_incoming(
         bail!("incoming OBEX transfer failed");
     }
     Ok(())
+}
+
+fn publish_transfer_update(
+    event: &mut ObexEvent,
+    update: &TransferUpdate,
+    events: &broadcast::Sender<ObexEvent>,
+) {
+    event.status.clone_from(&update.status);
+    event.transferred = update.transferred;
+    event.size = update.size;
+    event.event = lifecycle_event(&event.status).into();
+    tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
+    let _ = events.send(event.clone());
 }
 
 pub(crate) fn lifecycle_event(status: &str) -> &'static str {
@@ -936,8 +940,8 @@ mod tests {
     use crate::backend::ObexRemote;
 
     use super::{
-        IncomingDetails, incoming_event, lifecycle_event, reserve_incoming_destination_in,
-        safe_file_name, validate_outgoing_path,
+        IncomingDetails, TransferUpdate, incoming_event, lifecycle_event, publish_transfer_update,
+        reserve_incoming_destination_in, safe_file_name, validate_outgoing_path,
     };
 
     #[test]
@@ -987,6 +991,18 @@ mod tests {
         assert_eq!(event.device_key, "device-1");
         assert_eq!(event.size, 2048);
         assert_eq!(event.timeout_ms, Some(60_000));
+        let (events, mut receiver) = tokio::sync::broadcast::channel(1);
+        let mut event = event;
+        publish_transfer_update(
+            &mut event,
+            &TransferUpdate {
+                status: "active".into(),
+                transferred: 512,
+                size: 2048,
+            },
+            &events,
+        );
+        assert_eq!(receiver.try_recv().unwrap().transferred, 512);
         assert_eq!(lifecycle_event("complete"), "completed");
         assert_eq!(lifecycle_event("active"), "progress");
     }
