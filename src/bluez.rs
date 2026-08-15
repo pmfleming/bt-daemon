@@ -20,7 +20,7 @@ use tokio::{
 use crate::{
     backend::{
         AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
-        ObexRemote, ObexTarget, Params,
+        ObexRemote, ObexTarget, OperationProgress, Params,
     },
     fast_pair::FastPairBatteryProvider,
     identity::DeviceIdentityRegistry,
@@ -211,6 +211,39 @@ impl BluezBackend {
             Err(_) => tracing::warn!(%device_key, "Bluetooth reconnect timed out"),
         }
         Ok(())
+    }
+
+    async fn ensure_operation_adapter_powered(
+        &self,
+        adapter: &BluezAdapter,
+        params: &Value,
+        progress: &OperationProgress,
+    ) -> Result<()> {
+        let power_on = params.optional_bool("power_on")?.unwrap_or(true);
+        if bluez_result(adapter.is_powered().await, "read operation adapter power")? {
+            return Ok(());
+        }
+        if !power_on {
+            return Err(BackendError::new(
+                BackendErrorKind::Rejected,
+                "Bluetooth adapter is powered off and power_on is disabled",
+            )
+            .into());
+        }
+        progress("powering-on");
+        let before = self.snapshot().await?;
+        if before.radio.hard_blocked {
+            return Err(BackendError::new(
+                BackendErrorKind::Rejected,
+                "Bluetooth is disabled by a hardware radio switch",
+            )
+            .into());
+        }
+        unblock_rfkill(&before, false)?;
+        adapter
+            .set_powered(true)
+            .await
+            .backend_context("power adapter for Bluetooth device operation")
     }
 
     async fn set_one_adapter_power(&self, key: &str, powered: bool) -> Result<()> {
@@ -481,9 +514,14 @@ impl BluetoothBackend for BluezBackend {
         device_key: &str,
         operation: DeviceOperation,
         params: &Value,
+        progress: OperationProgress,
     ) -> Result<Snapshot> {
         tracing::info!(%device_key, %operation, "Bluetooth device operation started");
         let (adapter, device) = self.find_device(device_key).await?;
+        if matches!(operation, DeviceOperation::Pair | DeviceOperation::Connect) {
+            self.ensure_operation_adapter_powered(&adapter, params, &progress)
+                .await?;
+        }
         let trust_after_pair = self.management.policy().trust_after_pair;
         run_device_operation(
             &adapter,
@@ -492,6 +530,7 @@ impl BluetoothBackend for BluezBackend {
             params,
             self.fast_pair.as_deref(),
             trust_after_pair,
+            &progress,
         )
         .await?;
         if operation == DeviceOperation::Remove {
@@ -713,6 +752,7 @@ async fn run_device_operation(
     params: &Value,
     fast_pair: Option<&FastPairBatteryProvider>,
     default_trust_after_pair: bool,
+    progress: &OperationProgress,
 ) -> Result<()> {
     use DeviceOperation::{
         ProvisionFastPair, ResetAlias, SetAlias, SetBlocked, SetMultipoint, SetNoiseControl,
@@ -720,9 +760,17 @@ async fn run_device_operation(
     };
     match operation {
         DeviceOperation::Pair => {
-            pair_with_policy(adapter, device, params, fast_pair, default_trust_after_pair).await
+            pair_with_policy(
+                adapter,
+                device,
+                params,
+                fast_pair,
+                default_trust_after_pair,
+                progress,
+            )
+            .await
         }
-        DeviceOperation::Connect => connect_device(device, "connect Bluetooth device").await,
+        DeviceOperation::Connect => connect_workflow(device, params, progress).await,
         DeviceOperation::Disconnect => {
             disconnect_device(device, "disconnect Bluetooth device").await
         }
@@ -742,6 +790,7 @@ async fn pair_with_policy(
     params: &Value,
     fast_pair: Option<&FastPairBatteryProvider>,
     default_trust_after_pair: bool,
+    progress: &OperationProgress,
 ) -> Result<()> {
     let trust_after_pair = params
         .optional_bool("trust_after_pair")?
@@ -750,7 +799,7 @@ async fn pair_with_policy(
     if public_key.is_some() && fast_pair.is_none() {
         bail!("Fast Pair provider is unavailable");
     }
-    pair_device(device, trust_after_pair).await?;
+    pair_device(device, trust_after_pair, progress).await?;
     provision_after_pair(adapter, device, public_key, fast_pair).await
 }
 
@@ -831,7 +880,12 @@ async fn provision_after_pair(
     Ok(())
 }
 
-async fn pair_device(device: &BluezDevice, trust_after_pair: bool) -> Result<()> {
+async fn pair_device(
+    device: &BluezDevice,
+    trust_after_pair: bool,
+    progress: &OperationProgress,
+) -> Result<()> {
+    progress("pairing");
     operation_timeout(
         Duration::from_secs(75),
         "pair Bluetooth device",
@@ -839,15 +893,67 @@ async fn pair_device(device: &BluezDevice, trust_after_pair: bool) -> Result<()>
     )
     .await?;
     if trust_after_pair {
+        progress("trusting");
         device
             .set_trusted(true)
             .await
             .backend_context("trust paired Bluetooth device")?;
     }
     if !bluez_result(device.is_connected().await, "read device connected state")? {
+        progress("connecting");
         connect_device(device, "connect paired Bluetooth device").await?;
     }
+    progress("resolving-services");
+    wait_for_services(device).await;
     Ok(())
+}
+
+async fn connect_workflow(
+    device: &BluezDevice,
+    params: &Value,
+    progress: &OperationProgress,
+) -> Result<()> {
+    if params.optional_bool("trust")?.unwrap_or(false)
+        && bluez_result(
+            device.is_paired().await,
+            "read connect device pairing state",
+        )?
+        && !bluez_result(device.is_trusted().await, "read connect device trust state")?
+    {
+        progress("trusting");
+        device
+            .set_trusted(true)
+            .await
+            .backend_context("trust Bluetooth device before connecting")?;
+    }
+    progress("connecting");
+    connect_device(device, "connect Bluetooth device").await?;
+    if params.optional_bool("wait_for_services")?.unwrap_or(true) {
+        progress("resolving-services");
+        wait_for_services(device).await;
+    }
+    Ok(())
+}
+
+async fn wait_for_services(device: &BluezDevice) {
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match device.is_services_resolved().await {
+                Ok(true) => return,
+                Ok(false) => tokio::time::sleep(Duration::from_millis(200)).await,
+                Err(error) => {
+                    tracing::debug!(%error, "could not read Bluetooth service-resolution state");
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    if result.is_err() {
+        tracing::debug!(
+            "Bluetooth service resolution did not complete before the workflow deadline"
+        );
+    }
 }
 
 async fn connect_device(device: &BluezDevice, operation: &'static str) -> Result<()> {

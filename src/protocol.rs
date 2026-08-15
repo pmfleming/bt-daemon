@@ -64,7 +64,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
     ),
     (
         "bluetooth.device.operation",
-        r#"{"key":"device-opaque","operation":"connect"}"#,
+        r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#,
         "operation",
         Some(stream::OPERATION),
     ),
@@ -84,7 +84,14 @@ pub const STREAMS: &[(&str, &[&str])] = &[
     ),
     (
         stream::OPERATION,
-        &["started", "completed", "failed", "cancelled", "lagged"],
+        &[
+            "started",
+            "progress",
+            "completed",
+            "failed",
+            "cancelled",
+            "lagged",
+        ],
     ),
     (
         stream::SCAN,

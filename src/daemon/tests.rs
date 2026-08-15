@@ -6,7 +6,10 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::{
-    backend::{AdapterOperation, BluetoothBackend, DeviceOperation, ObexRemote, ObexTarget},
+    backend::{
+        AdapterOperation, BluetoothBackend, DeviceOperation, ObexRemote, ObexTarget,
+        OperationProgress,
+    },
     identity::DeviceIdentityRegistry,
     model::{Adapter, Snapshot},
     pairing::PairingBroker,
@@ -76,7 +79,14 @@ impl BluetoothBackend for TestBackend {
         })
     }
 
-    async fn device_operation(&self, _: &str, _: DeviceOperation, _: &Value) -> Result<Snapshot> {
+    async fn device_operation(
+        &self,
+        _: &str,
+        _: DeviceOperation,
+        _: &Value,
+        progress: OperationProgress,
+    ) -> Result<Snapshot> {
+        progress("connecting");
         if self.complete {
             self.snapshot().await
         } else {
@@ -177,6 +187,9 @@ async fn operation_emits_started_and_completed_events() {
     let response = start_operation(&daemon, "connect").await;
     assert_eq!(response["data"]["operation"]["state"], "queued");
     assert_eq!(events.recv().await.unwrap().event, "started");
+    let progress = events.recv().await.unwrap();
+    assert_eq!(progress.event, "progress");
+    assert_eq!(progress.stage, "connecting");
     assert_eq!(events.recv().await.unwrap().event, "completed");
     assert!(daemon.operations.is_empty().await);
 }
@@ -191,8 +204,10 @@ async fn active_operation_can_be_cancelled() {
     assert_eq!(events.recv().await.unwrap().event, "started");
     let response: Value = serde_json::from_str(&daemon.cancel(request_id).await).unwrap();
     assert_eq!(response["data"]["kind"], "operation");
-    let cancelled = events.recv().await.unwrap();
-    assert_eq!(cancelled.event, "cancelled");
+    let mut cancelled = events.recv().await.unwrap();
+    while cancelled.event != "cancelled" {
+        cancelled = events.recv().await.unwrap();
+    }
     assert_eq!(cancelled.request_id, request_id);
 }
 

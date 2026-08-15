@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -6,6 +6,8 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::model::Snapshot;
+
+pub type OperationProgress = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendErrorKind {
@@ -226,6 +228,7 @@ pub trait BluetoothBackend: Send + Sync {
         device_key: &str,
         operation: DeviceOperation,
         params: &Value,
+        progress: OperationProgress,
     ) -> Result<Snapshot>;
 }
 

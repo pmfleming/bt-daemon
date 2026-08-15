@@ -85,6 +85,7 @@
       "event": "completed",
       "operation": "connect",
       "request_id": "operation-1",
+      "stage": "completed",
       "state": "completed"
     },
     "event": "completed",
@@ -203,7 +204,10 @@
         "name": "bluetooth.device.operation",
         "params_example": {
           "key": "device-opaque",
-          "operation": "connect"
+          "operation": "connect",
+          "power_on": true,
+          "trust": false,
+          "wait_for_services": true
         },
         "response_key": "operation",
         "stream": "bluetooth.operation"
@@ -241,6 +245,7 @@
       {
         "events": [
           "started",
+          "progress",
           "completed",
           "failed",
           "cancelled",

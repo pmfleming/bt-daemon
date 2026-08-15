@@ -25,6 +25,7 @@ pub(super) struct OperationEvent {
     device_key: String,
     operation: String,
     state: String,
+    pub(super) stage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<crate::model::Snapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,6 +40,7 @@ impl OperationEvent {
             device_key,
             operation,
             state: "queued".into(),
+            stage: "queued".into(),
             snapshot: None,
             error: None,
         }
@@ -48,6 +50,16 @@ impl OperationEvent {
         Self {
             event: event.into(),
             state: state.into(),
+            stage: state.into(),
+            ..self.clone()
+        }
+    }
+
+    fn progress(&self, stage: &str) -> Self {
+        Self {
+            event: "progress".into(),
+            state: "running".into(),
+            stage: stage.into(),
             ..self.clone()
         }
     }
@@ -64,6 +76,7 @@ impl OperationEvent {
         }
         .into();
         self.state.clone_from(&self.event);
+        self.stage.clone_from(&self.event);
         self
     }
 }
@@ -140,9 +153,14 @@ impl OperationCoordinator {
             }
             tracing::info!(request_id = %task_event.request_id, device_key = %task_event.device_key, operation = %task_operation, "Bluetooth device operation started");
             let _ = events.send(task_event.with_state("started", "running"));
+            let progress_events = events.clone();
+            let progress_event = task_event.clone();
+            let progress = Arc::new(move |stage: &'static str| {
+                let _ = progress_events.send(progress_event.progress(stage));
+            });
             let result = crate::task::catch(
                 "Bluetooth backend device operation",
-                backend.device_operation(&task_event.device_key, task_operation, &params),
+                backend.device_operation(&task_event.device_key, task_operation, &params, progress),
             )
             .await
             .and_then(|result| result);
