@@ -22,13 +22,14 @@ use tokio::{
 };
 
 use crate::{
+    audio,
     backend::{
         AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
         ObexRemote, ObexTarget, OperationProgress, Params,
     },
     fast_pair::FastPairBatteryProvider,
     identity::DeviceIdentityRegistry,
-    management::ManagementStore,
+    management::{DevicePolicy, ManagementStore},
     model::{Device, Snapshot},
     pairing::PairingBroker,
     rfkill,
@@ -298,8 +299,12 @@ impl BluezBackend {
     async fn restore_runtime_state(&self) -> Result<()> {
         let runtime = self.management.runtime();
         self.restore_adapter_power(runtime.adapter_power()).await?;
-        if self.management.policy().reconnect_on_resume {
-            for device_key in runtime.connected_device_keys() {
+        for device_key in runtime.connected_device_keys() {
+            if self
+                .management
+                .device_policy(device_key)
+                .reconnect_on_resume
+            {
                 self.reconnect_device(device_key).await?;
             }
         }
@@ -343,9 +348,12 @@ impl BluezBackend {
         &self,
         adapter: &BluezAdapter,
         params: &Value,
+        default_power_on: bool,
         progress: &OperationProgress,
     ) -> Result<()> {
-        let power_on = params.optional_bool("power_on")?.unwrap_or(true);
+        let power_on = params
+            .optional_bool("power_on")?
+            .unwrap_or(default_power_on);
         if bluez_result(adapter.is_powered().await, "read operation adapter power")? {
             return Ok(());
         }
@@ -608,6 +616,12 @@ impl BluetoothBackend for BluezBackend {
         self.snapshot().await
     }
 
+    async fn update_device_policy(&self, device_key: &str, params: &Value) -> Result<Snapshot> {
+        self.find_device(device_key).await?;
+        self.management.update_device_policy(device_key, params)?;
+        self.snapshot().await
+    }
+
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
         tracing::debug!(%device_key, "resolving outgoing OBEX target");
         let (adapter, device) = self.find_device(device_key).await?;
@@ -644,24 +658,36 @@ impl BluetoothBackend for BluezBackend {
     ) -> Result<Snapshot> {
         tracing::info!(%device_key, %operation, "Bluetooth device operation started");
         let (adapter, device) = self.find_device(device_key).await?;
+        let policy = self.management.device_policy(device_key);
         if matches!(operation, DeviceOperation::Pair | DeviceOperation::Connect) {
-            self.ensure_operation_adapter_powered(&adapter, params, &progress)
-                .await?;
+            self.ensure_operation_adapter_powered(
+                &adapter,
+                params,
+                policy.power_on_connect,
+                &progress,
+            )
+            .await?;
         }
-        let trust_after_pair = self.management.policy().trust_after_pair;
         run_device_operation(
             &adapter,
             &device,
             operation,
             params,
             self.fast_pair.as_deref(),
-            trust_after_pair,
+            &policy,
             &progress,
         )
         .await?;
+        if matches!(operation, DeviceOperation::Pair | DeviceOperation::Connect)
+            && (policy.audio_route_on_connect == "switch"
+                || policy.preferred_audio_profile_key.is_some())
+        {
+            apply_audio_policy(device_key, device.address(), &policy, &progress).await?;
+        }
         if operation == DeviceOperation::Remove {
             self.device_cache.lock().await.remove(device_key);
             self.identities.forget_presentation(device_key);
+            self.management.forget_device_policy(device_key);
         }
         let snapshot = self.snapshot().await?;
         self.management.remember_snapshot(&snapshot);
@@ -700,6 +726,12 @@ impl BluetoothBackend for RecoveringBackend {
 
     async fn update_management(&self, params: &Value) -> Result<Snapshot> {
         self.current().update_management(params).await
+    }
+
+    async fn update_device_policy(&self, device_key: &str, params: &Value) -> Result<Snapshot> {
+        self.current()
+            .update_device_policy(device_key, params)
+            .await
     }
 
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
@@ -931,7 +963,7 @@ async fn run_device_operation(
     operation: DeviceOperation,
     params: &Value,
     fast_pair: Option<&FastPairBatteryProvider>,
-    default_trust_after_pair: bool,
+    policy: &DevicePolicy,
     progress: &OperationProgress,
 ) -> Result<()> {
     use DeviceOperation::{
@@ -945,12 +977,15 @@ async fn run_device_operation(
                 device,
                 params,
                 fast_pair,
-                default_trust_after_pair,
+                policy.trust_after_pair,
+                policy.wait_for_services,
                 progress,
             )
             .await
         }
-        DeviceOperation::Connect => connect_workflow(device, params, progress).await,
+        DeviceOperation::Connect => {
+            connect_workflow(device, params, policy.wait_for_services, progress).await
+        }
         DeviceOperation::Disconnect => {
             disconnect_device(device, "disconnect Bluetooth device").await
         }
@@ -970,6 +1005,7 @@ async fn pair_with_policy(
     params: &Value,
     fast_pair: Option<&FastPairBatteryProvider>,
     default_trust_after_pair: bool,
+    default_wait_for_services: bool,
     progress: &OperationProgress,
 ) -> Result<()> {
     let trust_after_pair = params
@@ -979,7 +1015,13 @@ async fn pair_with_policy(
     if public_key.is_some() && fast_pair.is_none() {
         bail!("Fast Pair provider is unavailable");
     }
-    pair_device(device, trust_after_pair, progress).await?;
+    pair_device(
+        device,
+        trust_after_pair,
+        default_wait_for_services,
+        progress,
+    )
+    .await?;
     provision_after_pair(adapter, device, public_key, fast_pair).await
 }
 
@@ -1063,6 +1105,7 @@ async fn provision_after_pair(
 async fn pair_device(
     device: &BluezDevice,
     trust_after_pair: bool,
+    wait_for_service_resolution: bool,
     progress: &OperationProgress,
 ) -> Result<()> {
     progress("pairing");
@@ -1083,14 +1126,17 @@ async fn pair_device(
         progress("connecting");
         connect_device(device, "connect paired Bluetooth device").await?;
     }
-    progress("resolving-services");
-    wait_for_services(device).await;
+    if wait_for_service_resolution {
+        progress("resolving-services");
+        wait_for_services(device).await;
+    }
     Ok(())
 }
 
 async fn connect_workflow(
     device: &BluezDevice,
     params: &Value,
+    default_wait_for_services: bool,
     progress: &OperationProgress,
 ) -> Result<()> {
     if params.optional_bool("trust")?.unwrap_or(false)
@@ -1108,7 +1154,10 @@ async fn connect_workflow(
     }
     progress("connecting");
     connect_device(device, "connect Bluetooth device").await?;
-    if params.optional_bool("wait_for_services")?.unwrap_or(true) {
+    if params
+        .optional_bool("wait_for_services")?
+        .unwrap_or(default_wait_for_services)
+    {
         progress("resolving-services");
         wait_for_services(device).await;
     }
@@ -1133,6 +1182,56 @@ async fn wait_for_services(device: &BluezDevice) {
         tracing::debug!(
             "Bluetooth service resolution did not complete before the workflow deadline"
         );
+    }
+}
+
+async fn apply_audio_policy(
+    device_key: &str,
+    address: bluer::Address,
+    policy: &DevicePolicy,
+    progress: &OperationProgress,
+) -> Result<()> {
+    progress("waiting-for-audio");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let address = address.to_string();
+    loop {
+        let requested_profile = policy.preferred_audio_profile_key.clone();
+        let switch_output = policy.audio_route_on_connect == "switch";
+        let key = device_key.to_string();
+        let target_address = address.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+            let devices = audio::probe()?;
+            let device = devices
+                .into_iter()
+                .find(|device| device.address.eq_ignore_ascii_case(&target_address))
+                .context("Bluetooth audio card is not ready")?;
+            if let Some(profile_key) = requested_profile {
+                let profile = device
+                    .profiles
+                    .iter()
+                    .find(|profile| {
+                        profile.available && audio::profile_key(&key, &profile.name) == profile_key
+                    })
+                    .context("preferred Bluetooth audio profile is unavailable")?;
+                if device.active_profile != Some(profile.index) {
+                    audio::set_profile(&target_address, profile.index)?;
+                }
+            }
+            if switch_output {
+                audio::set_default_sink(&target_address)?;
+            }
+            Ok(())
+        })
+        .await
+        .context("Bluetooth audio policy task failed")?;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                tracing::debug!(%error, %device_key, "Bluetooth audio policy is waiting for PipeWire");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => return Err(error.context("apply Bluetooth per-device audio policy")),
+        }
     }
 }
 

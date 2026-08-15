@@ -163,6 +163,20 @@
         "stream": "bluetooth.changed"
       },
       {
+        "name": "bluetooth.device.policy.update",
+        "params_example": {
+          "audio_route_on_connect": "keep",
+          "key": "device-opaque",
+          "power_on_connect": true,
+          "preferred_audio_profile_key": null,
+          "reconnect_on_resume": true,
+          "trust_after_pair": true,
+          "wait_for_services": true
+        },
+        "response_key": "snapshot",
+        "stream": "bluetooth.changed"
+      },
+      {
         "name": "bluetooth.obex.snapshot",
         "params_example": {},
         "response_key": "obex",
@@ -384,6 +398,14 @@
             "name": "Headphones",
             "paired": true,
             "present": false,
+            "policy": {
+              "audio_route_on_connect": "keep",
+              "power_on_connect": true,
+              "preferred_audio_profile_key": null,
+              "reconnect_on_resume": true,
+              "trust_after_pair": true,
+              "wait_for_services": true
+            },
             "rssi": null,
             "services": [
               {

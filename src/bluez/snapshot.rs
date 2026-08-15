@@ -290,6 +290,7 @@ async fn device_snapshot(
         signal_live: state.live_rssi.is_some(),
         present,
         last_seen_ms,
+        policy: backend.management.device_policy(&key),
         capabilities,
     };
     if present {

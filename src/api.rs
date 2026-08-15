@@ -18,6 +18,9 @@ enum BackendRequest<'a> {
         operation: AdapterOperation,
     },
     UpdateManagement,
+    UpdateDevicePolicy {
+        key: &'a str,
+    },
 }
 
 impl BackendRequest<'_> {
@@ -36,6 +39,7 @@ impl BackendRequest<'_> {
                 backend.adapter_operation(key, operation, params).await
             }
             Self::UpdateManagement => backend.update_management(params).await,
+            Self::UpdateDevicePolicy { key } => backend.update_device_policy(key, params).await,
         }
     }
 }
@@ -78,6 +82,9 @@ fn parse_backend_request<'a>(method: &str, params: &'a Value) -> Result<BackendR
             Ok(BackendRequest::AdapterOperation { key, operation })
         }
         "bluetooth.management.update" => Ok(BackendRequest::UpdateManagement),
+        "bluetooth.device.policy.update" => Ok(BackendRequest::UpdateDevicePolicy {
+            key: params.require_string("key").map_err(validation_error)?,
+        }),
         _ => Err(error(
             "unsupported-method",
             format!("Unsupported bt-api method: {method}"),

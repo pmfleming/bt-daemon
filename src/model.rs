@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::management::ManagementPolicy;
+use crate::management::{DevicePolicy, ManagementPolicy};
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
@@ -69,6 +69,7 @@ pub struct Device {
     pub signal_live: bool,
     pub present: bool,
     pub last_seen_ms: Option<u64>,
+    pub policy: DevicePolicy,
     pub capabilities: DeviceCapabilities,
 }
 

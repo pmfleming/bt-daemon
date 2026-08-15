@@ -42,6 +42,12 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         "snapshot",
         Some(stream::CHANGED),
     ),
+    (
+        "bluetooth.device.policy.update",
+        r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#,
+        "snapshot",
+        Some(stream::CHANGED),
+    ),
     ("bluetooth.obex.snapshot", "{}", "obex", None),
     (
         "bluetooth.obex.send",

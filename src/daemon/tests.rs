@@ -65,6 +65,10 @@ impl BluetoothBackend for TestBackend {
         self.snapshot().await
     }
 
+    async fn update_device_policy(&self, _: &str, _: &Value) -> Result<Snapshot> {
+        self.snapshot().await
+    }
+
     async fn obex_target(&self, _: &str) -> Result<ObexTarget> {
         Ok(ObexTarget {
             source: "00:00:00:00:00:00".into(),
