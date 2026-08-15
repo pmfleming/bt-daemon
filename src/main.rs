@@ -5,8 +5,12 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use bt_daemon::{
-    api, audio, backend::BluetoothBackend, bluez::BluezBackend, client, daemon,
-    pairing::PairingBroker, protocol,
+    api, audio,
+    backend::BluetoothBackend,
+    bluez::{BluezBackend, RecoveringBackend},
+    client, daemon,
+    pairing::PairingBroker,
+    protocol,
 };
 
 #[derive(Debug, Parser)]
@@ -66,9 +70,12 @@ async fn run() -> Result<()> {
             bluez.apply_startup_policy().await;
             bluez.start_monitoring();
             bluez.start_lifecycle_monitoring();
-            let backend: Arc<dyn BluetoothBackend> = bluez.clone();
             let pairing = PairingBroker::new(bluez.identity_registry());
-            let _agent = bluez.register_agent(pairing.agent()).await?;
+            let agent = bluez.register_agent(pairing.agent()).await?;
+            let recovering = RecoveringBackend::new(bluez);
+            recovering.set_agent(agent).await;
+            recovering.start_recovery(Arc::clone(&pairing));
+            let backend: Arc<dyn BluetoothBackend> = recovering;
             daemon::run(backend, pairing).await
         }
         Command::Client => client::run().await,
