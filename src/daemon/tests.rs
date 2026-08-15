@@ -130,6 +130,7 @@ fn daemon(
             pairing: PairingBroker::new(DeviceIdentityRegistry::in_memory()),
             sequence: AtomicU64::new(1),
             subscriptions: Arc::new(Mutex::new(Default::default())),
+            scan_owner_watches: Arc::new(Mutex::new(Default::default())),
             operations,
             scans,
             audio_events,
@@ -149,11 +150,14 @@ async fn start_operation(daemon: &BluetoothDaemon, operation: &str) -> Value {
 
 async fn start_scan(scans: &ScanCoordinator, adapter: &str, timeout_ms: u64) -> Value {
     scans
-        .start(&json!({
-            "adapter_key": adapter,
-            "enabled": true,
-            "timeout_ms": timeout_ms
-        }))
+        .start(
+            &json!({
+                "adapter_key": adapter,
+                "enabled": true,
+                "timeout_ms": timeout_ms
+            }),
+            ":test-owner",
+        )
         .await
 }
 
@@ -208,10 +212,16 @@ async fn scan_rejects_malformed_optional_parameters() {
     let (daemon, _, _) = daemon(true);
     let response = daemon
         .scans
-        .start(&json!({ "adapter_key": 42, "enabled": true }))
+        .start(
+            &json!({ "adapter_key": 42, "enabled": true }),
+            ":test-owner",
+        )
         .await;
     assert_eq!(response["error"]["code"], "validation-error");
-    let response = daemon.scans.start(&json!({ "enabled": "yes" })).await;
+    let response = daemon
+        .scans
+        .start(&json!({ "enabled": "yes" }), ":test-owner")
+        .await;
     assert_eq!(response["error"]["code"], "validation-error");
     assert_eq!(daemon.obex.cancel("missing-transfer").await, None);
 }
@@ -222,7 +232,10 @@ async fn overlapping_global_scan_stops_only_uncovered_adapters() {
     let backend = test_backend(true, false, Arc::clone(&scanning));
     let scans = ScanCoordinator::new(backend);
     let global = scans
-        .start(&json!({ "enabled": true, "timeout_ms": 60_000 }))
+        .start(
+            &json!({ "enabled": true, "timeout_ms": 60_000 }),
+            ":global-owner",
+        )
         .await;
     let global_id = global["data"]["scan"]["request_id"].as_str().unwrap();
     let targeted = start_scan(&scans, "adapter-1", 60_000).await;
@@ -255,6 +268,35 @@ async fn scan_sessions_are_bounded_and_cancellable() {
     assert_eq!(response["data"]["stopped"], request_id);
     assert_eq!(events.recv().await.unwrap().state, "cancelled");
     assert!(daemon.scans.is_empty().await);
+}
+
+#[tokio::test]
+async fn scan_owner_loss_releases_only_that_owners_leases() {
+    let scanning = Arc::new(StdMutex::new(Vec::new()));
+    let backend = test_backend(true, false, Arc::clone(&scanning));
+    let scans = ScanCoordinator::new(backend);
+    let first = scans
+        .start(
+            &json!({ "adapter_key": "adapter-1", "timeout_ms": 60_000 }),
+            ":owner-one",
+        )
+        .await;
+    let second = scans
+        .start(
+            &json!({ "adapter_key": "adapter-1", "timeout_ms": 60_000 }),
+            ":owner-two",
+        )
+        .await;
+    assert_eq!(first["ok"], true);
+    assert_eq!(second["ok"], true);
+
+    scans.stop_owner(":owner-one").await;
+    assert!(stopped_calls(&scanning).is_empty());
+    scans.stop_owner(":owner-two").await;
+    assert_eq!(
+        stopped_calls(&scanning),
+        vec![(Some("adapter-1".into()), false)]
+    );
 }
 
 #[tokio::test]

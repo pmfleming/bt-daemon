@@ -24,6 +24,8 @@ pub(super) struct ScanEvent {
     adapter_key: Option<String>,
     #[serde(skip)]
     adapter_keys: Vec<String>,
+    #[serde(skip)]
+    owner: String,
     pub(super) state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
@@ -73,9 +75,10 @@ impl ScanRequest {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ScanCoordinator {
     backend: Arc<dyn BluetoothBackend>,
-    sequence: AtomicU64,
+    sequence: Arc<AtomicU64>,
     tasks: Arc<Mutex<HashMap<String, ScanTask>>>,
     transition: Arc<Mutex<()>>,
     events: broadcast::Sender<ScanEvent>,
@@ -86,7 +89,7 @@ impl ScanCoordinator {
         let (events, _) = broadcast::channel(32);
         Self {
             backend,
-            sequence: AtomicU64::new(1),
+            sequence: Arc::new(AtomicU64::new(1)),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             transition: Arc::new(Mutex::new(())),
             events,
@@ -101,7 +104,7 @@ impl ScanCoordinator {
         self.tasks.lock().await.contains_key(request_id)
     }
 
-    pub(super) async fn start(&self, params: &Value) -> Value {
+    pub(super) async fn start(&self, params: &Value, owner: &str) -> Value {
         let (adapter_key, timeout_ms) = match ScanRequest::parse(params) {
             Ok(ScanRequest::Start {
                 adapter_key,
@@ -151,6 +154,7 @@ impl ScanCoordinator {
             request_id: request_id.clone(),
             adapter_key: adapter_key.clone(),
             adapter_keys,
+            owner: owner.to_string(),
             state: "running".into(),
             timeout_ms: Some(timeout_ms),
             snapshot: Some(Arc::clone(&snapshot)),
@@ -218,6 +222,23 @@ impl ScanCoordinator {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         })
+    }
+
+    pub(super) async fn stop_owner(&self, owner: &str) {
+        let request_ids = self
+            .tasks
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, task)| task.event.owner == owner)
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            let response = self.stop(Some(&request_id), "cancelled").await;
+            if response["ok"].as_bool() != Some(true) {
+                tracing::warn!(%owner, %request_id, "could not release scan after its D-Bus owner disappeared");
+            }
+        }
     }
 
     pub(super) async fn stop(&self, request_id: Option<&str>, event: &str) -> Value {
@@ -332,6 +353,7 @@ fn terminal_event(
         request_id,
         adapter_key,
         adapter_keys: Vec::new(),
+        owner: String::new(),
         state: state.into(),
         timeout_ms: None,
         snapshot,

@@ -125,7 +125,7 @@ pub(super) async fn start(
         forward!(requested.operations, operation_events, OPERATION_STREAM);
         forward!(requested.scans, scan_events, SCAN_STREAM);
         forward!(requested.obex, obex_events, OBEX_STREAM);
-        forwarders.spawn(wait_for_owner_loss(connection, owner));
+        forwarders.spawn(wait_for_owner_loss(connection, owner.to_string()));
         if let Some(Err(error)) = forwarders.join_next().await {
             tracing::error!(%subscription_id, %error, "subscription forwarder task failed");
         }
@@ -138,7 +138,7 @@ pub(super) async fn start(
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
 }
 
-async fn wait_for_owner_loss(connection: zbus::Connection, owner: UniqueName<'static>) {
+pub(super) async fn wait_for_owner_loss(connection: zbus::Connection, owner: String) {
     let result = async {
         let proxy = zbus::Proxy::new(
             &connection,
@@ -155,7 +155,7 @@ async fn wait_for_owner_loss(connection: zbus::Connection, owner: UniqueName<'st
         while let Some(message) = changes.next().await {
             let (name, old_owner, new_owner): (String, String, String) =
                 message.body().deserialize()?;
-            if name == owner.as_str() && !old_owner.is_empty() && new_owner.is_empty() {
+            if name == owner && !old_owner.is_empty() && new_owner.is_empty() {
                 return Ok::<(), anyhow::Error>(());
             }
         }

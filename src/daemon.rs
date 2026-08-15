@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -39,6 +39,7 @@ pub struct BluetoothDaemon {
     pairing: Arc<PairingBroker>,
     sequence: AtomicU64,
     subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    scan_owner_watches: Arc<Mutex<HashSet<String>>>,
     operations: OperationCoordinator,
     scans: ScanCoordinator,
     audio_events: broadcast::Sender<()>,
@@ -50,9 +51,25 @@ impl BluetoothDaemon {
         format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
     }
 
-    async fn dispatch_call(&self, method: &str, params: Value) -> Value {
+    async fn dispatch_call(
+        &self,
+        method: &str,
+        params: Value,
+        owner: Option<&str>,
+        connection: Option<&zbus::Connection>,
+    ) -> Value {
         match method {
-            "bluetooth.scan" => self.scans.start(&params).await,
+            "bluetooth.scan" => {
+                let owner = owner.unwrap_or("internal");
+                let response = self.scans.start(&params, owner).await;
+                if response["ok"].as_bool() == Some(true)
+                    && let Some(connection) = connection
+                {
+                    self.watch_scan_owner(connection.clone(), owner.to_string())
+                        .await;
+                }
+                response
+            }
             "bluetooth.obex.send" => self.obex.outgoing.start(&params).await,
             "bluetooth.obex.respond" => obex::respond(&self.obex.incoming, &params).await,
             "bluetooth.obex.snapshot" => self.obex.snapshot().await,
@@ -66,11 +83,33 @@ impl BluetoothDaemon {
             _ => api::dispatch(Arc::clone(&self.backend), method, params).await,
         }
     }
+
+    async fn watch_scan_owner(&self, connection: zbus::Connection, owner: String) {
+        let mut watches = self.scan_owner_watches.lock().await;
+        if !watches.insert(owner.clone()) {
+            return;
+        }
+        drop(watches);
+        let scans = self.scans.clone();
+        let watches = Arc::clone(&self.scan_owner_watches);
+        crate::task::spawn("scan-owner-watch", async move {
+            subscription::wait_for_owner_loss(connection, owner.clone()).await;
+            tracing::info!(%owner, "D-Bus owner disappeared; releasing its Bluetooth scans");
+            scans.stop_owner(&owner).await;
+            watches.lock().await.remove(&owner);
+        });
+    }
 }
 
 #[zbus::interface(name = "org.laufan.BluetoothDaemon1")]
 impl BluetoothDaemon {
-    async fn call(&self, method: &str, params_json: &str) -> String {
+    async fn call(
+        &self,
+        method: &str,
+        params_json: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> String {
         tracing::info!(%method, "D-Bus request received");
         let params = match serde_json::from_str(params_json) {
             Ok(params) => params,
@@ -82,7 +121,10 @@ impl BluetoothDaemon {
                 return response.to_string();
             }
         };
-        let response = self.dispatch_call(method, params).await;
+        let owner = header.sender().map(|sender| sender.as_str());
+        let response = self
+            .dispatch_call(method, params, owner, Some(connection))
+            .await;
         api::log_response(method, &response);
         response.to_string()
     }
@@ -234,6 +276,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
                 pairing,
                 sequence: AtomicU64::new(1),
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                scan_owner_watches: Arc::new(Mutex::new(HashSet::new())),
                 operations,
                 scans,
                 audio_events,
