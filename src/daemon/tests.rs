@@ -192,6 +192,9 @@ async fn operation_emits_started_and_completed_events() {
     assert_eq!(progress.stage, "connecting");
     assert_eq!(events.recv().await.unwrap().event, "completed");
     assert!(daemon.operations.is_empty().await);
+    let recovered = daemon.operations.snapshot().await;
+    assert_eq!(recovered["active"].as_array().unwrap().len(), 0);
+    assert_eq!(recovered["recent"][0]["event"], "completed");
 }
 
 #[tokio::test]

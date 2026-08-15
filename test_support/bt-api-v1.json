@@ -211,6 +211,12 @@
         "stream": "bluetooth.audio.changed"
       },
       {
+        "name": "bluetooth.requests.snapshot",
+        "params_example": {},
+        "response_key": "requests",
+        "stream": null
+      },
+      {
         "name": "bluetooth.device.operation",
         "params_example": {
           "key": "device-opaque",

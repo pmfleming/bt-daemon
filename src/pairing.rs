@@ -169,6 +169,15 @@ impl PairingBroker {
         self.events.subscribe()
     }
 
+    pub fn pending_events(&self) -> Vec<PairingEvent> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .map(|request| request.event.clone())
+            .collect()
+    }
+
     pub fn device_key(&self, adapter: &str, address: Address) -> String {
         self.identities.device_key(adapter, address)
     }

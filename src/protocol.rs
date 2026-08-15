@@ -68,6 +68,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         "audio_devices",
         Some(stream::AUDIO),
     ),
+    ("bluetooth.requests.snapshot", "{}", "requests", None),
     (
         "bluetooth.device.operation",
         r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#,

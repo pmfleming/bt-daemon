@@ -100,6 +100,17 @@ impl ScanCoordinator {
         self.events.subscribe()
     }
 
+    pub(super) async fn snapshot(&self) -> Value {
+        let active = self
+            .tasks
+            .lock()
+            .await
+            .values()
+            .map(|task| task.event.clone())
+            .collect::<Vec<_>>();
+        json!({ "active": active })
+    }
+
     pub(super) async fn contains(&self, request_id: &str) -> bool {
         self.tasks.lock().await.contains_key(request_id)
     }

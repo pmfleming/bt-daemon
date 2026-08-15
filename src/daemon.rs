@@ -76,6 +76,13 @@ impl BluetoothDaemon {
             "bluetooth.audio.snapshot" => audio::snapshot(Arc::clone(&self.pairing)).await,
             "bluetooth.audio.setProfile" => audio::set_profile(&self.pairing, &params).await,
             "bluetooth.audio.setDefault" => audio::set_default(&self.pairing, &params).await,
+            "bluetooth.requests.snapshot" => api::success(json!({
+                "requests": {
+                    "operations": self.operations.snapshot().await,
+                    "scans": self.scans.snapshot().await,
+                    "pairing": { "active": self.pairing.pending_events() },
+                }
+            })),
             "bluetooth.device.operation" => self.operations.start(params).await,
             "bluetooth.pairing.respond" => match self.pairing.respond(&params).await {
                 Ok(accepted) => api::success(json!({ "result": { "accepted": accepted } })),

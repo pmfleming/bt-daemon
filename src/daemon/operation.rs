@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -97,6 +97,7 @@ pub(super) struct OperationCoordinator {
     sequence: AtomicU64,
     state: Arc<Mutex<OperationState>>,
     events: broadcast::Sender<OperationEvent>,
+    recent: Arc<Mutex<VecDeque<OperationEvent>>>,
 }
 
 impl OperationCoordinator {
@@ -107,11 +108,25 @@ impl OperationCoordinator {
             sequence: AtomicU64::new(1),
             state: Arc::new(Mutex::new(OperationState::default())),
             events,
+            recent: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
     pub(super) fn subscribe(&self) -> broadcast::Receiver<OperationEvent> {
         self.events.subscribe()
+    }
+
+    pub(super) async fn snapshot(&self) -> Value {
+        let active = self
+            .state
+            .lock()
+            .await
+            .tasks
+            .values()
+            .map(|task| task.event.clone())
+            .collect::<Vec<_>>();
+        let recent = self.recent.lock().await.iter().cloned().collect::<Vec<_>>();
+        json!({ "active": active, "recent": recent })
     }
 
     pub(super) async fn start(&self, params: Value) -> Value {
@@ -144,6 +159,7 @@ impl OperationCoordinator {
         let backend = Arc::clone(&self.backend);
         let operation_state = Arc::clone(&self.state);
         let events = self.events.clone();
+        let recent = Arc::clone(&self.recent);
         let task_event = queued.clone();
         let task_operation = operation;
         let (start_sender, start_receiver) = oneshot::channel();
@@ -152,11 +168,27 @@ impl OperationCoordinator {
                 return;
             }
             tracing::info!(request_id = %task_event.request_id, device_key = %task_event.device_key, operation = %task_operation, "Bluetooth device operation started");
-            let _ = events.send(task_event.with_state("started", "running"));
+            let started = task_event.with_state("started", "running");
+            if let Some(task) = operation_state
+                .lock()
+                .await
+                .tasks
+                .get_mut(&task_event.request_id)
+            {
+                task.event = started.clone();
+            }
+            let _ = events.send(started);
             let progress_events = events.clone();
             let progress_event = task_event.clone();
+            let progress_state = Arc::clone(&operation_state);
             let progress = Arc::new(move |stage: &'static str| {
-                let _ = progress_events.send(progress_event.progress(stage));
+                let update = progress_event.progress(stage);
+                if let Ok(mut state) = progress_state.try_lock()
+                    && let Some(task) = state.tasks.get_mut(&progress_event.request_id)
+                {
+                    task.event = update.clone();
+                }
+                let _ = progress_events.send(update);
             });
             let result = crate::task::catch(
                 "Bluetooth backend device operation",
@@ -172,13 +204,15 @@ impl OperationCoordinator {
                     tracing::warn!(request_id = %task_event.request_id, error = %error, error_chain = %format!("{error:#}"), "Bluetooth device operation failed")
                 }
             }
+            let terminal = task_event.clone().finished(result);
             let mut state = operation_state.lock().await;
             state.tasks.remove(&task_event.request_id);
             if state.active_devices.get(&task_event.device_key) == Some(&task_event.request_id) {
                 state.active_devices.remove(&task_event.device_key);
             }
             drop(state);
-            let _ = events.send(task_event.finished(result));
+            retain_terminal(&recent, terminal.clone()).await;
+            let _ = events.send(terminal);
         });
         state.tasks.insert(
             request_id.clone(),
@@ -212,14 +246,22 @@ impl OperationCoordinator {
         };
         task.handle.abort();
         tracing::info!(%request_id, "Bluetooth device operation cancelled");
-        let _ = self
-            .events
-            .send(task.event.with_state("cancelled", "cancelled"));
+        let terminal = task.event.with_state("cancelled", "cancelled");
+        retain_terminal(&self.recent, terminal.clone()).await;
+        let _ = self.events.send(terminal);
         true
     }
 
     #[cfg(test)]
     pub(super) async fn is_empty(&self) -> bool {
         self.state.lock().await.tasks.is_empty()
+    }
+}
+
+async fn retain_terminal(recent: &Mutex<VecDeque<OperationEvent>>, event: OperationEvent) {
+    let mut recent = recent.lock().await;
+    recent.push_back(event);
+    while recent.len() > 64 {
+        recent.pop_front();
     }
 }
