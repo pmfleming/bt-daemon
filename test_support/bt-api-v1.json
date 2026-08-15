@@ -113,56 +113,256 @@
   },
   "protocol": "bt-api",
   "registry": {
+    "compatibility": {
+      "event_recovery_method": "bluetooth.requests.snapshot",
+      "request_unknown_fields": "method-dependent",
+      "response_unknown_fields": "ignore"
+    },
+    "errors": [
+      {
+        "code": "timeout",
+        "retryable": true
+      },
+      {
+        "code": "device-unavailable",
+        "retryable": true
+      },
+      {
+        "code": "rejected",
+        "retryable": false
+      },
+      {
+        "code": "bluez-unavailable",
+        "retryable": true
+      },
+      {
+        "code": "validation-error",
+        "retryable": false
+      },
+      {
+        "code": "operation-failed",
+        "retryable": false
+      },
+      {
+        "code": "daemon-unavailable",
+        "retryable": true
+      },
+      {
+        "code": "device-busy",
+        "retryable": true
+      },
+      {
+        "code": "request-not-found",
+        "retryable": false
+      },
+      {
+        "code": "unsupported-method",
+        "retryable": false
+      },
+      {
+        "code": "unsupported-stream",
+        "retryable": false
+      },
+      {
+        "code": "audio-unavailable",
+        "retryable": true
+      },
+      {
+        "code": "audio-endpoint-unavailable",
+        "retryable": true
+      }
+    ],
     "methods": [
       {
+        "cancellable": false,
+        "description": "Return machine-readable bt-api methods, schemas, streams, operations, and errors.",
+        "name": "bluetooth.protocol.describe",
+        "params_example": {},
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "required_capability": null,
+        "response_key": "registry",
+        "stream": null
+      },
+      {
+        "cancellable": false,
+        "description": "Return the current radio, adapter, device, and policy snapshot.",
         "name": "bluetooth.snapshot",
         "params_example": {},
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
       },
       {
+        "cancellable": false,
+        "description": "Set global or adapter Bluetooth power.",
         "name": "bluetooth.setPowered",
         "params_example": {
           "adapter_key": null,
           "powered": true
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "adapter_key": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "powered": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "powered"
+          ],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
       },
       {
+        "cancellable": true,
+        "description": "Acquire or release a bounded caller-owned discovery lease.",
         "name": "bluetooth.scan",
         "params_example": {
           "adapter_key": "adapter-opaque",
           "enabled": true,
           "timeout_ms": 15000
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "adapter_key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "timeout_ms": {
+              "maximum": 60000,
+              "minimum": 1000,
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "scan",
         "stream": "bluetooth.scan"
       },
       {
+        "cancellable": false,
+        "description": "Mutate one adapter setting.",
         "name": "bluetooth.adapter.operation",
         "params_example": {
           "discoverable": true,
           "key": "adapter-opaque",
           "operation": "set-discoverable"
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "discoverable": {
+              "type": "boolean"
+            },
+            "key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "operation": {
+              "enum": [
+                "set-alias",
+                "set-discoverable",
+                "set-pairable",
+                "set-discoverable-timeout",
+                "set-pairable-timeout"
+              ],
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "key",
+            "operation"
+          ],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
       },
       {
+        "cancellable": false,
+        "description": "Update persistent global Bluetooth policy.",
         "name": "bluetooth.management.update",
         "params_example": {
           "launch_state": "remember",
-          "reconnect_on_resume": true,
-          "trust_after_pair": true,
           "preferred_adapter_key": "adapter-opaque",
+          "reconnect_on_resume": true,
           "show_blocked_devices": false,
-          "show_recent_devices": false
+          "show_recent_devices": false,
+          "trust_after_pair": true
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "launch_state": {
+              "enum": [
+                "remember",
+                "enable",
+                "disable"
+              ],
+              "minLength": 1,
+              "type": "string"
+            },
+            "preferred_adapter_key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "reconnect_on_resume": {
+              "type": "boolean"
+            },
+            "show_blocked_devices": {
+              "type": "boolean"
+            },
+            "show_recent_devices": {
+              "type": "boolean"
+            },
+            "trust_after_pair": {
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
       },
       {
+        "cancellable": false,
+        "description": "Update persistent policy for one device; null clears an override.",
         "name": "bluetooth.device.policy.update",
         "params_example": {
           "audio_route_on_connect": "keep",
@@ -173,64 +373,224 @@
           "trust_after_pair": true,
           "wait_for_services": true
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "audio_route_on_connect": {
+              "enum": [
+                "keep",
+                "switch"
+              ],
+              "minLength": 1,
+              "type": "string"
+            },
+            "key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "power_on_connect": {
+              "type": "boolean"
+            },
+            "preferred_audio_profile_key": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reconnect_on_resume": {
+              "type": "boolean"
+            },
+            "trust_after_pair": {
+              "type": "boolean"
+            },
+            "wait_for_services": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "key"
+          ],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "snapshot",
         "stream": "bluetooth.changed"
       },
       {
+        "cancellable": false,
+        "description": "Return object-push capabilities.",
         "name": "bluetooth.obex.snapshot",
         "params_example": {},
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "obex",
         "stream": null
       },
       {
+        "cancellable": true,
+        "description": "Start an outgoing object-push transfer.",
         "name": "bluetooth.obex.send",
         "params_example": {
           "device_key": "device-opaque",
           "path": "/selected/file"
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "device_key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "path": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_key",
+            "path"
+          ],
+          "type": "object"
+        },
+        "required_capability": "can_send_file",
         "response_key": "transfer",
         "stream": "bluetooth.obex.transfer"
       },
       {
+        "cancellable": false,
+        "description": "Answer an incoming object-push authorization request.",
         "name": "bluetooth.obex.respond",
         "params_example": {
           "accept": true,
           "request_id": "obex-incoming-1"
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "accept": {
+              "type": "boolean"
+            },
+            "request_id": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "accept",
+            "request_id"
+          ],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "authorization",
         "stream": "bluetooth.obex.transfer"
       },
       {
+        "cancellable": false,
+        "description": "Return Bluetooth PipeWire cards, profiles, and endpoints.",
         "name": "bluetooth.audio.snapshot",
         "params_example": {},
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "audio_devices",
         "stream": null
       },
       {
+        "cancellable": false,
+        "description": "Activate an available Bluetooth audio profile.",
         "name": "bluetooth.audio.setProfile",
         "params_example": {
           "device_key": "device-opaque",
           "profile_key": "audio-profile-opaque"
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "device_key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "profile_key": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_key",
+            "profile_key"
+          ],
+          "type": "object"
+        },
+        "required_capability": "audio_device",
         "response_key": "audio_devices",
         "stream": null
       },
       {
+        "cancellable": false,
+        "description": "Make a Bluetooth sink or source the PipeWire default.",
         "name": "bluetooth.audio.setDefault",
         "params_example": {
           "device_key": "device-opaque",
           "endpoint_key": "audio-endpoint-opaque"
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "device_key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "endpoint_key": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_key",
+            "endpoint_key"
+          ],
+          "type": "object"
+        },
+        "required_capability": "audio_device",
         "response_key": "audio_devices",
         "stream": "bluetooth.audio.changed"
       },
       {
+        "cancellable": false,
+        "description": "Recover active and recent request state after reconnect or event loss.",
         "name": "bluetooth.requests.snapshot",
         "params_example": {},
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "requests",
         "stream": null
       },
       {
+        "cancellable": true,
+        "description": "Start a cancellable staged device operation.",
         "name": "bluetooth.device.operation",
         "params_example": {
           "key": "device-opaque",
@@ -239,20 +599,290 @@
           "trust": false,
           "wait_for_services": true
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "operation": {
+              "enum": [
+                "pair",
+                "connect",
+                "disconnect",
+                "remove",
+                "set-trusted",
+                "set-blocked",
+                "set-wake-allowed",
+                "set-alias",
+                "reset-alias",
+                "provision-fast-pair",
+                "set-multipoint",
+                "set-noise-control"
+              ],
+              "minLength": 1,
+              "type": "string"
+            },
+            "power_on": {
+              "type": "boolean"
+            },
+            "trust": {
+              "type": "boolean"
+            },
+            "wait_for_services": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "key",
+            "operation"
+          ],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "operation",
         "stream": "bluetooth.operation"
       },
       {
+        "cancellable": false,
+        "description": "Answer an active pairing-agent prompt.",
         "name": "bluetooth.pairing.respond",
         "params_example": {
           "accept": true,
           "request_id": "pairing-1",
           "value": null
         },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": true,
+          "properties": {
+            "accept": {
+              "type": "boolean"
+            },
+            "request_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "accept",
+            "request_id"
+          ],
+          "type": "object"
+        },
+        "required_capability": null,
         "response_key": "result",
         "stream": "pairing.request"
       }
     ],
+    "operations": {
+      "adapter": {
+        "names": [
+          "set-alias",
+          "set-discoverable",
+          "set-pairable",
+          "set-discoverable-timeout",
+          "set-pairable-timeout"
+        ],
+        "parameters": {
+          "set-alias": {
+            "properties": {
+              "alias": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "alias"
+            ]
+          },
+          "set-discoverable": {
+            "properties": {
+              "discoverable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "discoverable"
+            ]
+          },
+          "set-discoverable-timeout": {
+            "properties": {
+              "timeout": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "timeout"
+            ]
+          },
+          "set-pairable": {
+            "properties": {
+              "pairable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "pairable"
+            ]
+          },
+          "set-pairable-timeout": {
+            "properties": {
+              "timeout": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "timeout"
+            ]
+          }
+        }
+      },
+      "device": {
+        "names": [
+          "pair",
+          "connect",
+          "disconnect",
+          "remove",
+          "set-trusted",
+          "set-blocked",
+          "set-wake-allowed",
+          "set-alias",
+          "reset-alias",
+          "provision-fast-pair",
+          "set-multipoint",
+          "set-noise-control"
+        ],
+        "parameters": {
+          "connect": {
+            "properties": {
+              "power_on": {
+                "type": "boolean"
+              },
+              "trust": {
+                "type": "boolean"
+              },
+              "wait_for_services": {
+                "type": "boolean"
+              }
+            }
+          },
+          "disconnect": {
+            "properties": {}
+          },
+          "pair": {
+            "properties": {
+              "fast_pair_anti_spoofing_public_key": {
+                "type": "string"
+              },
+              "power_on": {
+                "type": "boolean"
+              },
+              "trust_after_pair": {
+                "type": "boolean"
+              },
+              "wait_for_services": {
+                "type": "boolean"
+              }
+            }
+          },
+          "provision-fast-pair": {
+            "properties": {
+              "anti_spoofing_public_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "anti_spoofing_public_key"
+            ]
+          },
+          "remove": {
+            "properties": {}
+          },
+          "reset-alias": {
+            "properties": {}
+          },
+          "set-alias": {
+            "properties": {
+              "alias": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "alias"
+            ]
+          },
+          "set-blocked": {
+            "properties": {
+              "blocked": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "blocked"
+            ]
+          },
+          "set-multipoint": {
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "set-noise-control": {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "transparent",
+                  "adaptive",
+                  "off",
+                  "noise-cancelling"
+                ]
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "set-trusted": {
+            "properties": {
+              "trusted": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "trusted"
+            ]
+          },
+          "set-wake-allowed": {
+            "properties": {
+              "wake_allowed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wake_allowed"
+            ]
+          }
+        }
+      }
+    },
     "protocol": "bt-api",
     "streams": [
       {

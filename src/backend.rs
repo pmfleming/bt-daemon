@@ -144,6 +144,8 @@ macro_rules! operation_enum {
         }
 
         impl $name {
+            pub const VALUES: &'static [&'static str] = &[$($value),+];
+
             pub const fn as_str(self) -> &'static str {
                 match self {
                     $(Self::$variant => $value),+

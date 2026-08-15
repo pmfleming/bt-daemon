@@ -15,7 +15,7 @@ use tokio::{
 };
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
-use crate::{api, backend::BluetoothBackend, pairing::PairingBroker};
+use crate::{api, backend::BluetoothBackend, pairing::PairingBroker, protocol};
 
 pub const BUS_NAME: &str = "org.laufan.BluetoothDaemon";
 pub const OBJECT_PATH: &str = "/org/laufan/BluetoothDaemon";
@@ -58,6 +58,9 @@ impl BluetoothDaemon {
         connection: Option<&zbus::Connection>,
     ) -> Value {
         match method {
+            "bluetooth.protocol.describe" => {
+                api::success(json!({ "registry": protocol::registry() }))
+            }
             "bluetooth.scan" => {
                 let owner = owner.unwrap_or("internal");
                 let response = self.scans.start(&params, owner).await;
