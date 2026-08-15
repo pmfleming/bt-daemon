@@ -20,7 +20,7 @@ use serde::Serialize;
 
 mod profile;
 use profile::parse_profile;
-pub use profile::profile_key;
+pub use profile::{endpoint_key, profile_key};
 
 macro_rules! bind_or_return {
     ($registry:expr, $global:expr, $kind:ty) => {
@@ -225,6 +225,77 @@ pub fn probe() -> Result<Vec<AudioDevice>> {
 pub fn set_profile(address: &str, index: u32) -> Result<()> {
     initialize();
     set_profile_inner(address, index)
+}
+
+pub fn set_default_sink(address: &str) -> Result<()> {
+    set_default_endpoint(address, EndpointKind::Sink)
+}
+
+pub fn set_default_source(address: &str) -> Result<()> {
+    set_default_endpoint(address, EndpointKind::Source)
+}
+
+fn set_default_endpoint(address: &str, kind: EndpointKind) -> Result<()> {
+    initialize();
+    let devices = probe_inner()?;
+    let device = devices
+        .iter()
+        .find(|device| device.address.eq_ignore_ascii_case(address))
+        .context("Bluetooth audio device is unavailable")?;
+    let endpoint = match kind {
+        EndpointKind::Sink => device.sink.as_ref(),
+        EndpointKind::Source => device.source.as_ref(),
+    }
+    .context("requested Bluetooth audio endpoint is unavailable")?;
+    if endpoint.name.is_empty() {
+        anyhow::bail!("requested Bluetooth audio endpoint has no PipeWire node name");
+    }
+    set_default_node(kind, &endpoint.name)
+}
+
+fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
+    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
+    let context =
+        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
+    let core = context.connect_rc(None).context("connect to PipeWire")?;
+    let registry = core.get_registry_rc().context("open PipeWire registry")?;
+    let registry_weak = registry.downgrade();
+    let applied = Rc::new(Cell::new(false));
+    let applied_for_registry = Rc::clone(&applied);
+    let retained = Rc::new(RefCell::new(None::<Metadata>));
+    let retained_for_registry = Rc::clone(&retained);
+    let key = match kind {
+        EndpointKind::Sink => "default.audio.sink",
+        EndpointKind::Source => "default.audio.source",
+    };
+    let value = serde_json::json!({ "name": node_name }).to_string();
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if global.type_ != ObjectType::Metadata
+                || global.props.and_then(|props| props.get("metadata.name")) != Some("default")
+            {
+                return;
+            }
+            let Some(registry) = registry_weak.upgrade() else {
+                return;
+            };
+            match registry.bind::<Metadata, _>(global) {
+                Ok(metadata) => {
+                    metadata.set_property(0, key, Some("Spa:String:JSON"), Some(&value));
+                    *retained_for_registry.borrow_mut() = Some(metadata);
+                    applied_for_registry.set(true);
+                }
+                Err(error) => tracing::warn!(%error, "could not bind PipeWire default metadata"),
+            }
+        })
+        .register();
+    pipewire_roundtrip(&main_loop, &core)?;
+    pipewire_roundtrip(&main_loop, &core)?;
+    if !applied.get() {
+        anyhow::bail!("PipeWire default metadata is unavailable");
+    }
+    Ok(())
 }
 
 fn set_profile_inner(address: &str, index: u32) -> Result<()> {

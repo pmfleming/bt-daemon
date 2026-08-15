@@ -42,6 +42,48 @@ fn device_address(device: &audio::AudioDevice) -> Option<bluer::Address> {
     }
 }
 
+pub(super) async fn set_default(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
+    let (device_key, endpoint_key) = match params.require_strings("device_key", "endpoint_key") {
+        Ok(params) => params,
+        Err(error) => return api::error("validation-error", error.to_string()),
+    };
+    let devices = match devices().await {
+        Ok(devices) => devices,
+        Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
+    };
+    let selection = devices.into_iter().find_map(|device| {
+        let address = device_address(&device)?;
+        if device.adapter.is_empty() || pairing.device_key(&device.adapter, address) != device_key {
+            return None;
+        }
+        for (kind, available) in [
+            ("sink", device.sink.is_some()),
+            ("source", device.source.is_some()),
+        ] {
+            if available && audio::endpoint_key(device_key, kind) == endpoint_key {
+                return Some((device.address, kind));
+            }
+        }
+        None
+    });
+    let Some((address, kind)) = selection else {
+        return api::error(
+            "audio-endpoint-unavailable",
+            "Bluetooth audio endpoint is not available".to_string(),
+        );
+    };
+    let result = tokio::task::spawn_blocking(move || match kind {
+        "sink" => audio::set_default_sink(&address),
+        _ => audio::set_default_source(&address),
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => snapshot(Arc::clone(pairing)).await,
+        Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
+        Err(error) => api::error("audio-operation-failed", error.to_string()),
+    }
+}
+
 pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
     let (device_key, profile_key) = match params.require_strings("device_key", "profile_key") {
         Ok(params) => params,
@@ -110,9 +152,10 @@ pub(super) async fn snapshot(pairing: Arc<PairingBroker>) -> Value {
                     })
                 })
                 .collect::<Vec<_>>();
-            let endpoint = |value: Option<audio::AudioEndpoint>| {
+            let endpoint = |kind: &str, value: Option<audio::AudioEndpoint>| {
                 value.map(|endpoint| {
                     json!({
+                        "key": audio::endpoint_key(&device_key, kind),
                         "ready": !matches!(endpoint.state.as_str(), "creating" | "error"),
                         "state": endpoint.state,
                         "is_default": endpoint.is_default,
@@ -123,8 +166,8 @@ pub(super) async fn snapshot(pairing: Arc<PairingBroker>) -> Value {
                 "device_key": device_key,
                 "active_profile_key": active_profile_key,
                 "profiles": profiles,
-                "sink": endpoint(device.sink),
-                "source": endpoint(device.source),
+                "sink": endpoint("sink", device.sink),
+                "source": endpoint("source", device.source),
             }))
         })
         .collect::<Vec<_>>();

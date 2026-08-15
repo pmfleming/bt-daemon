@@ -17,6 +17,7 @@
           ],
           "sink": {
             "is_default": true,
+            "key": "audio-endpoint-sink",
             "ready": true,
             "state": "idle"
           },
@@ -199,6 +200,15 @@
         },
         "response_key": "audio_devices",
         "stream": null
+      },
+      {
+        "name": "bluetooth.audio.setDefault",
+        "params_example": {
+          "device_key": "device-opaque",
+          "endpoint_key": "audio-endpoint-opaque"
+        },
+        "response_key": "audio_devices",
+        "stream": "bluetooth.audio.changed"
       },
       {
         "name": "bluetooth.device.operation",

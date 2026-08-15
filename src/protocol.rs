@@ -63,6 +63,12 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
         None,
     ),
     (
+        "bluetooth.audio.setDefault",
+        r#"{"device_key":"device-opaque","endpoint_key":"audio-endpoint-opaque"}"#,
+        "audio_devices",
+        Some(stream::AUDIO),
+    ),
+    (
         "bluetooth.device.operation",
         r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#,
         "operation",

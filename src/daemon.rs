@@ -75,6 +75,7 @@ impl BluetoothDaemon {
             "bluetooth.obex.snapshot" => self.obex.snapshot().await,
             "bluetooth.audio.snapshot" => audio::snapshot(Arc::clone(&self.pairing)).await,
             "bluetooth.audio.setProfile" => audio::set_profile(&self.pairing, &params).await,
+            "bluetooth.audio.setDefault" => audio::set_default(&self.pairing, &params).await,
             "bluetooth.device.operation" => self.operations.start(params).await,
             "bluetooth.pairing.respond" => match self.pairing.respond(&params).await {
                 Ok(accepted) => api::success(json!({ "result": { "accepted": accepted } })),
