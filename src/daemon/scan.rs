@@ -205,8 +205,7 @@ impl ScanCoordinator {
                     "Bluetooth scan completion",
                     stop_adapters(&backend, &adapters),
                 )
-                .await
-                .and_then(|result| result);
+                .await;
                 match result {
                     Ok(snapshot) => {
                         tasks.lock().await.remove(&task_id);

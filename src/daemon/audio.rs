@@ -42,50 +42,74 @@ fn device_address(device: &audio::AudioDevice) -> Option<bluer::Address> {
     }
 }
 
-pub(super) async fn set_default(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
-    let (device_key, endpoint_key) = match params.require_strings("device_key", "endpoint_key") {
-        Ok(params) => params,
-        Err(error) => return api::error("validation-error", error.to_string()),
-    };
-    let devices = match devices().await {
-        Ok(devices) => devices,
-        Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
-    };
-    let selection = devices.into_iter().find_map(|device| {
-        let address = device_address(&device)?;
-        if device.adapter.is_empty() || pairing.device_key(&device.adapter, address) != device_key {
-            return None;
-        }
-        for (kind, available) in [
-            ("sink", device.sink.is_some()),
-            ("source", device.source.is_some()),
-        ] {
-            if available && audio::endpoint_key(device_key, kind) == endpoint_key {
-                return Some((device.address, kind));
-            }
-        }
-        None
-    });
-    let Some((address, kind)) = selection else {
-        return api::error(
-            "audio-endpoint-unavailable",
-            "Bluetooth audio endpoint is not available".to_string(),
-        );
-    };
-    let result = tokio::task::spawn_blocking(move || match kind {
-        "sink" => audio::set_default_sink(&address),
-        _ => audio::set_default_source(&address),
-    })
-    .await;
-    match result {
-        Ok(Ok(())) => snapshot(Arc::clone(pairing)).await,
-        Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
-        Err(error) => api::error("audio-operation-failed", error.to_string()),
+type AudioOperation = Box<dyn FnOnce() -> Result<()> + Send>;
+type SelectOperation = fn(&str, &str, audio::AudioDevice) -> Option<AudioOperation>;
+
+fn select_default(
+    device_key: &str,
+    requested_key: &str,
+    device: audio::AudioDevice,
+) -> Option<AudioOperation> {
+    let kind = [
+        ("sink", device.sink.is_some()),
+        ("source", device.source.is_some()),
+    ]
+    .into_iter()
+    .find(|(kind, available)| *available && audio::endpoint_key(device_key, kind) == requested_key)?
+    .0;
+    let address = device.address;
+    match kind {
+        "sink" => Some(Box::new(move || audio::set_default_sink(&address))),
+        _ => Some(Box::new(move || audio::set_default_source(&address))),
     }
 }
 
+fn select_profile(
+    device_key: &str,
+    requested_key: &str,
+    device: audio::AudioDevice,
+) -> Option<AudioOperation> {
+    let profile = device.profiles.into_iter().find(|profile| {
+        profile.available && audio::profile_key(device_key, &profile.name) == requested_key
+    })?;
+    Some(Box::new(move || {
+        audio::set_profile(&device.address, profile.index)
+    }))
+}
+
+pub(super) async fn set_default(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
+    apply_change(
+        pairing,
+        params,
+        "endpoint_key",
+        "audio-endpoint-unavailable",
+        "Bluetooth audio endpoint is not available",
+        select_default,
+    )
+    .await
+}
+
 pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
-    let (device_key, profile_key) = match params.require_strings("device_key", "profile_key") {
+    apply_change(
+        pairing,
+        params,
+        "profile_key",
+        "audio-profile-unavailable",
+        "Bluetooth audio profile is not available",
+        select_profile,
+    )
+    .await
+}
+
+async fn apply_change(
+    pairing: &Arc<PairingBroker>,
+    params: &Value,
+    parameter: &str,
+    unavailable_code: &str,
+    unavailable_message: &str,
+    select: SelectOperation,
+) -> Value {
+    let (device_key, requested_key) = match params.require_strings("device_key", parameter) {
         Ok(params) => params,
         Err(error) => return api::error("validation-error", error.to_string()),
     };
@@ -93,23 +117,17 @@ pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) ->
         Ok(devices) => devices,
         Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
     };
-    let selection = devices.into_iter().find_map(|device| {
+    let operation = devices.into_iter().find_map(|device| {
         let address = device_address(&device)?;
         if device.adapter.is_empty() || pairing.device_key(&device.adapter, address) != device_key {
             return None;
         }
-        let profile = device.profiles.into_iter().find(|profile| {
-            audio::profile_key(device_key, &profile.name) == profile_key && profile.available
-        })?;
-        Some((device.address, profile.index))
+        select(device_key, requested_key, device)
     });
-    let Some((address, index)) = selection else {
-        return api::error(
-            "audio-profile-unavailable",
-            "Bluetooth audio profile is not available".to_string(),
-        );
+    let Some(operation) = operation else {
+        return api::error(unavailable_code, unavailable_message.to_string());
     };
-    match tokio::task::spawn_blocking(move || audio::set_profile(&address, index)).await {
+    match tokio::task::spawn_blocking(operation).await {
         Ok(Ok(())) => snapshot(Arc::clone(pairing)).await,
         Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
         Err(error) => api::error("audio-operation-failed", error.to_string()),

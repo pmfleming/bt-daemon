@@ -43,6 +43,20 @@ pub struct Adapter {
 pub struct Device {
     pub key: String,
     pub adapter_key: String,
+    #[serde(flatten)]
+    pub identity: DeviceIdentity,
+    #[serde(flatten)]
+    pub state: DeviceState,
+    #[serde(flatten)]
+    pub services: DeviceServices,
+    #[serde(flatten)]
+    pub presentation: DevicePresentation,
+    pub policy: DevicePolicy,
+    pub capabilities: DeviceCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceIdentity {
     pub name: String,
     pub alias: String,
     pub remote_name: Option<String>,
@@ -50,17 +64,29 @@ pub struct Device {
     pub address: String,
     pub address_type: String,
     pub icon: Option<String>,
+    pub modalias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceState {
     pub paired: bool,
     pub bonded: Option<bool>,
     pub connected: bool,
-    pub services_resolved: bool,
     pub trusted: bool,
     pub blocked: bool,
     pub wake_allowed: Option<bool>,
     pub legacy_pairing: bool,
-    pub modalias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceServices {
+    pub services_resolved: bool,
     pub uuids: Vec<String>,
     pub services: Vec<Service>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicePresentation {
     pub battery: Vec<Battery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast_pair: Option<FastPairFeatures>,
@@ -69,8 +95,6 @@ pub struct Device {
     pub signal_live: bool,
     pub present: bool,
     pub last_seen_ms: Option<u64>,
-    pub policy: DevicePolicy,
-    pub capabilities: DeviceCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize)]

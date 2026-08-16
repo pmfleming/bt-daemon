@@ -74,16 +74,25 @@ pub(crate) trait Params {
     }
 }
 
+fn invalid_parameter(name: &str, expected: &str, optional: bool) -> anyhow::Error {
+    let qualifier = if optional {
+        "invalid optional"
+    } else {
+        "missing or invalid"
+    };
+    BackendError::new(
+        BackendErrorKind::InvalidInput,
+        format!("{qualifier} {expected} parameter '{name}'"),
+    )
+    .into()
+}
+
 impl Params for Value {
     fn optional_bool(&self, name: &str) -> Result<Option<bool>> {
         match self.get(name) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::Bool(value)) => Ok(Some(*value)),
-            _ => Err(BackendError::new(
-                BackendErrorKind::InvalidInput,
-                format!("invalid optional boolean parameter '{name}'"),
-            )
-            .into()),
+            _ => Err(invalid_parameter(name, "boolean", true)),
         }
     }
 
@@ -91,48 +100,28 @@ impl Params for Value {
         match self.get(name) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
-            _ => Err(BackendError::new(
-                BackendErrorKind::InvalidInput,
-                format!("invalid optional string parameter '{name}'"),
-            )
-            .into()),
+            _ => Err(invalid_parameter(name, "string", true)),
         }
     }
 
     fn require_bool(&self, name: &str) -> Result<bool> {
-        self.get(name).and_then(Value::as_bool).ok_or_else(|| {
-            BackendError::new(
-                BackendErrorKind::InvalidInput,
-                format!("missing or invalid boolean parameter '{name}'"),
-            )
-            .into()
-        })
+        self.get(name)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid_parameter(name, "boolean", false))
     }
 
     fn require_string(&self, name: &str) -> Result<&str> {
         self.get(name)
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                BackendError::new(
-                    BackendErrorKind::InvalidInput,
-                    format!("missing or invalid string parameter '{name}'"),
-                )
-                .into()
-            })
+            .ok_or_else(|| invalid_parameter(name, "string", false))
     }
 
     fn require_u32(&self, name: &str) -> Result<u32> {
         self.get(name)
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| {
-                BackendError::new(
-                    BackendErrorKind::InvalidInput,
-                    format!("missing or invalid unsigned integer parameter '{name}'"),
-                )
-                .into()
-            })
+            .ok_or_else(|| invalid_parameter(name, "unsigned integer", false))
     }
 }
 

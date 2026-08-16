@@ -6,7 +6,10 @@ use bluer::{Adapter as BluezAdapter, Device as BluezDevice};
 use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::DeviceIdentityRegistry,
-    model::{Adapter, Battery, Device, DeviceCapabilities, Service, Snapshot, presentation_type},
+    model::{
+        Adapter, Battery, Device, DeviceCapabilities, DeviceIdentity, DevicePresentation,
+        DeviceServices, DeviceState, Service, Snapshot, presentation_type,
+    },
 };
 
 use super::{
@@ -40,9 +43,9 @@ pub(super) async fn build(backend: &BluezBackend) -> Result<Snapshot> {
     }
     snapshot.devices.sort_by_key(|device| {
         (
-            !device.connected,
-            !device.paired,
-            device.name.to_lowercase(),
+            !device.state.connected,
+            !device.state.paired,
+            device.identity.name.to_lowercase(),
         )
     });
     let powered = snapshot.adapters.iter().any(|adapter| adapter.powered);
@@ -134,7 +137,7 @@ struct DeviceMetadata {
     uuids: Vec<String>,
 }
 
-struct DeviceState {
+struct BluezDeviceState {
     paired: bool,
     connected: bool,
     trusted: bool,
@@ -143,7 +146,7 @@ struct DeviceState {
     live_rssi: Option<i16>,
 }
 
-impl DeviceState {
+impl BluezDeviceState {
     async fn read(device: &BluezDevice) -> Result<Self> {
         Ok(Self {
             paired: bluez_result(device.is_paired().await, "read device paired state")?,
@@ -198,7 +201,7 @@ async fn device_snapshot(
     device: &BluezDevice,
     adapter_key: &str,
 ) -> Result<Option<Device>> {
-    let state = DeviceState::read(device).await?;
+    let state = BluezDeviceState::read(device).await?;
     let present = state.present();
     let identity = device.address();
     let key = backend.identities.device_key(adapter.name(), identity);
@@ -226,11 +229,13 @@ async fn device_snapshot(
     let last_seen_ms = present.then_some(now_ms).or_else(|| {
         cached
             .as_ref()
-            .and_then(|cached| cached.device.last_seen_ms)
+            .and_then(|cached| cached.device.presentation.last_seen_ms)
     });
-    let rssi = state
-        .live_rssi
-        .or_else(|| cached.as_ref().and_then(|cached| cached.device.rssi));
+    let rssi = state.live_rssi.or_else(|| {
+        cached
+            .as_ref()
+            .and_then(|cached| cached.device.presentation.rssi)
+    });
     let observed_battery = device_batteries(
         device,
         identity,
@@ -265,31 +270,39 @@ async fn device_snapshot(
     let snapshot = Device {
         key: key.clone(),
         adapter_key: adapter_key.to_string(),
-        name: metadata.alias.clone(),
-        alias: metadata.alias,
-        remote_name: metadata.remote_name,
-        device_type,
-        address: identity.to_string(),
-        address_type: metadata.address_type,
-        icon,
-        paired: state.paired,
-        bonded: bonded_property(&backend.system_bus, adapter.name(), identity).await,
-        connected: state.connected,
-        services_resolved: metadata.services_resolved,
-        trusted: state.trusted,
-        blocked: state.blocked,
-        wake_allowed: state.wake_allowed,
-        legacy_pairing: metadata.legacy_pairing,
-        modalias: metadata.modalias,
-        uuids: metadata.uuids,
-        services,
-        battery,
-        fast_pair: fast_pair_features,
-        rssi,
-        signal_strength: rssi.map(signal_strength),
-        signal_live: state.live_rssi.is_some(),
-        present,
-        last_seen_ms,
+        identity: DeviceIdentity {
+            name: metadata.alias.clone(),
+            alias: metadata.alias,
+            remote_name: metadata.remote_name,
+            device_type,
+            address: identity.to_string(),
+            address_type: metadata.address_type,
+            icon,
+            modalias: metadata.modalias,
+        },
+        state: DeviceState {
+            paired: state.paired,
+            bonded: bonded_property(&backend.system_bus, adapter.name(), identity).await,
+            connected: state.connected,
+            trusted: state.trusted,
+            blocked: state.blocked,
+            wake_allowed: state.wake_allowed,
+            legacy_pairing: metadata.legacy_pairing,
+        },
+        services: DeviceServices {
+            services_resolved: metadata.services_resolved,
+            uuids: metadata.uuids,
+            services,
+        },
+        presentation: DevicePresentation {
+            battery,
+            fast_pair: fast_pair_features,
+            rssi,
+            signal_strength: rssi.map(signal_strength),
+            signal_live: state.live_rssi.is_some(),
+            present,
+            last_seen_ms,
+        },
         policy: backend.management.device_policy(&key),
         capabilities,
     };
@@ -339,20 +352,20 @@ fn presentation(
 
 fn cached_device_view(cached: &CachedDevice) -> Device {
     let mut device = cached.device.clone();
-    device.connected = false;
-    device.present = false;
-    device.signal_live = false;
-    let has_fast_pair = device.uuids.iter().any(|uuid| {
+    device.state.connected = false;
+    device.presentation.present = false;
+    device.presentation.signal_live = false;
+    let has_fast_pair = device.services.uuids.iter().any(|uuid| {
         uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
             || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
     });
     device.capabilities = device_capabilities(
-        device.paired,
+        device.state.paired,
         false,
-        device.blocked,
-        device.wake_allowed,
+        device.state.blocked,
+        device.state.wake_allowed,
         has_fast_pair,
-        device.fast_pair.as_ref(),
+        device.presentation.fast_pair.as_ref(),
     );
     device
 }

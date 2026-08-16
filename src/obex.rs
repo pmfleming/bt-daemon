@@ -407,8 +407,7 @@ impl IncomingBroker {
                     &events,
                 ),
             )
-            .await
-            .and_then(|result| result);
+            .await;
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
                 let error = serde_json::json!({
@@ -697,49 +696,68 @@ struct IncomingDetails {
     size: u64,
 }
 
+async fn read_properties(
+    connection: &zbus::Connection,
+    path: OwnedObjectPath,
+    interface: &'static str,
+    description: &'static str,
+) -> Result<HashMap<String, OwnedValue>> {
+    PropertiesProxy::builder(connection)
+        .destination(BUS_NAME)?
+        .path(path)?
+        .build()
+        .await?
+        .get_all(interface.try_into()?)
+        .await
+        .with_context(|| format!("read {description}"))
+}
+
+fn property_path(values: &HashMap<String, OwnedValue>, name: &str) -> Option<OwnedObjectPath> {
+    values
+        .get(name)?
+        .try_clone()
+        .ok()
+        .and_then(|value| OwnedObjectPath::try_from(value).ok())
+}
+
+fn incoming_name(values: &HashMap<String, OwnedValue>) -> String {
+    property_string(values, "Name")
+        .or_else(|| {
+            let filename = property_string(values, "Filename")?;
+            Path::new(&filename)
+                .file_name()?
+                .to_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "bluetooth-transfer".into())
+}
+
 async fn incoming_details(
     connection: &zbus::Connection,
     transfer_path: &OwnedObjectPath,
 ) -> Result<IncomingDetails> {
-    let transfer = PropertiesProxy::builder(connection)
-        .destination(BUS_NAME)?
-        .path(transfer_path.clone())?
-        .build()
-        .await?;
-    let values = transfer
-        .get_all(TRANSFER_INTERFACE.try_into()?)
-        .await
-        .context("read incoming OBEX transfer")?;
-    let session_path = values
-        .get("Session")
-        .and_then(|value| value.try_clone().ok())
-        .and_then(|value| OwnedObjectPath::try_from(value).ok())
-        .context("incoming OBEX transfer has no session")?;
-    let session = PropertiesProxy::builder(connection)
-        .destination(BUS_NAME)?
-        .path(session_path)?
-        .build()
-        .await?;
-    let session_values = session
-        .get_all(SESSION_INTERFACE.try_into()?)
-        .await
-        .context("read incoming OBEX session")?;
-    let name = property_string(&values, "Name")
-        .or_else(|| {
-            property_string(&values, "Filename").and_then(|value| {
-                Path::new(&value)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_string)
-            })
-        })
-        .unwrap_or_else(|| "bluetooth-transfer".into());
+    let values = read_properties(
+        connection,
+        transfer_path.clone(),
+        TRANSFER_INTERFACE,
+        "incoming OBEX transfer",
+    )
+    .await?;
+    let session_path =
+        property_path(&values, "Session").context("incoming OBEX transfer has no session")?;
+    let session_values = read_properties(
+        connection,
+        session_path,
+        SESSION_INTERFACE,
+        "incoming OBEX session",
+    )
+    .await?;
     Ok(IncomingDetails {
         source: property_string(&session_values, "Source")
             .context("incoming OBEX session has no source")?,
         destination: property_string(&session_values, "Destination")
             .context("incoming OBEX session has no destination")?,
-        name,
+        name: incoming_name(&values),
         media_type: property_string(&values, "Type"),
         size: property_u64(&values, "Size").unwrap_or(0),
     })

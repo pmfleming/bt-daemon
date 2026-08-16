@@ -249,7 +249,7 @@ impl ManagementStore {
             connected_device_keys: snapshot
                 .devices
                 .iter()
-                .filter(|device| device.connected)
+                .filter(|device| device.state.connected)
                 .map(|device| device.key.clone())
                 .collect(),
         };

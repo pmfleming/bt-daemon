@@ -156,8 +156,7 @@ impl OutgoingTransfers {
                     let _ = update_events.send(update_event.updated(update));
                 }),
             )
-            .await
-            .and_then(|result| result);
+            .await;
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
                 tracing::warn!(request_id = %task_id, error = %error, error_chain = %format!("{error:#}"), "outgoing OBEX transfer failed");

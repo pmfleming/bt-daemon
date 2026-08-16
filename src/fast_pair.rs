@@ -739,6 +739,22 @@ fn provisioning_request(
     Ok((shared_key, write))
 }
 
+async fn provisioning_characteristics(
+    device: &Device,
+    uuids: FastPairUuids,
+) -> Result<(Characteristic, Characteristic)> {
+    let service = find_service(device, uuids.service)
+        .await?
+        .context("Fast Pair GATT service is unavailable for account-key provisioning")?;
+    let pairing = find_characteristic(&service, uuids.key_based_pairing)
+        .await?
+        .context("Fast Pair key-based pairing characteristic is unavailable")?;
+    let account_key = find_characteristic(&service, uuids.account_key)
+        .await?
+        .context("Fast Pair account key characteristic is unavailable")?;
+    Ok((pairing, account_key))
+}
+
 async fn complete_key_pairing(
     pairing: &Characteristic,
     request: &[u8],
@@ -769,6 +785,20 @@ async fn complete_key_pairing(
         "Fast Pair provider response did not match the paired Bluetooth device"
     );
     Ok(())
+}
+
+async fn write_account_key(
+    characteristic: &Characteristic,
+    shared_key: &[u8; 16],
+) -> Result<[u8; 16]> {
+    let account_key = AccountKeyStore::generate();
+    let mut encrypted = account_key;
+    crypt_block(shared_key, &mut encrypted, true);
+    characteristic
+        .write(&encrypted)
+        .await
+        .context("write encrypted Fast Pair account key")?;
+    Ok(account_key)
 }
 
 impl FastPairBatteryProvider {
@@ -904,16 +934,8 @@ impl FastPairBatteryProvider {
             .await?;
         let ble_address = runtime.ble_address.unwrap_or_else(|| device.address());
         let ble_device = resolve_ble_device(adapter, ble_address).await?;
-        let service = find_service(&ble_device, self.uuids.service)
-            .await?
-            .context("Fast Pair GATT service is unavailable for account-key provisioning")?;
-        let pairing = find_characteristic(&service, self.uuids.key_based_pairing)
-            .await?
-            .context("Fast Pair key-based pairing characteristic is unavailable")?;
-        let account_key_characteristic = find_characteristic(&service, self.uuids.account_key)
-            .await?
-            .context("Fast Pair account key characteristic is unavailable")?;
-
+        let (pairing, account_key_characteristic) =
+            provisioning_characteristics(&ble_device, self.uuids).await?;
         let local_address = adapter
             .address()
             .await
@@ -922,13 +944,7 @@ impl FastPairBatteryProvider {
             provisioning_request(anti_spoofing_key, ble_address, local_address)?;
         complete_key_pairing(&pairing, &request, &shared_key, device.address()).await?;
 
-        let account_key = AccountKeyStore::generate();
-        let mut encrypted_account_key = account_key;
-        crypt_block(&shared_key, &mut encrypted_account_key, true);
-        account_key_characteristic
-            .write(&encrypted_account_key)
-            .await
-            .context("write encrypted Fast Pair account key")?;
+        let account_key = write_account_key(&account_key_characteristic, &shared_key).await?;
         let device_key = self
             .identities
             .device_key(device.adapter_name(), device.address());
@@ -1040,8 +1056,7 @@ impl FastPairBatteryProvider {
                 "Fast Pair message stream",
                 run_message_stream(Arc::clone(&provider), address, stream),
             )
-            .await
-            .and_then(|result| result);
+            .await;
             if let Err(error) = result {
                 tracing::warn!(%address, %transport, error = %error, error_chain = %format!("{error:#}"), "Fast Pair battery stream failed");
             } else {
@@ -1148,8 +1163,7 @@ impl FastPairBatteryProvider {
                 .context("Fast Pair profile connection timed out")?
                 .context("Fast Pair profile connection failed")
             })
-            .await
-            .and_then(|result| result);
+            .await;
             if let Err(error) = result {
                 tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "Fast Pair RFCOMM connection failed");
                 provider.connection_failed(address).await;
@@ -1168,8 +1182,7 @@ impl FastPairBatteryProvider {
                     .await
                     .context("Fast Pair BLE L2CAP connection timed out")?
             })
-            .await
-            .and_then(|result| result);
+            .await;
             match result {
                 Ok(stream) if provider.mark_connected(address).await => {
                     tracing::debug!(%address, transport = "BLE L2CAP", "Fast Pair Message Stream connected");

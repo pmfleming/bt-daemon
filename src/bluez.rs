@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -31,11 +27,13 @@ use crate::{
     identity::DeviceIdentityRegistry,
     management::{DevicePolicy, ManagementStore},
     model::{Device, Snapshot},
-    pairing::PairingBroker,
     rfkill,
 };
 
+mod recovery;
 mod snapshot;
+
+pub use recovery::RecoveringBackend;
 
 const DISCOVERED_DEVICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
@@ -54,127 +52,6 @@ pub struct BluezBackend {
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
     management: ManagementStore,
-}
-
-pub struct RecoveringBackend {
-    current: RwLock<Arc<BluezBackend>>,
-    changes: broadcast::Sender<()>,
-    agent: Mutex<Option<AgentHandle>>,
-}
-
-impl RecoveringBackend {
-    pub fn new(initial: Arc<BluezBackend>) -> Arc<Self> {
-        let (changes, _) = broadcast::channel(64);
-        let backend = Arc::new(Self {
-            current: RwLock::new(Arc::clone(&initial)),
-            changes,
-            agent: Mutex::new(None),
-        });
-        backend.forward_changes(initial);
-        backend
-    }
-
-    pub async fn set_agent(&self, agent: AgentHandle) {
-        *self.agent.lock().await = Some(agent);
-    }
-
-    fn current(&self) -> Arc<BluezBackend> {
-        self.current
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
-    }
-
-    fn forward_changes(&self, backend: Arc<BluezBackend>) {
-        let mut receiver = backend.subscribe_changes();
-        let changes = self.changes.clone();
-        crate::task::spawn("recovering-bluez-change-forwarder", async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = changes.send(());
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
-    }
-
-    pub fn start_recovery(self: &Arc<Self>, pairing: Arc<PairingBroker>) {
-        let backend = Arc::clone(self);
-        crate::task::spawn("bluez-session-recovery", async move {
-            if let Err(error) = backend.monitor_owner(pairing).await {
-                tracing::error!(%error, "BlueZ recovery monitor stopped");
-            }
-        });
-    }
-
-    async fn monitor_owner(&self, pairing: Arc<PairingBroker>) -> Result<()> {
-        let connection = zbus::Connection::system()
-            .await
-            .context("connect BlueZ recovery monitor to system D-Bus")?;
-        let proxy = zbus::Proxy::new(
-            &connection,
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-        )
-        .await
-        .context("create BlueZ recovery owner proxy")?;
-        let mut changes = proxy
-            .receive_signal("NameOwnerChanged")
-            .await
-            .context("subscribe to BlueZ owner changes")?;
-        while let Some(message) = changes.next().await {
-            let (name, old_owner, new_owner): (String, String, String) = message
-                .body()
-                .deserialize()
-                .context("decode BlueZ owner change")?;
-            if name != "org.bluez" || old_owner == new_owner {
-                continue;
-            }
-            let _ = self.changes.send(());
-            if new_owner.is_empty() {
-                tracing::warn!(
-                    "BlueZ disappeared; retaining daemon API while waiting for recovery"
-                );
-                continue;
-            }
-            tracing::info!("BlueZ appeared; rebuilding Bluetooth backend");
-            loop {
-                match BluezBackend::new().await {
-                    Ok(replacement) => {
-                        let replacement = Arc::new(replacement);
-                        replacement.apply_startup_policy().await;
-                        replacement.start_monitoring();
-                        replacement.start_lifecycle_monitoring();
-                        match replacement.register_agent(pairing.agent()).await {
-                            Ok(agent) => *self.agent.lock().await = Some(agent),
-                            Err(error) => {
-                                tracing::warn!(%error, "could not restore the Bluetooth pairing agent");
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
-                        }
-                        *self
-                            .current
-                            .write()
-                            .unwrap_or_else(|poison| poison.into_inner()) =
-                            Arc::clone(&replacement);
-                        self.forward_changes(replacement);
-                        let _ = self.changes.send(());
-                        tracing::info!("Bluetooth backend recovered without restarting bt-daemon");
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "Bluetooth backend recovery is retrying");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        bail!("BlueZ recovery owner stream ended")
-    }
 }
 
 impl BluezBackend {
@@ -692,66 +569,6 @@ impl BluetoothBackend for BluezBackend {
         let snapshot = self.snapshot().await?;
         self.management.remember_snapshot(&snapshot);
         Ok(snapshot)
-    }
-}
-
-#[async_trait]
-impl BluetoothBackend for RecoveringBackend {
-    fn subscribe_changes(&self) -> broadcast::Receiver<()> {
-        self.changes.subscribe()
-    }
-
-    async fn snapshot(&self) -> Result<Snapshot> {
-        self.current().snapshot().await
-    }
-
-    async fn set_powered(&self, adapter_key: Option<&str>, powered: bool) -> Result<Snapshot> {
-        self.current().set_powered(adapter_key, powered).await
-    }
-
-    async fn set_scanning(&self, adapter_key: Option<&str>, enabled: bool) -> Result<Snapshot> {
-        self.current().set_scanning(adapter_key, enabled).await
-    }
-
-    async fn adapter_operation(
-        &self,
-        adapter_key: &str,
-        operation: AdapterOperation,
-        params: &Value,
-    ) -> Result<Snapshot> {
-        self.current()
-            .adapter_operation(adapter_key, operation, params)
-            .await
-    }
-
-    async fn update_management(&self, params: &Value) -> Result<Snapshot> {
-        self.current().update_management(params).await
-    }
-
-    async fn update_device_policy(&self, device_key: &str, params: &Value) -> Result<Snapshot> {
-        self.current()
-            .update_device_policy(device_key, params)
-            .await
-    }
-
-    async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
-        self.current().obex_target(device_key).await
-    }
-
-    async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote> {
-        self.current().obex_remote(source, destination).await
-    }
-
-    async fn device_operation(
-        &self,
-        device_key: &str,
-        operation: DeviceOperation,
-        params: &Value,
-        progress: OperationProgress,
-    ) -> Result<Snapshot> {
-        self.current()
-            .device_operation(device_key, operation, params, progress)
-            .await
     }
 }
 

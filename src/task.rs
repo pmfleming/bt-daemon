@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use futures::FutureExt;
 use tokio::task::JoinHandle;
 
-pub(crate) async fn catch<T>(name: &'static str, future: impl Future<Output = T>) -> Result<T> {
+async fn catch_unwind<T>(name: &'static str, future: impl Future<Output = T>) -> Result<T> {
     AssertUnwindSafe(future)
         .catch_unwind()
         .await
@@ -18,13 +18,20 @@ pub(crate) async fn catch<T>(name: &'static str, future: impl Future<Output = T>
         })
 }
 
+pub(crate) async fn catch<T>(
+    name: &'static str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    catch_unwind(name, future).await?
+}
+
 pub(crate) fn spawn(
     name: &'static str,
     future: impl Future<Output = ()> + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::trace!(task = name, "background task started");
-        match catch(name, future).await {
+        match catch_unwind(name, future).await {
             Ok(()) => tracing::trace!(task = name, "background task ended"),
             Err(error) => tracing::error!(task = name, error = %error, "background task panicked"),
         }

@@ -194,8 +194,7 @@ impl OperationCoordinator {
                 "Bluetooth backend device operation",
                 backend.device_operation(&task_event.device_key, task_operation, &params, progress),
             )
-            .await
-            .and_then(|result| result);
+            .await;
             match &result {
                 Ok(_) => {
                     tracing::info!(request_id = %task_event.request_id, "Bluetooth device operation completed")

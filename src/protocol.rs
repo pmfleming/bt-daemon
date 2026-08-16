@@ -13,120 +13,45 @@ pub mod stream {
     pub const OBEX: &str = "bluetooth.obex.transfer";
 }
 
-pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
-    ("bluetooth.protocol.describe", "{}", "registry", None),
-    (
-        "bluetooth.snapshot",
-        "{}",
-        "snapshot",
-        Some(stream::CHANGED),
-    ),
-    (
-        "bluetooth.setPowered",
-        r#"{"adapter_key":null,"powered":true}"#,
-        "snapshot",
-        Some(stream::CHANGED),
-    ),
-    (
-        "bluetooth.scan",
-        r#"{"adapter_key":"adapter-opaque","enabled":true,"timeout_ms":15000}"#,
-        "scan",
-        Some(stream::SCAN),
-    ),
-    (
-        "bluetooth.adapter.operation",
-        r#"{"key":"adapter-opaque","operation":"set-discoverable","discoverable":true}"#,
-        "snapshot",
-        Some(stream::CHANGED),
-    ),
-    (
-        "bluetooth.management.update",
-        r#"{"launch_state":"remember","reconnect_on_resume":true,"trust_after_pair":true,"preferred_adapter_key":"adapter-opaque","show_blocked_devices":false,"show_recent_devices":false}"#,
-        "snapshot",
-        Some(stream::CHANGED),
-    ),
-    (
-        "bluetooth.device.policy.update",
-        r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#,
-        "snapshot",
-        Some(stream::CHANGED),
-    ),
-    ("bluetooth.obex.snapshot", "{}", "obex", None),
-    (
-        "bluetooth.obex.send",
-        r#"{"device_key":"device-opaque","path":"/selected/file"}"#,
-        "transfer",
-        Some(stream::OBEX),
-    ),
-    (
-        "bluetooth.obex.respond",
-        r#"{"request_id":"obex-incoming-1","accept":true}"#,
-        "authorization",
-        Some(stream::OBEX),
-    ),
-    ("bluetooth.audio.snapshot", "{}", "audio_devices", None),
-    (
-        "bluetooth.audio.setProfile",
-        r#"{"device_key":"device-opaque","profile_key":"audio-profile-opaque"}"#,
-        "audio_devices",
-        None,
-    ),
-    (
-        "bluetooth.audio.setDefault",
-        r#"{"device_key":"device-opaque","endpoint_key":"audio-endpoint-opaque"}"#,
-        "audio_devices",
-        Some(stream::AUDIO),
-    ),
-    ("bluetooth.requests.snapshot", "{}", "requests", None),
-    (
-        "bluetooth.device.operation",
-        r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#,
-        "operation",
-        Some(stream::OPERATION),
-    ),
-    (
-        "bluetooth.pairing.respond",
-        r#"{"request_id":"pairing-1","accept":true,"value":null}"#,
-        "result",
-        Some(stream::PAIRING),
-    ),
-];
+macro_rules! method_registry {
+    ($($name:literal, $params:literal, $response:literal, $stream:expr;)+) => {
+        &[$(($name, $params, $response, $stream)),+]
+    };
+}
 
-pub const STREAMS: &[(&str, &[&str])] = &[
-    (stream::CHANGED, &["subscribed", "changed", "unavailable"]),
-    (
-        stream::PAIRING,
-        &["requested", "display", "cancelled", "lagged"],
-    ),
-    (
-        stream::OPERATION,
-        &[
-            "started",
-            "progress",
-            "completed",
-            "failed",
-            "cancelled",
-            "lagged",
-        ],
-    ),
-    (
-        stream::SCAN,
-        &["started", "completed", "failed", "cancelled", "lagged"],
-    ),
-    (
-        stream::OBEX,
-        &[
-            "authorization-requested",
-            "queued",
-            "progress",
-            "completed",
-            "failed",
-            "cancelled",
-            "lagged",
-        ],
-    ),
-    (stream::AUDIO, &["subscribed", "changed", "unavailable"]),
-];
+pub const METHODS: &[(&str, &str, &str, Option<&str>)] = method_registry! {
+    "bluetooth.protocol.describe", "{}", "registry", None;
+    "bluetooth.snapshot", "{}", "snapshot", Some(stream::CHANGED);
+    "bluetooth.setPowered", r#"{"adapter_key":null,"powered":true}"#, "snapshot", Some(stream::CHANGED);
+    "bluetooth.scan", r#"{"adapter_key":"adapter-opaque","enabled":true,"timeout_ms":15000}"#, "scan", Some(stream::SCAN);
+    "bluetooth.adapter.operation", r#"{"key":"adapter-opaque","operation":"set-discoverable","discoverable":true}"#, "snapshot", Some(stream::CHANGED);
+    "bluetooth.management.update", r#"{"launch_state":"remember","reconnect_on_resume":true,"trust_after_pair":true,"preferred_adapter_key":"adapter-opaque","show_blocked_devices":false,"show_recent_devices":false}"#, "snapshot", Some(stream::CHANGED);
+    "bluetooth.device.policy.update", r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#, "snapshot", Some(stream::CHANGED);
+    "bluetooth.obex.snapshot", "{}", "obex", None;
+    "bluetooth.obex.send", r#"{"device_key":"device-opaque","path":"/selected/file"}"#, "transfer", Some(stream::OBEX);
+    "bluetooth.obex.respond", r#"{"request_id":"obex-incoming-1","accept":true}"#, "authorization", Some(stream::OBEX);
+    "bluetooth.audio.snapshot", "{}", "audio_devices", None;
+    "bluetooth.audio.setProfile", r#"{"device_key":"device-opaque","profile_key":"audio-profile-opaque"}"#, "audio_devices", None;
+    "bluetooth.audio.setDefault", r#"{"device_key":"device-opaque","endpoint_key":"audio-endpoint-opaque"}"#, "audio_devices", Some(stream::AUDIO);
+    "bluetooth.requests.snapshot", "{}", "requests", None;
+    "bluetooth.device.operation", r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#, "operation", Some(stream::OPERATION);
+    "bluetooth.pairing.respond", r#"{"request_id":"pairing-1","accept":true,"value":null}"#, "result", Some(stream::PAIRING);
+};
+
+macro_rules! stream_registry {
+    ($($name:expr => [$($event:literal),+];)+) => {
+        &[$(($name, &[$($event),+])),+]
+    };
+}
+
+pub const STREAMS: &[(&str, &[&str])] = stream_registry! {
+    stream::CHANGED => ["subscribed", "changed", "unavailable"];
+    stream::PAIRING => ["requested", "display", "cancelled", "lagged"];
+    stream::OPERATION => ["started", "progress", "completed", "failed", "cancelled", "lagged"];
+    stream::SCAN => ["started", "completed", "failed", "cancelled", "lagged"];
+    stream::OBEX => ["authorization-requested", "queued", "progress", "completed", "failed", "cancelled", "lagged"];
+    stream::AUDIO => ["subscribed", "changed", "unavailable"];
+};
 
 fn method_description(name: &str) -> &'static str {
     match name {
