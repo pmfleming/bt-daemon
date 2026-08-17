@@ -1002,6 +1002,14 @@ async fn wait_for_services(device: &BluezDevice) {
     }
 }
 
+#[derive(Clone)]
+struct AudioPolicyRequest {
+    device_key: String,
+    address: String,
+    preferred_profile_key: Option<String>,
+    switch_output: bool,
+}
+
 async fn apply_audio_policy(
     device_key: &str,
     address: bluer::Address,
@@ -1009,47 +1017,61 @@ async fn apply_audio_policy(
     progress: &OperationProgress,
 ) -> Result<()> {
     progress("waiting-for-audio");
+    let request = AudioPolicyRequest {
+        device_key: device_key.to_string(),
+        address: address.to_string(),
+        preferred_profile_key: policy.preferred_audio_profile_key.clone(),
+        switch_output: policy.audio_route_on_connect == "switch",
+    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let address = address.to_string();
     loop {
-        let requested_profile = policy.preferred_audio_profile_key.clone();
-        let switch_output = policy.audio_route_on_connect == "switch";
-        let key = device_key.to_string();
-        let target_address = address.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<()> {
-            let devices = audio::probe()?;
-            let device = devices
-                .into_iter()
-                .find(|device| device.address.eq_ignore_ascii_case(&target_address))
-                .context("Bluetooth audio card is not ready")?;
-            if let Some(profile_key) = requested_profile {
-                let profile = device
-                    .profiles
-                    .iter()
-                    .find(|profile| {
-                        profile.available && audio::profile_key(&key, &profile.name) == profile_key
-                    })
-                    .context("preferred Bluetooth audio profile is unavailable")?;
-                if device.active_profile != Some(profile.index) {
-                    audio::set_profile(&target_address, profile.index)?;
-                }
-            }
-            if switch_output {
-                audio::set_default_sink(&target_address)?;
-            }
-            Ok(())
-        })
-        .await
-        .context("Bluetooth audio policy task failed")?;
+        let attempt = request.clone();
+        let result = tokio::task::spawn_blocking(move || apply_audio_policy_once(&attempt))
+            .await
+            .context("Bluetooth audio policy task failed")?;
         match result {
             Ok(()) => return Ok(()),
             Err(error) if tokio::time::Instant::now() < deadline => {
-                tracing::debug!(%error, %device_key, "Bluetooth audio policy is waiting for PipeWire");
+                tracing::debug!(%error, device_key, "Bluetooth audio policy is waiting for PipeWire");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(error) => return Err(error.context("apply Bluetooth per-device audio policy")),
         }
     }
+}
+
+fn apply_audio_policy_once(request: &AudioPolicyRequest) -> Result<()> {
+    let devices = audio::probe()?;
+    let device = devices
+        .into_iter()
+        .find(|device| device.address.eq_ignore_ascii_case(&request.address))
+        .context("Bluetooth audio card is not ready")?;
+    apply_preferred_audio_profile(&device, request)?;
+    if request.switch_output {
+        audio::set_default_sink(&request.address)?;
+    }
+    Ok(())
+}
+
+fn apply_preferred_audio_profile(
+    device: &audio::AudioDevice,
+    request: &AudioPolicyRequest,
+) -> Result<()> {
+    let Some(profile_key) = &request.preferred_profile_key else {
+        return Ok(());
+    };
+    let profile = device
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.available
+                && audio::profile_key(&request.device_key, &profile.name) == *profile_key
+        })
+        .context("preferred Bluetooth audio profile is unavailable")?;
+    if device.active_profile != Some(profile.index) {
+        audio::set_profile(&request.address, profile.index)?;
+    }
+    Ok(())
 }
 
 async fn connect_device(device: &BluezDevice, operation: &'static str) -> Result<()> {
