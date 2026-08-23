@@ -254,11 +254,8 @@ fn set_default_endpoint(address: &str, kind: EndpointKind) -> Result<()> {
 }
 
 fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
-    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
-    let context =
-        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
-    let core = context.connect_rc(None).context("connect to PipeWire")?;
-    let registry = core.get_registry_rc().context("open PipeWire registry")?;
+    let session = pipewire_session()?;
+    let registry = &session.registry;
     let registry_weak = registry.downgrade();
     let applied = Rc::new(Cell::new(false));
     let applied_for_registry = Rc::clone(&applied);
@@ -290,8 +287,8 @@ fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
             }
         })
         .register();
-    pipewire_roundtrip(&main_loop, &core)?;
-    pipewire_roundtrip(&main_loop, &core)?;
+    pipewire_roundtrip(&session.main_loop, &session.core)?;
+    pipewire_roundtrip(&session.main_loop, &session.core)?;
     if !applied.get() {
         anyhow::bail!("PipeWire default metadata is unavailable");
     }
@@ -301,11 +298,8 @@ fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
 fn set_profile_inner(address: &str, index: u32) -> Result<()> {
     let requested_index = index;
     let bytes = profile_parameter(index)?;
-    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
-    let context =
-        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
-    let core = context.connect_rc(None).context("connect to PipeWire")?;
-    let registry = core.get_registry_rc().context("open PipeWire registry")?;
+    let session = pipewire_session()?;
+    let registry = &session.registry;
     let registry_weak = registry.downgrade();
     let expected_name = format!("bluez_card.{}", address.replace(':', "_"));
     let confirmed = Rc::new(Cell::new(false));
@@ -336,8 +330,8 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
             }
         })
         .register();
-    pipewire_roundtrip(&main_loop, &core)?;
-    pipewire_roundtrip(&main_loop, &core)?;
+    pipewire_roundtrip(&session.main_loop, &session.core)?;
+    pipewire_roundtrip(&session.main_loop, &session.core)?;
     if !confirmed.get() {
         anyhow::bail!("PipeWire did not activate the requested Bluetooth audio profile");
     }
@@ -394,11 +388,8 @@ fn apply_profile(
 }
 
 fn probe_inner() -> Result<Vec<AudioDevice>> {
-    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
-    let context =
-        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
-    let core = context.connect_rc(None).context("connect to PipeWire")?;
-    let registry = core.get_registry_rc().context("open PipeWire registry")?;
+    let session = pipewire_session()?;
+    let registry = &session.registry;
     let registry_weak = registry.downgrade();
     let state = ProbeState::default();
     let state_for_registry = state.clone();
@@ -411,9 +402,28 @@ fn probe_inner() -> Result<Vec<AudioDevice>> {
         })
         .register();
 
-    pipewire_roundtrip(&main_loop, &core)?;
-    pipewire_roundtrip(&main_loop, &core)?;
+    pipewire_roundtrip(&session.main_loop, &session.core)?;
+    pipewire_roundtrip(&session.main_loop, &session.core)?;
     Ok(state.finish())
+}
+
+struct PipewireSession {
+    main_loop: pw::main_loop::MainLoopRc,
+    core: pw::core::CoreRc,
+    registry: pw::registry::RegistryRc,
+}
+
+fn pipewire_session() -> Result<PipewireSession> {
+    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
+    let context =
+        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
+    let core = context.connect_rc(None).context("connect to PipeWire")?;
+    let registry = core.get_registry_rc().context("open PipeWire registry")?;
+    Ok(PipewireSession {
+        main_loop,
+        core,
+        registry,
+    })
 }
 
 fn pipewire_roundtrip(

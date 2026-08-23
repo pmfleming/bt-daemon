@@ -130,12 +130,9 @@ impl OperationCoordinator {
     }
 
     pub(super) async fn start(&self, params: Value) -> Value {
-        let (device_key, operation) = match params.require_strings("key", "operation") {
-            Ok((key, operation)) => match DeviceOperation::try_from(operation) {
-                Ok(operation) => (key.to_string(), operation),
-                Err(error) => return api::error("validation-error", error.to_string()),
-            },
-            Err(error) => return api::error("validation-error", error.to_string()),
+        let (device_key, operation) = match operation_request(&params) {
+            Ok(request) => request,
+            Err(error) => return error,
         };
 
         let mut state = self.state.lock().await;
@@ -156,62 +153,18 @@ impl OperationCoordinator {
             operation.to_string(),
         );
         tracing::info!(%request_id, %device_key, %operation, "Bluetooth device operation queued");
-        let backend = Arc::clone(&self.backend);
-        let operation_state = Arc::clone(&self.state);
-        let events = self.events.clone();
-        let recent = Arc::clone(&self.recent);
+        let execution = OperationExecution {
+            backend: Arc::clone(&self.backend),
+            state: Arc::clone(&self.state),
+            events: self.events.clone(),
+            recent: Arc::clone(&self.recent),
+        };
         let task_event = queued.clone();
-        let task_operation = operation;
         let (start_sender, start_receiver) = oneshot::channel();
         let handle = crate::task::spawn("device-operation", async move {
-            if start_receiver.await.is_err() {
-                return;
-            }
-            tracing::info!(request_id = %task_event.request_id, device_key = %task_event.device_key, operation = %task_operation, "Bluetooth device operation started");
-            let started = task_event.with_state("started", "running");
-            if let Some(task) = operation_state
-                .lock()
-                .await
-                .tasks
-                .get_mut(&task_event.request_id)
-            {
-                task.event = started.clone();
-            }
-            let _ = events.send(started);
-            let progress_events = events.clone();
-            let progress_event = task_event.clone();
-            let progress_state = Arc::clone(&operation_state);
-            let progress = Arc::new(move |stage: &'static str| {
-                let update = progress_event.progress(stage);
-                if let Ok(mut state) = progress_state.try_lock()
-                    && let Some(task) = state.tasks.get_mut(&progress_event.request_id)
-                {
-                    task.event = update.clone();
-                }
-                let _ = progress_events.send(update);
-            });
-            let result = crate::task::catch(
-                "Bluetooth backend device operation",
-                backend.device_operation(&task_event.device_key, task_operation, &params, progress),
-            )
-            .await;
-            match &result {
-                Ok(_) => {
-                    tracing::info!(request_id = %task_event.request_id, "Bluetooth device operation completed")
-                }
-                Err(error) => {
-                    tracing::warn!(request_id = %task_event.request_id, error = %error, error_chain = %format!("{error:#}"), "Bluetooth device operation failed")
-                }
-            }
-            let terminal = task_event.clone().finished(result);
-            let mut state = operation_state.lock().await;
-            state.tasks.remove(&task_event.request_id);
-            if state.active_devices.get(&task_event.device_key) == Some(&task_event.request_id) {
-                state.active_devices.remove(&task_event.device_key);
-            }
-            drop(state);
-            retain_terminal(&recent, terminal.clone()).await;
-            let _ = events.send(terminal);
+            execution
+                .run(task_event, operation, params, start_receiver)
+                .await;
         });
         state.tasks.insert(
             request_id.clone(),
@@ -254,6 +207,90 @@ impl OperationCoordinator {
     #[cfg(test)]
     pub(super) async fn is_empty(&self) -> bool {
         self.state.lock().await.tasks.is_empty()
+    }
+}
+
+fn operation_request(params: &Value) -> Result<(String, DeviceOperation), Value> {
+    let (key, operation) = params
+        .require_strings("key", "operation")
+        .map_err(|error| api::error("validation-error", error.to_string()))?;
+    let operation = DeviceOperation::try_from(operation)
+        .map_err(|error| api::error("validation-error", error.to_string()))?;
+    Ok((key.to_string(), operation))
+}
+
+struct OperationExecution {
+    backend: Arc<dyn BluetoothBackend>,
+    state: Arc<Mutex<OperationState>>,
+    events: broadcast::Sender<OperationEvent>,
+    recent: Arc<Mutex<VecDeque<OperationEvent>>>,
+}
+
+impl OperationExecution {
+    async fn run(
+        self,
+        event: OperationEvent,
+        operation: DeviceOperation,
+        params: Value,
+        start: oneshot::Receiver<()>,
+    ) {
+        if start.await.is_err() {
+            return;
+        }
+        tracing::info!(request_id = %event.request_id, device_key = %event.device_key, %operation, "Bluetooth device operation started");
+        self.publish_started(&event).await;
+        let progress = self.progress_reporter(&event);
+        let result = crate::task::catch(
+            "Bluetooth backend device operation",
+            self.backend
+                .device_operation(&event.device_key, operation, &params, progress),
+        )
+        .await;
+        log_operation_result(&event.request_id, &result);
+        let terminal = event.clone().finished(result);
+        self.remove_active(&event).await;
+        retain_terminal(&self.recent, terminal.clone()).await;
+        let _ = self.events.send(terminal);
+    }
+
+    async fn publish_started(&self, event: &OperationEvent) {
+        let started = event.with_state("started", "running");
+        if let Some(task) = self.state.lock().await.tasks.get_mut(&event.request_id) {
+            task.event = started.clone();
+        }
+        let _ = self.events.send(started);
+    }
+
+    fn progress_reporter(&self, event: &OperationEvent) -> Arc<dyn Fn(&'static str) + Send + Sync> {
+        let events = self.events.clone();
+        let event = event.clone();
+        let state = Arc::clone(&self.state);
+        Arc::new(move |stage| {
+            let update = event.progress(stage);
+            if let Ok(mut state) = state.try_lock()
+                && let Some(task) = state.tasks.get_mut(&event.request_id)
+            {
+                task.event = update.clone();
+            }
+            let _ = events.send(update);
+        })
+    }
+
+    async fn remove_active(&self, event: &OperationEvent) {
+        let mut state = self.state.lock().await;
+        state.tasks.remove(&event.request_id);
+        if state.active_devices.get(&event.device_key) == Some(&event.request_id) {
+            state.active_devices.remove(&event.device_key);
+        }
+    }
+}
+
+fn log_operation_result(request_id: &str, result: &anyhow::Result<crate::model::Snapshot>) {
+    match result {
+        Ok(_) => tracing::info!(%request_id, "Bluetooth device operation completed"),
+        Err(error) => {
+            tracing::warn!(%request_id, %error, error_chain = %format!("{error:#}"), "Bluetooth device operation failed")
+        }
     }
 }
 
