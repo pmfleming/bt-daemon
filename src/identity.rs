@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    model::{Battery, presentation_type},
+    model::{Battery, presentation_component_order, presentation_components, presentation_type},
     state,
 };
 
@@ -22,8 +22,21 @@ struct RememberedPresentation {
     icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    components: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     battery: Vec<Battery>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RememberedPresentationValues {
+    pub icon: Option<String>,
+    pub device_type: String,
+    pub model_id: Option<String>,
+    pub components: Vec<String>,
+    pub battery: Vec<Battery>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -113,19 +126,23 @@ impl DeviceIdentityRegistry {
         key
     }
 
-    pub fn remember_presentation(
+    pub(crate) fn remember_presentation(
         &self,
         device_key: &str,
         icon: Option<&str>,
+        model_id: Option<&str>,
         battery: &[Battery],
-    ) -> (Option<String>, Vec<Battery>, String) {
+    ) -> RememberedPresentationValues {
         let mut state = self.state();
         let (changed, remembered) = {
             let presentation = state
                 .presentations
                 .entry(device_key.to_string())
                 .or_default();
-            (presentation.update(icon, battery), presentation.values())
+            (
+                presentation.update(icon, model_id, battery),
+                presentation.values(),
+            )
         };
         self.persist_if(changed, &state, "device presentation");
         remembered
@@ -159,7 +176,7 @@ impl DeviceIdentityRegistry {
 }
 
 impl RememberedPresentation {
-    fn update(&mut self, icon: Option<&str>, battery: &[Battery]) -> bool {
+    fn update(&mut self, icon: Option<&str>, model_id: Option<&str>, battery: &[Battery]) -> bool {
         let icon = icon.filter(|value| !value.trim().is_empty());
         let observed_type = presentation_type(icon, battery);
         let resolved_type = self.resolved_type(observed_type).to_string();
@@ -169,8 +186,10 @@ impl RememberedPresentation {
             self.device_type = Some(resolved_type);
         }
         let icon_changed = self.update_icon(icon);
+        let model_changed = self.update_model_id(model_id);
+        let components_changed = self.update_components(battery);
         let battery_changed = self.update_battery(battery);
-        type_changed || icon_changed || battery_changed
+        type_changed || icon_changed || model_changed || components_changed || battery_changed
     }
 
     fn resolved_type<'a>(&'a self, observed: &'a str) -> &'a str {
@@ -196,6 +215,28 @@ impl RememberedPresentation {
         true
     }
 
+    fn update_model_id(&mut self, model_id: Option<&str>) -> bool {
+        let model_id = model_id.filter(|value| !value.trim().is_empty());
+        if model_id.is_none_or(|model_id| self.model_id.as_deref() == Some(model_id)) {
+            return false;
+        }
+        self.model_id = model_id.map(Into::into);
+        true
+    }
+
+    fn update_components(&mut self, battery: &[Battery]) -> bool {
+        let observed = presentation_components(battery);
+        if observed.is_empty() {
+            return false;
+        }
+        let previous = self.components.clone();
+        self.components.extend(observed);
+        self.components
+            .sort_by_key(|component| presentation_component_order(component));
+        self.components.dedup();
+        self.components != previous
+    }
+
     fn update_battery(&mut self, battery: &[Battery]) -> bool {
         if battery.is_empty() || self.battery == battery {
             return false;
@@ -204,12 +245,14 @@ impl RememberedPresentation {
         true
     }
 
-    fn values(&self) -> (Option<String>, Vec<Battery>, String) {
-        (
-            self.icon.clone(),
-            self.battery.clone(),
-            self.device_type().into(),
-        )
+    fn values(&self) -> RememberedPresentationValues {
+        RememberedPresentationValues {
+            icon: self.icon.clone(),
+            device_type: self.device_type().into(),
+            model_id: self.model_id.clone(),
+            components: self.components.clone(),
+            battery: self.battery.clone(),
+        }
     }
 }
 
@@ -290,17 +333,23 @@ mod tests {
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let registry = DeviceIdentityRegistry::load(Some(path.clone())).unwrap();
         let key = registry.device_key("hci0", address);
-        let expected_battery = vec![battery(64)];
-        registry.remember_presentation("device-known", Some("audio-headphones"), &expected_battery);
+        let expected_battery = component_battery("left", 64);
+        registry.remember_presentation(
+            "device-known",
+            Some("audio-headphones"),
+            Some("a1b2c3"),
+            &expected_battery,
+        );
         drop(registry);
 
         let registry = DeviceIdentityRegistry::load(Some(path)).unwrap();
         assert_eq!(key, registry.device_key("hci0", address));
-        let (icon, remembered_battery, device_type) =
-            registry.remember_presentation("device-known", None, &[]);
-        assert_eq!(icon.as_deref(), Some("audio-headphones"));
-        assert_eq!(remembered_battery, expected_battery);
-        assert_eq!(device_type, "Headphones");
+        let presentation = registry.remember_presentation("device-known", None, None, &[]);
+        assert_eq!(presentation.icon.as_deref(), Some("audio-headphones"));
+        assert_eq!(presentation.battery, expected_battery);
+        assert_eq!(presentation.device_type, "Earbuds");
+        assert_eq!(presentation.model_id.as_deref(), Some("a1b2c3"));
+        assert_eq!(presentation.components, ["left"]);
 
         let legacy_path = directory.join("legacy.json");
         fs::write(&legacy_path, r#"{"version":1,"adapters":{},"devices":{}}"#).unwrap();
@@ -313,14 +362,16 @@ mod tests {
         let registry = DeviceIdentityRegistry::in_memory();
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let key = registry.device_key("hci0", address);
-        registry.remember_presentation(&key, Some("input-mouse"), &[battery(80)]);
+        registry.remember_presentation(&key, Some("input-mouse"), None, &[battery(80)]);
         registry.forget_presentation(&key);
 
         assert_eq!(key, registry.device_key("hci0", address));
-        assert_eq!(
-            registry.remember_presentation(&key, None, &[]),
-            (None, vec![], "Bluetooth device".to_string())
-        );
+        let presentation = registry.remember_presentation(&key, None, None, &[]);
+        assert_eq!(presentation.icon, None);
+        assert_eq!(presentation.battery, vec![]);
+        assert_eq!(presentation.device_type, "Bluetooth device");
+        assert_eq!(presentation.model_id, None);
+        assert_eq!(presentation.components, Vec::<String>::new());
     }
 
     #[test]
@@ -329,16 +380,50 @@ mod tests {
         let component_battery = component_battery("left", 80);
         assert_eq!(
             registry
-                .remember_presentation("device-known", Some("audio-headset"), &component_battery)
-                .2,
+                .remember_presentation(
+                    "device-known",
+                    Some("audio-headset"),
+                    None,
+                    &component_battery,
+                )
+                .device_type,
             "Earbuds"
         );
         assert_eq!(
             registry
-                .remember_presentation("device-known", Some("audio-headphones"), &[battery(79)])
-                .2,
+                .remember_presentation(
+                    "device-known",
+                    Some("audio-headphones"),
+                    None,
+                    &[battery(79)],
+                )
+                .device_type,
             "Earbuds"
         );
+    }
+
+    #[test]
+    fn remembered_components_and_model_survive_transient_connection_metadata() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        let mut component_reports = component_battery("right", 75);
+        component_reports.extend(component_battery("left", 80));
+        let observed = registry.remember_presentation(
+            "device-known",
+            Some("audio-headset"),
+            Some("02fc97"),
+            &component_reports,
+        );
+        assert_eq!(observed.components, ["left", "right"]);
+
+        let restored = registry.remember_presentation(
+            "device-known",
+            Some("audio-headphones"),
+            None,
+            &[battery(79)],
+        );
+        assert_eq!(restored.device_type, "Earbuds");
+        assert_eq!(restored.model_id.as_deref(), Some("02fc97"));
+        assert_eq!(restored.components, ["left", "right"]);
     }
 
     #[test]
@@ -346,15 +431,15 @@ mod tests {
         let registry = DeviceIdentityRegistry::in_memory();
         assert_eq!(
             registry
-                .remember_presentation("device-known", Some("audio-headphones"), &[])
-                .2,
+                .remember_presentation("device-known", Some("audio-headphones"), None, &[])
+                .device_type,
             "Headphones"
         );
         let component_battery = component_battery("right", 75);
         assert_eq!(
             registry
-                .remember_presentation("device-known", None, &component_battery)
-                .2,
+                .remember_presentation("device-known", None, None, &component_battery)
+                .device_type,
             "Earbuds"
         );
     }

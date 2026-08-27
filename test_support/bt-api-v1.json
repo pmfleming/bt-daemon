@@ -1020,6 +1020,7 @@
               }
             },
             "connected": false,
+            "components": [],
             "icon": "audio-headset",
             "key": "device-opaque",
             "last_seen_ms": null,

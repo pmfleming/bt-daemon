@@ -8,7 +8,7 @@ use crate::{
     identity::DeviceIdentityRegistry,
     model::{
         Adapter, Battery, Device, DeviceCapabilities, DeviceIdentity, DevicePresentation,
-        DeviceServices, DeviceState, Service, Snapshot, presentation_type,
+        DeviceServices, DeviceState, Service, Snapshot, presentation_components, presentation_type,
     },
 };
 
@@ -243,18 +243,21 @@ async fn device_snapshot(
         backend.fast_pair.as_deref(),
     )
     .await?;
-    let (icon, battery, device_type) = presentation(
+    let fast_pair_features = match (state.connected, backend.fast_pair.as_deref()) {
+        (true, Some(provider)) => provider.features(device).await,
+        _ => None,
+    };
+    let presentation = presentation(
         &backend.identities,
         &key,
         state.paired,
         state.connected,
         metadata.icon,
+        fast_pair_features
+            .as_ref()
+            .and_then(|features| features.model_id.as_deref()),
         observed_battery,
     );
-    let fast_pair_features = match (state.connected, backend.fast_pair.as_deref()) {
-        (true, Some(provider)) => provider.features(device).await,
-        _ => None,
-    };
     let has_fast_pair = metadata.uuids.iter().any(|uuid| {
         uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
             || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
@@ -274,10 +277,10 @@ async fn device_snapshot(
             name: metadata.alias.clone(),
             alias: metadata.alias,
             remote_name: metadata.remote_name,
-            device_type,
+            device_type: presentation.device_type,
             address: identity.to_string(),
             address_type: metadata.address_type,
-            icon,
+            icon: presentation.icon,
             modalias: metadata.modalias,
         },
         state: DeviceState {
@@ -295,7 +298,9 @@ async fn device_snapshot(
             services,
         },
         presentation: DevicePresentation {
-            battery,
+            battery: presentation.battery,
+            components: presentation.components,
+            model_id: presentation.model_id,
             fast_pair: fast_pair_features,
             rssi,
             signal_strength: rssi.map(signal_strength),
@@ -318,36 +323,56 @@ async fn device_snapshot(
     Ok(Some(snapshot))
 }
 
+struct ResolvedPresentation {
+    icon: Option<String>,
+    device_type: String,
+    model_id: Option<String>,
+    components: Vec<String>,
+    battery: Vec<Battery>,
+}
+
 fn presentation(
     identities: &DeviceIdentityRegistry,
     key: &str,
     paired: bool,
     connected: bool,
     icon: Option<String>,
+    model_id: Option<&str>,
     battery: Vec<Battery>,
-) -> (Option<String>, Vec<Battery>, String) {
+) -> ResolvedPresentation {
     if !paired {
         identities.forget_presentation(key);
-        let device_type = presentation_type(icon.as_deref(), &battery).into();
-        return (icon, battery, device_type);
+        return ResolvedPresentation {
+            device_type: presentation_type(icon.as_deref(), &battery).into(),
+            components: presentation_components(&battery),
+            model_id: model_id.map(Into::into),
+            icon,
+            battery,
+        };
     }
-    let (remembered_icon, remembered_battery, device_type) =
-        identities.remember_presentation(key, icon.as_deref(), &battery);
+    let remembered = identities.remember_presentation(key, icon.as_deref(), model_id, &battery);
     let icon = icon.filter(|icon| !icon.trim().is_empty());
-    let restored_icon = icon.is_none() && remembered_icon.is_some();
-    let restored_battery = !connected && battery.is_empty() && !remembered_battery.is_empty();
+    let restored_icon = icon.is_none() && remembered.icon.is_some();
+    let restored_battery = !connected && battery.is_empty() && !remembered.battery.is_empty();
     tracing::trace!(
         device_key = key,
         restored_icon,
         restored_battery,
+        restored_model = model_id.is_none() && remembered.model_id.is_some(),
+        restored_components = battery.is_empty() && !remembered.components.is_empty(),
         "resolved snapshot presentation"
     );
-    let battery = if restored_battery {
-        remembered_battery
-    } else {
-        battery
-    };
-    (icon.or(remembered_icon), battery, device_type)
+    ResolvedPresentation {
+        icon: icon.or(remembered.icon),
+        device_type: remembered.device_type,
+        model_id: remembered.model_id,
+        components: remembered.components,
+        battery: if restored_battery {
+            remembered.battery
+        } else {
+            battery
+        },
+    }
 }
 
 fn cached_device_view(cached: &CachedDevice) -> Device {

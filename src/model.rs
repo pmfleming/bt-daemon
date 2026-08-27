@@ -88,6 +88,9 @@ pub struct DeviceServices {
 #[derive(Debug, Clone, Serialize)]
 pub struct DevicePresentation {
     pub battery: Vec<Battery>,
+    pub components: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast_pair: Option<FastPairFeatures>,
     pub rssi: Option<i16>,
@@ -141,6 +144,30 @@ fn is_earbud_component(report: &Battery) -> bool {
     ["left", "right"]
         .iter()
         .any(|component| report.component.eq_ignore_ascii_case(component))
+}
+
+pub(crate) fn presentation_components(battery: &[Battery]) -> Vec<String> {
+    let mut components = battery
+        .iter()
+        .filter_map(|report| {
+            ["left", "right", "case"]
+                .into_iter()
+                .find(|component| report.component.eq_ignore_ascii_case(component))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    components.sort_by_key(|component| presentation_component_order(component));
+    components.dedup();
+    components
+}
+
+pub(crate) fn presentation_component_order(component: &str) -> u8 {
+    match component {
+        "left" => 0,
+        "right" => 1,
+        "case" => 2,
+        _ => 3,
+    }
 }
 
 const TYPE_RULES: &[(&[&str], &str)] = &[
