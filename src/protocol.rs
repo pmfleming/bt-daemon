@@ -262,7 +262,7 @@ pub fn registry() -> Value {
 
 /// Return the checked-in contract used by consumers and compatibility tests.
 pub fn contract_fixture() -> Value {
-    match serde_json::from_str(include_str!("../test_support/bt-api-v1.json")) {
+    match shelllist_daemon_core::load_fixture(include_str!("../test_support/bt-api-v1.json")) {
         Ok(fixture) => fixture,
         Err(error) => json!({ "fixture_error": error.to_string() }),
     }
@@ -270,16 +270,18 @@ pub fn contract_fixture() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::{METHODS, STREAMS, VERSION, contract_fixture, registry};
 
     #[test]
     fn registry_names_are_unique_and_fixture_matches_registry() {
-        let mut names = HashSet::new();
-        assert!(METHODS.iter().all(|method| names.insert(method.0)));
-        names.clear();
-        assert!(STREAMS.iter().all(|stream| names.insert(stream.0)));
+        shelllist_daemon_core::validate_unique_names(
+            &METHODS.iter().map(|method| method.0).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        shelllist_daemon_core::validate_unique_names(
+            &STREAMS.iter().map(|stream| stream.0).collect::<Vec<_>>(),
+        )
+        .unwrap();
 
         let fixture = contract_fixture();
         assert_eq!(fixture["version"], VERSION);

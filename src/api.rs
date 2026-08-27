@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use anyhow::Error;
 use serde_json::{Value, json};
+use shelllist_daemon_core::{ApiError as EnvelopeError, ApiIdentity};
 
 use crate::backend::{AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, Params};
 
 pub use crate::protocol::{NAME as PROTOCOL, VERSION};
+const API: ApiIdentity = ApiIdentity::new(PROTOCOL, VERSION as u32);
 
 enum BackendRequest<'a> {
     Snapshot,
@@ -57,8 +59,7 @@ pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: 
         Ok(snapshot) => success(json!({ "snapshot": snapshot })),
         Err(cause) => {
             tracing::warn!(%method, error = %cause, error_chain = %format!("{cause:#}"), "backend API request failed");
-            let details = error_value(&cause);
-            json!({ "protocol": PROTOCOL, "version": VERSION, "ok": false, "error": details })
+            backend_error(&cause)
         }
     };
     log_response(method, &response);
@@ -118,7 +119,7 @@ fn validation_error(error: Error) -> Value {
 }
 
 pub fn success(data: Value) -> Value {
-    json!({ "protocol": PROTOCOL, "version": VERSION, "ok": true, "data": data })
+    shelllist_daemon_core::success(API, data)
 }
 
 pub fn error_value(error: &Error) -> Value {
@@ -133,8 +134,22 @@ pub fn error_value(error: &Error) -> Value {
     })
 }
 
+fn backend_error(cause: &Error) -> Value {
+    let details = error_value(cause);
+    shelllist_daemon_core::error(
+        API,
+        EnvelopeError::new(
+            details["code"].as_str().unwrap_or("operation-failed"),
+            details["message"]
+                .as_str()
+                .unwrap_or("Bluetooth operation failed"),
+        )
+        .with_retryable(details["retryable"].as_bool().unwrap_or(false)),
+    )
+}
+
 pub fn error(code: &str, message: String) -> Value {
-    json!({ "protocol": PROTOCOL, "version": VERSION, "ok": false, "error": { "code": code, "message": message } })
+    shelllist_daemon_core::error(API, EnvelopeError::new(code, message))
 }
 
 #[cfg(test)]

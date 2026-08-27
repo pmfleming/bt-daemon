@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use serde::Deserialize;
 use serde_json::{Value, json};
+use shelllist_daemon_core::ClientRequest as Request;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
@@ -14,29 +14,6 @@ use crate::{
     api,
     daemon::{BUS_NAME, INTERFACE, OBJECT_PATH},
 };
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "kebab-case")]
-enum Request {
-    Call {
-        id: String,
-        method: String,
-        #[serde(default)]
-        params: Value,
-    },
-    Subscribe {
-        id: String,
-        #[serde(default)]
-        streams: Vec<String>,
-    },
-    Cancel {
-        id: String,
-        request_id: String,
-    },
-    Shutdown {
-        id: String,
-    },
-}
 
 type Output = Arc<Mutex<tokio::io::Stdout>>;
 

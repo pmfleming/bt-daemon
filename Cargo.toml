@@ -20,6 +20,7 @@ pipewire = { version = "0.10", features = ["v1_2_0"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+shelllist-daemon-core = { git = "https://github.com/pmfleming/daemon-framework.git", rev = "a1b2695d179cca3665645db0c8e9f1a413e53ac6" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"

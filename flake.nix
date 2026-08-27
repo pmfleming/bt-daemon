@@ -15,7 +15,10 @@
             pname = "bt-daemon";
             version = "0.1.0";
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes."shelllist-daemon-core-0.1.0" = "sha256-V2ytfB6faOsv4zf8jDyJs1jKRLmCWbyb/EHUT/0OfGs=";
+            };
             nativeBuildInputs = with pkgs; [ llvmPackages.libclang pkg-config ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
