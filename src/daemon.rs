@@ -220,14 +220,13 @@ async fn emit_stream<T: Serialize>(
     event: &str,
     data: &T,
 ) {
-    let value = json!({
-        "protocol": api::PROTOCOL,
-        "version": api::VERSION,
-        "stream": stream,
-        "event": event,
-        "subscription_id": subscription_id,
-        "data": data,
-    });
+    let value = shelllist_daemon_core::event_envelope(
+        shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
+        stream,
+        event,
+        shelllist_daemon_core::Correlation::Subscription(subscription_id),
+        json!({ "data": data }),
+    );
     if let Err(error) = BluetoothDaemon::event(emitter, stream, &value.to_string()).await {
         tracing::warn!(%error, %stream, %subscription_id, "could not emit subscription event");
     }
