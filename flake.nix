@@ -18,8 +18,8 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes = {
-                "shelllist-daemon-core-0.1.0" = "sha256-3tXlcM+PtEExZ91mtTIy/3Jpcj6o9MBlypPd3Z1ioVw=";
-                "shelllist-daemon-tokio-0.1.0" = "sha256-3tXlcM+PtEExZ91mtTIy/3Jpcj6o9MBlypPd3Z1ioVw=";
+                "shelllist-daemon-core-0.1.0" = "sha256-XEqqom61PKOUHmLvF7Zf8HBhaRc6XWaWr3ol8SXK+eE=";
+                "shelllist-daemon-tokio-0.1.0" = "sha256-XEqqom61PKOUHmLvF7Zf8HBhaRc6XWaWr3ol8SXK+eE=";
               };
             };
             nativeBuildInputs = with pkgs; [ llvmPackages.libclang pkg-config ];

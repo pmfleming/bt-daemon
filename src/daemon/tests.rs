@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex as StdMutex, atomic::AtomicU64};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -142,8 +142,7 @@ fn daemon(
         BluetoothDaemon {
             backend,
             pairing: PairingBroker::new(DeviceIdentityRegistry::in_memory()),
-            sequence: AtomicU64::new(1),
-            subscriptions: Arc::new(Mutex::new(Default::default())),
+            subscriptions: Arc::new(shelllist_daemon_tokio::OwnedTaskRegistry::default()),
             scan_owner_watches: Arc::new(Mutex::new(Default::default())),
             operations,
             scans,
@@ -209,7 +208,8 @@ async fn active_operation_can_be_cancelled() {
         .as_str()
         .unwrap();
     assert_eq!(events.recv().await.unwrap().event, "started");
-    let response: Value = serde_json::from_str(&daemon.cancel(request_id).await).unwrap();
+    let response: Value =
+        serde_json::from_str(&daemon.cancel_owned(request_id, None).await).unwrap();
     assert_eq!(response["data"]["kind"], "operation");
     let mut cancelled = events.recv().await.unwrap();
     while cancelled.event != "cancelled" {
@@ -226,7 +226,7 @@ async fn rejects_concurrent_operations_for_one_device() {
     assert_eq!(events.recv().await.unwrap().event, "started");
     let second = start_operation(&daemon, "remove").await;
     assert_eq!(second["error"]["code"], "device-busy");
-    let _ = daemon.cancel(request_id).await;
+    let _ = daemon.cancel_owned(request_id, None).await;
 }
 
 #[tokio::test]
@@ -286,7 +286,8 @@ async fn scan_sessions_are_bounded_and_cancellable() {
     let response = start_scan(&daemon.scans, "adapter-1", 1000).await;
     let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
     assert_eq!(events.recv().await.unwrap().state, "running");
-    let response: Value = serde_json::from_str(&daemon.cancel(request_id).await).unwrap();
+    let response: Value =
+        serde_json::from_str(&daemon.cancel_owned(request_id, None).await).unwrap();
     assert_eq!(response["data"]["stopped"], request_id);
     assert_eq!(events.recv().await.unwrap().state, "cancelled");
     assert!(daemon.scans.is_empty().await);

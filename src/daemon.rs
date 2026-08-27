@@ -1,18 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::{
-    sync::{Mutex, broadcast},
-    task::JoinHandle,
-};
+use shelllist_daemon_tokio::OwnedTaskRegistry;
+use tokio::sync::{Mutex, broadcast};
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
 use crate::{api, backend::BluetoothBackend, pairing::PairingBroker, protocol};
@@ -36,8 +28,7 @@ use self::{obex::ObexCoordinator, operation::OperationCoordinator, scan::ScanCoo
 pub struct BluetoothDaemon {
     backend: Arc<dyn BluetoothBackend>,
     pairing: Arc<PairingBroker>,
-    sequence: AtomicU64,
-    subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    subscriptions: Arc<OwnedTaskRegistry>,
     scan_owner_watches: Arc<Mutex<HashSet<String>>>,
     operations: OperationCoordinator,
     scans: ScanCoordinator,
@@ -47,7 +38,7 @@ pub struct BluetoothDaemon {
 
 impl BluetoothDaemon {
     fn next_id(&self, prefix: &str) -> String {
-        format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
+        self.subscriptions.next_id(prefix)
     }
 
     async fn dispatch_call(
@@ -103,11 +94,39 @@ impl BluetoothDaemon {
         let scans = self.scans.clone();
         let watches = Arc::clone(&self.scan_owner_watches);
         crate::task::spawn("scan-owner-watch", async move {
-            subscription::wait_for_owner_loss(connection, owner.clone()).await;
+            let _ = shelllist_daemon_tokio::wait_for_owner_name_loss(&connection, &owner).await;
             tracing::info!(%owner, "D-Bus owner disappeared; releasing its Bluetooth scans");
             scans.stop_owner(&owner).await;
             watches.lock().await.remove(&owner);
         });
+    }
+
+    async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> String {
+        tracing::info!(%request_id, "cancellation requested");
+        if self.subscriptions.cancel_owned(request_id, owner).await {
+            return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
+                .to_string();
+        }
+        if self.scans.contains(request_id).await {
+            return self
+                .scans
+                .stop(Some(request_id), "cancelled")
+                .await
+                .to_string();
+        }
+        if self.operations.cancel(request_id).await {
+            return api::success(json!({ "cancelled": request_id, "kind": "operation" }))
+                .to_string();
+        }
+        if let Some(kind) = self.obex.cancel(request_id).await {
+            return api::success(json!({ "cancelled": request_id, "kind": kind })).to_string();
+        }
+        tracing::warn!(%request_id, "cancellation target was not found");
+        api::error(
+            "request-not-found",
+            format!("No active subscription or operation named {request_id}"),
+        )
+        .to_string()
     }
 }
 
@@ -155,33 +174,9 @@ impl BluetoothDaemon {
         subscription::start(self, streams, sender, emitter).await
     }
 
-    async fn cancel(&self, request_id: &str) -> String {
-        tracing::info!(%request_id, "cancellation requested");
-        if let Some(task) = self.subscriptions.lock().await.remove(request_id) {
-            task.abort();
-            return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
-                .to_string();
-        }
-        if self.scans.contains(request_id).await {
-            return self
-                .scans
-                .stop(Some(request_id), "cancelled")
-                .await
-                .to_string();
-        }
-        if self.operations.cancel(request_id).await {
-            return api::success(json!({ "cancelled": request_id, "kind": "operation" }))
-                .to_string();
-        }
-        if let Some(kind) = self.obex.cancel(request_id).await {
-            return api::success(json!({ "cancelled": request_id, "kind": kind })).to_string();
-        }
-        tracing::warn!(%request_id, "cancellation target was not found");
-        api::error(
-            "request-not-found",
-            format!("No active subscription or operation named {request_id}"),
-        )
-        .to_string()
+    async fn cancel(&self, request_id: &str, #[zbus(header)] header: Header<'_>) -> String {
+        let owner = header.sender().map(ToString::to_string);
+        self.cancel_owned(request_id, owner.as_deref()).await
     }
 
     #[zbus(signal)]
@@ -284,8 +279,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
             BluetoothDaemon {
                 backend,
                 pairing,
-                sequence: AtomicU64::new(1),
-                subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                subscriptions: Arc::new(OwnedTaskRegistry::default()),
                 scan_owner_watches: Arc::new(Mutex::new(HashSet::new())),
                 operations,
                 scans,
@@ -305,7 +299,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         object_path = OBJECT_PATH,
         "bt-daemon started"
     );
-    std::future::pending().await
+    shelllist_daemon_tokio::wait_for_shutdown().await
 }
 
 #[cfg(test)]
