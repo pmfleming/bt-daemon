@@ -337,6 +337,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shelllist-daemon-core",
+ "shelllist-daemon-tokio",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1592,10 +1593,24 @@ dependencies = [
 [[package]]
 name = "shelllist-daemon-core"
 version = "0.1.0"
-source = "git+https://github.com/pmfleming/daemon-framework.git?rev=a1b2695d179cca3665645db0c8e9f1a413e53ac6#a1b2695d179cca3665645db0c8e9f1a413e53ac6"
+source = "git+https://github.com/pmfleming/daemon-framework.git?rev=4a4cd6080a3211af04519b93dfd685bbebe1a296#4a4cd6080a3211af04519b93dfd685bbebe1a296"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "shelllist-daemon-tokio"
+version = "0.1.0"
+source = "git+https://github.com/pmfleming/daemon-framework.git?rev=4a4cd6080a3211af04519b93dfd685bbebe1a296#4a4cd6080a3211af04519b93dfd685bbebe1a296"
+dependencies = [
+ "anyhow",
+ "futures",
+ "serde_json",
+ "shelllist-daemon-core",
+ "tokio",
+ "tracing",
+ "zbus",
 ]
 
 [[package]]

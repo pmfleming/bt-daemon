@@ -17,7 +17,10 @@
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
-              outputHashes."shelllist-daemon-core-0.1.0" = "sha256-V2ytfB6faOsv4zf8jDyJs1jKRLmCWbyb/EHUT/0OfGs=";
+              outputHashes = {
+                "shelllist-daemon-core-0.1.0" = "sha256-3tXlcM+PtEExZ91mtTIy/3Jpcj6o9MBlypPd3Z1ioVw=";
+                "shelllist-daemon-tokio-0.1.0" = "sha256-3tXlcM+PtEExZ91mtTIy/3Jpcj6o9MBlypPd3Z1ioVw=";
+              };
             };
             nativeBuildInputs = with pkgs; [ llvmPackages.libclang pkg-config ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
