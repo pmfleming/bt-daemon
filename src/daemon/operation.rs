@@ -84,6 +84,7 @@ impl OperationEvent {
 struct OperationTask {
     handle: JoinHandle<()>,
     event: OperationEvent,
+    owner: Option<String>,
 }
 
 #[derive(Default)]
@@ -130,6 +131,10 @@ impl OperationCoordinator {
     }
 
     pub(super) async fn start(&self, params: Value) -> Value {
+        self.start_owned(params, None).await
+    }
+
+    pub(super) async fn start_owned(&self, params: Value, owner: Option<String>) -> Value {
         let (device_key, operation) = match operation_request(&params) {
             Ok(request) => request,
             Err(error) => return error,
@@ -171,6 +176,7 @@ impl OperationCoordinator {
             OperationTask {
                 handle,
                 event: queued.clone(),
+                owner,
             },
         );
         state.active_devices.insert(device_key, request_id);
@@ -179,9 +185,16 @@ impl OperationCoordinator {
         api::success(json!({ "operation": queued }))
     }
 
-    pub(super) async fn cancel(&self, request_id: &str) -> bool {
+    pub(super) async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> bool {
         let task = {
             let mut state = self.state.lock().await;
+            if state
+                .tasks
+                .get(request_id)
+                .is_none_or(|task| task.owner.as_deref() != owner)
+            {
+                return false;
+            }
             let task = state.tasks.remove(request_id);
             if let Some(task) = &task
                 && state

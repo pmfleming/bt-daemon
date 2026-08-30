@@ -84,11 +84,16 @@ pub(super) async fn respond(incoming: &obex::IncomingBroker, params: &Value) -> 
     }
 }
 
+struct OutgoingCancellation {
+    owner: Option<String>,
+    sender: oneshot::Sender<()>,
+}
+
 pub(super) struct OutgoingTransfers {
     backend: Arc<dyn BluetoothBackend>,
     sequence: AtomicU64,
     events: broadcast::Sender<obex::ObexEvent>,
-    cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    cancellations: Arc<Mutex<HashMap<String, OutgoingCancellation>>>,
 }
 
 impl OutgoingTransfers {
@@ -104,7 +109,7 @@ impl OutgoingTransfers {
         }
     }
 
-    pub(super) async fn start(&self, params: &Value) -> Value {
+    pub(super) async fn start_owned(&self, params: &Value, owner: Option<String>) -> Value {
         let (device_key, path) = match params.require_strings("device_key", "path") {
             Ok(params) => params,
             Err(error) => return api::error("validation-error", error.to_string()),
@@ -139,10 +144,13 @@ impl OutgoingTransfers {
         let queued = obex::ObexEvent::outgoing(&request_id, device_key, &file_name, size);
         tracing::info!(%request_id, %device_key, %file_name, size, "outgoing OBEX transfer queued");
         let (cancel_sender, cancel_receiver) = oneshot::channel();
-        self.cancellations
-            .lock()
-            .await
-            .insert(request_id.clone(), cancel_sender);
+        self.cancellations.lock().await.insert(
+            request_id.clone(),
+            OutgoingCancellation {
+                owner,
+                sender: cancel_sender,
+            },
+        );
         let events = self.events.clone();
         let cancellations = Arc::clone(&self.cancellations);
         let task_id = request_id;
@@ -169,10 +177,22 @@ impl OutgoingTransfers {
     }
 
     pub(super) async fn cancel(&self, request_id: &str) -> bool {
-        let Some(cancel) = self.cancellations.lock().await.remove(request_id) else {
+        self.cancel_owned(request_id, None).await
+    }
+
+    pub(super) async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> bool {
+        let mut cancellations = self.cancellations.lock().await;
+        if cancellations
+            .get(request_id)
+            .is_none_or(|cancellation| cancellation.owner.as_deref() != owner)
+        {
+            return false;
+        }
+        let Some(cancel) = cancellations.remove(request_id) else {
             return false;
         };
-        let _ = cancel.send(());
+        drop(cancellations);
+        let _ = cancel.sender.send(());
         tracing::info!(%request_id, "outgoing OBEX transfer cancellation sent");
         true
     }

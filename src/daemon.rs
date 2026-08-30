@@ -63,7 +63,12 @@ impl BluetoothDaemon {
                 }
                 response
             }
-            "bluetooth.obex.send" => self.obex.outgoing.start(&params).await,
+            "bluetooth.obex.send" => {
+                self.obex
+                    .outgoing
+                    .start_owned(&params, owner.map(str::to_owned))
+                    .await
+            }
             "bluetooth.obex.respond" => obex::respond(&self.obex.incoming, &params).await,
             "bluetooth.obex.snapshot" => self.obex.snapshot().await,
             "bluetooth.audio.snapshot" => audio::snapshot(Arc::clone(&self.pairing)).await,
@@ -76,7 +81,11 @@ impl BluetoothDaemon {
                     "pairing": { "active": self.pairing.pending_events() },
                 }
             })),
-            "bluetooth.device.operation" => self.operations.start(params).await,
+            "bluetooth.device.operation" => {
+                self.operations
+                    .start_owned(params, owner.map(str::to_owned))
+                    .await
+            }
             "bluetooth.pairing.respond" => match self.pairing.respond(&params).await {
                 Ok(accepted) => api::success(json!({ "result": { "accepted": accepted } })),
                 Err(error) => api::error("pairing-response-rejected", format!("{error:#}")),
@@ -107,18 +116,28 @@ impl BluetoothDaemon {
             return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
                 .to_string();
         }
-        if self.scans.contains(request_id).await {
+        if self
+            .scans
+            .is_owned_by(request_id, owner.unwrap_or("internal"))
+            .await
+        {
             return self
                 .scans
                 .stop(Some(request_id), "cancelled")
                 .await
                 .to_string();
         }
-        if self.operations.cancel(request_id).await {
+        if self.operations.cancel_owned(request_id, owner).await {
             return api::success(json!({ "cancelled": request_id, "kind": "operation" }))
                 .to_string();
         }
-        if let Some(kind) = self.obex.cancel(request_id).await {
+        if self.obex.outgoing.cancel_owned(request_id, owner).await {
+            return api::success(json!({ "cancelled": request_id, "kind": "obex-outgoing" }))
+                .to_string();
+        }
+        if owner.is_none()
+            && let Some(kind) = self.obex.cancel(request_id).await
+        {
             return api::success(json!({ "cancelled": request_id, "kind": kind })).to_string();
         }
         tracing::warn!(%request_id, "cancellation target was not found");

@@ -286,8 +286,11 @@ async fn scan_sessions_are_bounded_and_cancellable() {
     let response = start_scan(&daemon.scans, "adapter-1", 1000).await;
     let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
     assert_eq!(events.recv().await.unwrap().state, "running");
+    let rejected: Value =
+        serde_json::from_str(&daemon.cancel_owned(request_id, Some(":other-owner")).await).unwrap();
+    assert_eq!(rejected["error"]["code"], "request-not-found");
     let response: Value =
-        serde_json::from_str(&daemon.cancel_owned(request_id, None).await).unwrap();
+        serde_json::from_str(&daemon.cancel_owned(request_id, Some(":test-owner")).await).unwrap();
     assert_eq!(response["data"]["stopped"], request_id);
     assert_eq!(events.recv().await.unwrap().state, "cancelled");
     assert!(daemon.scans.is_empty().await);

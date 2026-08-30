@@ -115,6 +115,14 @@ impl ScanCoordinator {
         self.tasks.lock().await.contains_key(request_id)
     }
 
+    pub(super) async fn is_owned_by(&self, request_id: &str, owner: &str) -> bool {
+        self.tasks
+            .lock()
+            .await
+            .get(request_id)
+            .is_some_and(|task| task.event.owner == owner)
+    }
+
     pub(super) async fn start(&self, params: &Value, owner: &str) -> Value {
         let (adapter_key, timeout_ms) = match ScanRequest::parse(params) {
             Ok(ScanRequest::Start {
