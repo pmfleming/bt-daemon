@@ -111,6 +111,7 @@ impl ScanCoordinator {
         json!({ "active": active })
     }
 
+    #[cfg(test)]
     pub(super) async fn contains(&self, request_id: &str) -> bool {
         self.tasks.lock().await.contains_key(request_id)
     }

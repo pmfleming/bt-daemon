@@ -130,6 +130,7 @@ impl OperationCoordinator {
         json!({ "active": active, "recent": recent })
     }
 
+    #[cfg(test)]
     pub(super) async fn start(&self, params: Value) -> Value {
         self.start_owned(params, None).await
     }
