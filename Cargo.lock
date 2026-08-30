@@ -1593,7 +1593,7 @@ dependencies = [
 [[package]]
 name = "shelllist-daemon-core"
 version = "0.1.0"
-source = "git+https://github.com/pmfleming/daemon-framework.git?rev=8a66b2430cfca5db971fecbd06bb5c89a67b4bd5#8a66b2430cfca5db971fecbd06bb5c89a67b4bd5"
+source = "git+https://github.com/pmfleming/daemon-framework.git?rev=b39f5c53941cda8464d30dada6da153de9dc13a7#b39f5c53941cda8464d30dada6da153de9dc13a7"
 dependencies = [
  "serde",
  "serde_json",
@@ -1602,7 +1602,7 @@ dependencies = [
 [[package]]
 name = "shelllist-daemon-tokio"
 version = "0.1.0"
-source = "git+https://github.com/pmfleming/daemon-framework.git?rev=8a66b2430cfca5db971fecbd06bb5c89a67b4bd5#8a66b2430cfca5db971fecbd06bb5c89a67b4bd5"
+source = "git+https://github.com/pmfleming/daemon-framework.git?rev=b39f5c53941cda8464d30dada6da153de9dc13a7#b39f5c53941cda8464d30dada6da153de9dc13a7"
 dependencies = [
  "anyhow",
  "futures",
