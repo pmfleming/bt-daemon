@@ -88,6 +88,8 @@ pub struct DeviceServices {
 #[derive(Debug, Clone, Serialize)]
 pub struct DevicePresentation {
     pub battery: Vec<Battery>,
+    pub battery_live: bool,
+    pub battery_last_known: bool,
     pub components: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,

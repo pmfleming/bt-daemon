@@ -995,6 +995,8 @@
                 "source": "bluez"
               }
             ],
+            "battery_live": true,
+            "battery_last_known": false,
             "blocked": false,
             "bonded": true,
             "capabilities": {

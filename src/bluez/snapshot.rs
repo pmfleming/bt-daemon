@@ -315,6 +315,8 @@ async fn device_snapshot(
         },
         presentation: DevicePresentation {
             battery: presentation.battery,
+            battery_live: presentation.battery_live,
+            battery_last_known: presentation.battery_last_known,
             components: presentation.components,
             model_id: presentation.model_id,
             fast_pair: fast_pair_features,
@@ -345,6 +347,8 @@ struct ResolvedPresentation {
     model_id: Option<String>,
     components: Vec<String>,
     battery: Vec<Battery>,
+    battery_live: bool,
+    battery_last_known: bool,
 }
 
 fn presentation(
@@ -363,6 +367,8 @@ fn presentation(
             components: presentation_components(&battery),
             model_id: model_id.map(Into::into),
             icon,
+            battery_live: connected && !battery.is_empty(),
+            battery_last_known: !connected && !battery.is_empty(),
             battery,
         };
     }
@@ -378,16 +384,19 @@ fn presentation(
         restored_components = battery.is_empty() && !remembered.components.is_empty(),
         "resolved snapshot presentation"
     );
+    let battery = if restored_battery {
+        remembered.battery
+    } else {
+        battery
+    };
     ResolvedPresentation {
         icon: icon.or(remembered.icon),
         device_type: remembered.device_type,
         model_id: remembered.model_id,
         components: remembered.components,
-        battery: if restored_battery {
-            remembered.battery
-        } else {
-            battery
-        },
+        battery_live: connected && !battery.is_empty(),
+        battery_last_known: !connected && !battery.is_empty(),
+        battery,
     }
 }
 
@@ -396,6 +405,10 @@ fn cached_device_view(cached: &CachedDevice) -> Device {
     device.state.connected = false;
     device.presentation.present = false;
     device.presentation.signal_live = false;
+    if !device.presentation.battery.is_empty() {
+        device.presentation.battery_live = false;
+        device.presentation.battery_last_known = true;
+    }
     let has_fast_pair = device.services.uuids.iter().any(|uuid| {
         uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
             || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
