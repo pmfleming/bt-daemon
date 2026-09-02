@@ -7,11 +7,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788051473,
-        "narHash": "sha256-KvdGb1Gdad8JSo8r/rVBGdZKkuLm/GlgvF/H1ft7Fkw=",
+        "lastModified": 1788384005,
+        "narHash": "sha256-b+tVRRctw4KIo69/c6sxshBsKmgRrVcOMGVzuwf5gPo=",
         "ref": "main",
-        "rev": "2624c56a58657b27dd03e3fd7e5a4ca1e2c49bf7",
-        "revCount": 20,
+        "rev": "c90883428ed83baa8e451dec5b598ad4e3141d25",
+        "revCount": 28,
         "type": "git",
         "url": "file:../daemon-framework"
       },
