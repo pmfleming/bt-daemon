@@ -1,18 +1,18 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc};
 
 use serde::Serialize;
 use serde_json::json;
 use tokio::{
-    sync::{broadcast, oneshot},
+    sync::{broadcast, oneshot, watch},
     task::JoinSet,
 };
 use zbus::{names::UniqueName, object_server::SignalEmitter};
 
-use crate::{api, backend::BluetoothBackend, pairing::PairingBroker, protocol};
+use crate::{api, protocol};
 
 use super::{
     AUDIO_STREAM, BluetoothDaemon, CHANGED_STREAM, OBEX_STREAM, OPERATION_STREAM, PAIRING_STREAM,
-    SCAN_STREAM, emit_audio, emit_snapshot, emit_stream,
+    SCAN_STREAM, SharedSnapshot, emit_audio, emit_snapshot, emit_stream,
 };
 
 #[derive(Clone, Copy)]
@@ -70,14 +70,12 @@ pub(super) async fn start(
     let subscription_id = id.clone();
     let signal_emitter = emitter.set_destination(owner.clone().into()).to_owned();
     let connection = signal_emitter.connection().clone();
-    let backend = Arc::clone(&daemon.backend);
-    let pairing = Arc::clone(&daemon.pairing);
+    let snapshots = daemon.snapshots.subscribe();
+    let audio_snapshots = daemon.audio_snapshots.subscribe();
     let pairing_events = daemon.pairing.subscribe();
     let operation_events = daemon.operations.subscribe();
     let scan_events = daemon.scans.subscribe();
     let obex_events = daemon.obex.subscribe();
-    let changes = daemon.backend.subscribe_changes();
-    let audio_events = daemon.audio_events.subscribe();
 
     tracing::info!(%subscription_id, %owner, ?streams, "subscription started");
     let task_owner = owner.clone();
@@ -91,20 +89,14 @@ pub(super) async fn start(
         spawn_if(
             &mut forwarders,
             requested.changes,
-            forward_snapshots(
-                changes,
-                signal_emitter.clone(),
-                Arc::clone(&backend),
-                subscription_id.clone(),
-            ),
+            forward_snapshots(snapshots, signal_emitter.clone(), subscription_id.clone()),
         );
         spawn_if(
             &mut forwarders,
             requested.audio,
             forward_audio(
-                audio_events,
+                audio_snapshots,
                 signal_emitter.clone(),
-                Arc::clone(&pairing),
                 subscription_id.clone(),
             ),
         );
@@ -194,47 +186,29 @@ async fn forward_events<T>(
 }
 
 async fn forward_snapshots(
-    mut receiver: broadcast::Receiver<()>,
+    mut receiver: watch::Receiver<SharedSnapshot>,
     emitter: SignalEmitter<'static>,
-    backend: Arc<dyn BluetoothBackend>,
     subscription_id: String,
 ) {
-    emit_snapshot(&emitter, &backend, &subscription_id, "subscribed").await;
-    while receive_coalesced(&mut receiver, Duration::from_millis(80), CHANGED_STREAM).await {
-        emit_snapshot(&emitter, &backend, &subscription_id, "changed").await;
+    let initial = receiver.borrow().clone();
+    emit_snapshot(&emitter, &initial, &subscription_id, "subscribed").await;
+    while receiver.changed().await.is_ok() {
+        let snapshot = receiver.borrow().clone();
+        emit_snapshot(&emitter, &snapshot, &subscription_id, "changed").await;
     }
 }
 
 async fn forward_audio(
-    mut receiver: broadcast::Receiver<()>,
+    mut receiver: watch::Receiver<serde_json::Value>,
     emitter: SignalEmitter<'static>,
-    pairing: Arc<PairingBroker>,
     subscription_id: String,
 ) {
-    emit_audio(&emitter, &pairing, &subscription_id, "subscribed").await;
-    while receive_coalesced(&mut receiver, Duration::from_millis(150), AUDIO_STREAM).await {
-        emit_audio(&emitter, &pairing, &subscription_id, "changed").await;
+    let initial = receiver.borrow().clone();
+    emit_audio(&emitter, &initial, &subscription_id, "subscribed").await;
+    while receiver.changed().await.is_ok() {
+        let snapshot = receiver.borrow().clone();
+        emit_audio(&emitter, &snapshot, &subscription_id, "changed").await;
     }
-}
-
-async fn receive_coalesced(
-    receiver: &mut broadcast::Receiver<()>,
-    delay: Duration,
-    stream: &'static str,
-) -> bool {
-    match receiver.recv().await {
-        Ok(()) => {}
-        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-            tracing::warn!(%stream, skipped, "refresh notifications were dropped");
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            tracing::warn!(%stream, "refresh source closed");
-            return false;
-        }
-    }
-    tokio::time::sleep(delay).await;
-    while receiver.try_recv().is_ok() {}
-    true
 }
 
 #[cfg(test)]

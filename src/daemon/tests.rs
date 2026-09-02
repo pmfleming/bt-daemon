@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::{
     backend::{
@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::{
-    BluetoothDaemon, ObexCoordinator, OperationCoordinator, ScanCoordinator,
+    BluetoothDaemon, ObexCoordinator, OperationCoordinator, ScanCoordinator, SharedSnapshot,
     operation::OperationEvent, scan::ScanEvent,
 };
 
@@ -131,13 +131,15 @@ fn daemon(
     broadcast::Receiver<OperationEvent>,
     broadcast::Receiver<ScanEvent>,
 ) {
-    let (audio_events, _) = broadcast::channel(8);
     let backend = test_backend(complete, false, Arc::new(StdMutex::new(Vec::new())));
     let operations = OperationCoordinator::new(Arc::clone(&backend));
     let receiver = operations.subscribe();
     let scans = ScanCoordinator::new(Arc::clone(&backend));
     let scan_receiver = scans.subscribe();
     let obex = ObexCoordinator::new(Arc::clone(&backend));
+    let (snapshots, _) = watch::channel(SharedSnapshot::Available(Arc::new(Snapshot::default())));
+    let (audio_snapshots, _) =
+        watch::channel(json!({ "ok": true, "data": { "audio_devices": [] } }));
     (
         BluetoothDaemon {
             backend,
@@ -146,7 +148,8 @@ fn daemon(
             scan_owner_watches: Arc::new(Mutex::new(Default::default())),
             operations,
             scans,
-            audio_events,
+            snapshots,
+            audio_snapshots,
             obex,
         },
         receiver,

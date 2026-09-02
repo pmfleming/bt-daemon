@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
 use shelllist_daemon_tokio::OwnedTaskRegistry;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
 use crate::{api, backend::BluetoothBackend, pairing::PairingBroker, protocol};
@@ -25,6 +25,12 @@ mod subscription;
 
 use self::{obex::ObexCoordinator, operation::OperationCoordinator, scan::ScanCoordinator};
 
+#[derive(Clone)]
+pub(super) enum SharedSnapshot {
+    Available(Arc<crate::model::Snapshot>),
+    Unavailable(Arc<String>),
+}
+
 pub struct BluetoothDaemon {
     backend: Arc<dyn BluetoothBackend>,
     pairing: Arc<PairingBroker>,
@@ -32,7 +38,8 @@ pub struct BluetoothDaemon {
     scan_owner_watches: Arc<Mutex<HashSet<String>>>,
     operations: OperationCoordinator,
     scans: ScanCoordinator,
-    audio_events: broadcast::Sender<()>,
+    snapshots: watch::Sender<SharedSnapshot>,
+    audio_snapshots: watch::Sender<Value>,
     obex: Arc<ObexCoordinator>,
 }
 
@@ -205,12 +212,12 @@ impl BluetoothDaemon {
 
 async fn emit_snapshot(
     emitter: &SignalEmitter<'_>,
-    backend: &Arc<dyn BluetoothBackend>,
+    snapshot: &SharedSnapshot,
     subscription_id: &str,
     event: &str,
 ) {
-    let value = match backend.snapshot().await {
-        Ok(snapshot) => json!({
+    let value = match snapshot {
+        SharedSnapshot::Available(snapshot) => json!({
             "protocol": api::PROTOCOL,
             "version": api::VERSION,
             "stream": CHANGED_STREAM,
@@ -218,13 +225,13 @@ async fn emit_snapshot(
             "subscription_id": subscription_id,
             "data": { "snapshot": snapshot }
         }),
-        Err(error) => json!({
+        SharedSnapshot::Unavailable(error) => json!({
             "protocol": api::PROTOCOL,
             "version": api::VERSION,
             "stream": CHANGED_STREAM,
             "event": "unavailable",
             "subscription_id": subscription_id,
-            "error": { "code": "bluez-unavailable", "message": format!("{error:#}") }
+            "error": { "code": "bluez-unavailable", "message": error }
         }),
     };
     if let Err(error) = BluetoothDaemon::event(emitter, CHANGED_STREAM, &value.to_string()).await {
@@ -253,11 +260,10 @@ async fn emit_stream<T: Serialize>(
 
 async fn emit_audio(
     emitter: &SignalEmitter<'_>,
-    pairing: &Arc<PairingBroker>,
+    envelope: &Value,
     subscription_id: &str,
     event: &str,
 ) {
-    let envelope = audio::snapshot(Arc::clone(pairing)).await;
     let value = if envelope["ok"].as_bool().unwrap_or(false) {
         json!({
             "protocol": api::PROTOCOL,
@@ -283,11 +289,31 @@ async fn emit_audio(
 }
 
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
+    let mut changes = backend.subscribe_changes();
+    let initial_snapshot = load_snapshot(&backend).await;
+    let (snapshots, _) = watch::channel(initial_snapshot);
+    let snapshot_backend = Arc::clone(&backend);
+    let snapshot_updates = snapshots.clone();
+    tokio::spawn(async move {
+        while receive_refresh(&mut changes, std::time::Duration::from_millis(80)).await {
+            snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
+        }
+    });
+
     let (audio_events, _) = broadcast::channel(32);
     let operations = OperationCoordinator::new(Arc::clone(&backend));
     let scans = ScanCoordinator::new(Arc::clone(&backend));
     let obex = ObexCoordinator::new(Arc::clone(&backend));
     audio::start_monitor(audio_events.clone())?;
+    let mut audio_changes = audio_events.subscribe();
+    let (audio_snapshots, _) = watch::channel(audio::snapshot(Arc::clone(&pairing)).await);
+    let audio_updates = audio_snapshots.clone();
+    let audio_pairing = Arc::clone(&pairing);
+    tokio::spawn(async move {
+        while receive_refresh(&mut audio_changes, std::time::Duration::from_millis(150)).await {
+            audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
+        }
+    });
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
@@ -301,7 +327,8 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
                 scan_owner_watches: Arc::new(Mutex::new(HashSet::new())),
                 operations,
                 scans,
-                audio_events,
+                snapshots,
+                audio_snapshots,
                 obex: Arc::clone(&obex),
             },
         )
@@ -318,6 +345,26 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         "bt-daemon started"
     );
     shelllist_daemon_tokio::wait_for_shutdown().await
+}
+
+async fn load_snapshot(backend: &Arc<dyn BluetoothBackend>) -> SharedSnapshot {
+    match backend.snapshot().await {
+        Ok(snapshot) => SharedSnapshot::Available(Arc::new(snapshot)),
+        Err(error) => SharedSnapshot::Unavailable(Arc::new(format!("{error:#}"))),
+    }
+}
+
+async fn receive_refresh(
+    receiver: &mut broadcast::Receiver<()>,
+    delay: std::time::Duration,
+) -> bool {
+    match receiver.recv().await {
+        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+        Err(broadcast::error::RecvError::Closed) => return false,
+    }
+    tokio::time::sleep(delay).await;
+    while receiver.try_recv().is_ok() {}
+    true
 }
 
 #[cfg(test)]
