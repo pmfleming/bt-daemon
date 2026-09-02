@@ -17,7 +17,7 @@ use crate::{
 
 use super::{
     BluetoothDaemon, ObexCoordinator, OperationCoordinator, ScanCoordinator, SharedSnapshot,
-    operation::OperationEvent, scan::ScanEvent,
+    operation::OperationEvent, scan::ScanEvent, snapshot_response,
 };
 
 type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
@@ -155,6 +155,16 @@ fn daemon(
         receiver,
         scan_receiver,
     )
+}
+
+#[test]
+fn cached_snapshot_reports_loading_and_available_states() {
+    let loading = snapshot_response(&SharedSnapshot::Loading);
+    assert_eq!(loading["error"]["code"], "snapshot-loading");
+
+    let available = snapshot_response(&SharedSnapshot::Available(Arc::new(Snapshot::default())));
+    assert_eq!(available["ok"], true);
+    assert!(available["data"]["snapshot"].is_object());
 }
 
 async fn start_operation(daemon: &BluetoothDaemon, operation: &str) -> Value {

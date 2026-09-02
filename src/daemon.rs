@@ -27,6 +27,7 @@ use self::{obex::ObexCoordinator, operation::OperationCoordinator, scan::ScanCoo
 
 #[derive(Clone)]
 pub(super) enum SharedSnapshot {
+    Loading,
     Available(Arc<crate::model::Snapshot>),
     Unavailable(Arc<String>),
 }
@@ -78,7 +79,7 @@ impl BluetoothDaemon {
             }
             "bluetooth.obex.respond" => obex::respond(&self.obex.incoming, &params).await,
             "bluetooth.obex.snapshot" => self.obex.snapshot().await,
-            "bluetooth.audio.snapshot" => audio::snapshot(Arc::clone(&self.pairing)).await,
+            "bluetooth.audio.snapshot" => self.audio_snapshots.borrow().clone(),
             "bluetooth.audio.setProfile" => audio::set_profile(&self.pairing, &params).await,
             "bluetooth.audio.setDefault" => audio::set_default(&self.pairing, &params).await,
             "bluetooth.requests.snapshot" => api::success(json!({
@@ -93,6 +94,7 @@ impl BluetoothDaemon {
                     .start_owned(params, owner.map(str::to_owned))
                     .await
             }
+            "bluetooth.snapshot" => snapshot_response(&self.snapshots.borrow()),
             "bluetooth.pairing.respond" => match self.pairing.respond(&params).await {
                 Ok(accepted) => api::success(json!({ "result": { "accepted": accepted } })),
                 Err(error) => api::error("pairing-response-rejected", format!("{error:#}")),
@@ -217,6 +219,14 @@ async fn emit_snapshot(
     event: &str,
 ) {
     let value = match snapshot {
+        SharedSnapshot::Loading => json!({
+            "protocol": api::PROTOCOL,
+            "version": api::VERSION,
+            "stream": CHANGED_STREAM,
+            "event": "loading",
+            "subscription_id": subscription_id,
+            "data": { "status": "loading" }
+        }),
         SharedSnapshot::Available(snapshot) => json!({
             "protocol": api::PROTOCOL,
             "version": api::VERSION,
@@ -290,15 +300,7 @@ async fn emit_audio(
 
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
     let mut changes = backend.subscribe_changes();
-    let initial_snapshot = load_snapshot(&backend).await;
-    let (snapshots, _) = watch::channel(initial_snapshot);
-    let snapshot_backend = Arc::clone(&backend);
-    let snapshot_updates = snapshots.clone();
-    tokio::spawn(async move {
-        while receive_refresh(&mut changes, std::time::Duration::from_millis(80)).await {
-            snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
-        }
-    });
+    let (snapshots, _) = watch::channel(SharedSnapshot::Loading);
 
     let (audio_events, _) = broadcast::channel(32);
     let operations = OperationCoordinator::new(Arc::clone(&backend));
@@ -306,14 +308,10 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     let obex = ObexCoordinator::new(Arc::clone(&backend));
     audio::start_monitor(audio_events.clone())?;
     let mut audio_changes = audio_events.subscribe();
-    let (audio_snapshots, _) = watch::channel(audio::snapshot(Arc::clone(&pairing)).await);
-    let audio_updates = audio_snapshots.clone();
-    let audio_pairing = Arc::clone(&pairing);
-    tokio::spawn(async move {
-        while receive_refresh(&mut audio_changes, std::time::Duration::from_millis(150)).await {
-            audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
-        }
-    });
+    let (audio_snapshots, _) = watch::channel(api::error(
+        "snapshot-loading",
+        "Bluetooth audio snapshot is loading".to_string(),
+    ));
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
@@ -321,14 +319,14 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         .serve_at(
             OBJECT_PATH,
             BluetoothDaemon {
-                backend,
-                pairing,
+                backend: Arc::clone(&backend),
+                pairing: Arc::clone(&pairing),
                 subscriptions: Arc::new(OwnedTaskRegistry::default()),
                 scan_owner_watches: Arc::new(Mutex::new(HashSet::new())),
                 operations,
                 scans,
-                snapshots,
-                audio_snapshots,
+                snapshots: snapshots.clone(),
+                audio_snapshots: audio_snapshots.clone(),
                 obex: Arc::clone(&obex),
             },
         )
@@ -339,12 +337,43 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         .await
         .context("start bt-daemon D-Bus service")?;
     obex.activate(connection).await;
+
+    // Claim the service name before probing BlueZ or PipeWire. Clients can
+    // connect immediately and observe a typed loading state while snapshots
+    // are populated in the background.
+    let snapshot_backend = Arc::clone(&backend);
+    let snapshot_updates = snapshots.clone();
+    tokio::spawn(async move {
+        snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
+        while receive_refresh(&mut changes, std::time::Duration::from_millis(80)).await {
+            snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
+        }
+    });
+    let audio_updates = audio_snapshots.clone();
+    let audio_pairing = Arc::clone(&pairing);
+    tokio::spawn(async move {
+        audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
+        while receive_refresh(&mut audio_changes, std::time::Duration::from_millis(150)).await {
+            audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
+        }
+    });
     tracing::info!(
         bus_name = BUS_NAME,
         object_path = OBJECT_PATH,
         "bt-daemon started"
     );
     shelllist_daemon_tokio::wait_for_shutdown().await
+}
+
+fn snapshot_response(snapshot: &SharedSnapshot) -> Value {
+    match snapshot {
+        SharedSnapshot::Loading => api::error(
+            "snapshot-loading",
+            "Bluetooth snapshot is loading".to_string(),
+        ),
+        SharedSnapshot::Available(snapshot) => api::success(json!({ "snapshot": snapshot })),
+        SharedSnapshot::Unavailable(error) => api::error("bluez-unavailable", error.to_string()),
+    }
 }
 
 async fn load_snapshot(backend: &Arc<dyn BluetoothBackend>) -> SharedSnapshot {

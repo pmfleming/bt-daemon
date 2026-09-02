@@ -2,6 +2,7 @@ use std::{collections::HashSet, time::SystemTime};
 
 use anyhow::Result;
 use bluer::{Adapter as BluezAdapter, Device as BluezDevice};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
@@ -24,23 +25,34 @@ pub(super) async fn build(backend: &BluezBackend) -> Result<Snapshot> {
         .lock()
         .await
         .retain(|_, cached| cache_entry_is_fresh(cached.observed_at_ms, now_ms));
+    let adapters = backend.adapters().await?;
+    let entries = stream::iter(adapters)
+        .map(|adapter| async move {
+            let address = adapter
+                .address()
+                .await
+                .backend_context("read stable adapter identity")?;
+            backend
+                .identities
+                .register_adapter(adapter.name(), &address.to_string());
+            let adapter_key = opaque_key("adapter", &address.to_string());
+            let (adapter, devices) = tokio::try_join!(
+                adapter_snapshot(&adapter, &adapter_key),
+                adapter_devices(backend, &adapter, &adapter_key),
+            )?;
+            Ok::<_, anyhow::Error>((adapter, devices))
+        })
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
     let mut snapshot = Snapshot::default();
-    for adapter in backend.adapters().await? {
-        let address = adapter
-            .address()
-            .await
-            .backend_context("read stable adapter identity")?;
-        backend
-            .identities
-            .register_adapter(adapter.name(), &address.to_string());
-        let adapter_key = opaque_key("adapter", &address.to_string());
-        snapshot
-            .adapters
-            .push(adapter_snapshot(&adapter, &adapter_key).await?);
-        snapshot
-            .devices
-            .extend(adapter_devices(backend, &adapter, &adapter_key).await?);
+    for (adapter, devices) in entries {
+        snapshot.adapters.push(adapter);
+        snapshot.devices.extend(devices);
     }
+    snapshot
+        .adapters
+        .sort_by(|left, right| left.key.cmp(&right.key));
     snapshot.devices.sort_by_key(|device| {
         (
             !device.state.connected,
@@ -64,21 +76,25 @@ async fn adapter_devices(
     adapter: &BluezAdapter,
     adapter_key: &str,
 ) -> Result<Vec<Device>> {
-    let mut devices = Vec::new();
-    let mut included = HashSet::new();
-    for address in adapter
+    let addresses = adapter
         .device_addresses()
         .await
-        .backend_context("list adapter devices")?
-    {
-        let device = adapter
-            .device(address)
-            .backend_context("open BlueZ device")?;
-        if let Some(snapshot) = device_snapshot(backend, adapter, &device, adapter_key).await? {
-            included.insert(snapshot.key.clone());
-            devices.push(snapshot);
-        }
-    }
+        .backend_context("list adapter devices")?;
+    let live = stream::iter(addresses)
+        .map(|address| async move {
+            let device = adapter
+                .device(address)
+                .backend_context("open BlueZ device")?;
+            device_snapshot(backend, adapter, &device, adapter_key).await
+        })
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut devices = live.into_iter().flatten().collect::<Vec<_>>();
+    let included = devices
+        .iter()
+        .map(|device| device.key.clone())
+        .collect::<HashSet<_>>();
 
     let now_ms = unix_time_ms();
     let cached = backend.device_cache.lock().await;
