@@ -644,7 +644,15 @@ impl ActiveTransfer {
                     .path(self.transfer_path.clone())?
                     .build()
                     .await?;
+                // Subscribe before refreshing the properties so completion cannot
+                // fall into the gap between SendFile's initial reply and monitoring.
                 let mut changes = properties.receive_properties_changed().await?;
+                let latest = properties
+                    .get_all(TRANSFER_INTERFACE.try_into()?)
+                    .await
+                    .context("read current outgoing OBEX transfer")?;
+                current.apply(&latest);
+                update(current.clone());
                 while !current.terminal() {
                     tokio::select! {
                         _ = &mut cancel => {
