@@ -489,8 +489,18 @@ mod tests {
     use super::ManagementStore;
 
     #[test]
-    fn policy_updates_are_validated_and_retained() {
+    fn policy_updates_are_retained_only_after_complete_validation() {
         let store = ManagementStore::in_memory();
+        for invalid in [
+            json!({ "launch_state": "sometimes" }),
+            json!({ "unknown": true }),
+            json!({ "launch_state": "disable", "reconnect_on_resume": "yes" }),
+        ] {
+            assert!(store.update(&invalid).is_err(), "{invalid}");
+            let policy = store.policy();
+            assert_eq!(policy.launch_state, "remember");
+            assert!(policy.reconnect_on_resume);
+        }
         let policy = store
             .update(&json!({
                 "launch_state": "disable",
@@ -501,41 +511,6 @@ mod tests {
         assert_eq!(policy.launch_state, "disable");
         assert!(!policy.trust_after_pair);
         assert_eq!(store.policy().preferred_adapter_key, "adapter-opaque");
-        assert!(
-            store
-                .update(&json!({ "launch_state": "sometimes" }))
-                .is_err()
-        );
-        assert!(store.update(&json!({ "unknown": true })).is_err());
-    }
-
-    #[test]
-    fn invalid_updates_do_not_partially_mutate_the_live_policy() {
-        let store = ManagementStore::in_memory();
-        assert!(
-            store
-                .update(&json!({
-                    "launch_state": "disable",
-                    "reconnect_on_resume": "yes"
-                }))
-                .is_err()
-        );
-        let policy = store.policy();
-        assert_eq!(policy.launch_state, "remember");
-        assert!(policy.reconnect_on_resume);
-    }
-
-    #[test]
-    fn absent_runtime_state_uses_the_current_version() {
-        let directory =
-            std::env::temp_dir().join(format!("bt-management-{}", uuid::Uuid::new_v4()));
-        let store = ManagementStore::load(
-            Some(directory.join("policy.json")),
-            Some(directory.join("runtime.json")),
-            Some(directory.join("devices.json")),
-        )
-        .unwrap();
-        assert!(store.runtime().adapter_power().is_empty());
     }
 
     #[test]

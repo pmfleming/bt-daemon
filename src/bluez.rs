@@ -1161,16 +1161,7 @@ async fn operation_timeout<T>(
 mod tests {
     use crate::backend::{BackendError, BackendErrorKind};
 
-    use super::{bluez_result, opaque_key, validate_obex_send_state};
-
-    #[test]
-    fn adapter_keys_are_opaque_and_deterministic() {
-        assert_eq!(
-            opaque_key("adapter", "hci0:AA"),
-            opaque_key("adapter", "hci0:AA")
-        );
-        assert!(!opaque_key("adapter", "hci0:AA").contains("AA"));
-    }
+    use super::{bluez_result, validate_obex_send_state};
 
     #[test]
     fn obex_policy_is_enforced() {

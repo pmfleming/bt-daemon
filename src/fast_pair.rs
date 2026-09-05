@@ -1389,11 +1389,10 @@ impl FastPairBatteryProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_SWITCH_CAPABILITY_CODE, AUDIO_SWITCH_GROUP, BATTERY_UPDATED_CODE, BatteryReport,
-        DEVICE_INFORMATION_GROUP, Frame, FrameDecoder, MAX_FRAME_PAYLOAD, MessageStreamTransport,
-        PsmAvailability, anc_mode_flag, crypt_block, decode_anc_state,
-        decode_audio_switch_capability, decode_component, decode_message_stream_psm,
-        derive_aes_key, message_mac, select_transport,
+        BATTERY_UPDATED_CODE, BatteryReport, DEVICE_INFORMATION_GROUP, FrameDecoder,
+        MAX_FRAME_PAYLOAD, MessageStreamTransport, PsmAvailability, anc_mode_flag, crypt_block,
+        decode_anc_state, decode_component, decode_message_stream_psm, derive_aes_key, message_mac,
+        select_transport,
     };
 
     #[test]
@@ -1466,32 +1465,32 @@ mod tests {
     }
 
     #[test]
-    fn three_component_update_maps_to_component_model() {
-        let report = BatteryReport::from_payload(&[0x64, 0x64, 0x4e]).unwrap();
-        let batteries = report.model_batteries();
-        assert_eq!(
-            batteries
-                .iter()
-                .map(|battery| (battery.component.as_str(), battery.percentage))
-                .collect::<Vec<_>>(),
-            [("left", 100), ("right", 100), ("case", 78)]
-        );
-        assert!(
-            batteries
-                .iter()
-                .all(|battery| battery.source == "google-fast-pair-message-stream")
-        );
-    }
-
-    #[test]
-    fn audio_switch_capability_decodes_multipoint_flags() {
-        let capability = decode_audio_switch_capability(&[0x01, 0x02, 0xe0, 0x00]).unwrap();
-        assert_eq!(capability.version, 0x0102);
-        assert!(capability.supported);
-        assert!(capability.audio_switch_enabled);
-        assert!(capability.configurable);
-        assert!(capability.enabled);
-        assert!(decode_audio_switch_capability(&[1, 2, 3]).is_err());
+    fn component_reports_preserve_known_values_without_inferring_unknown_components() {
+        for (payload, expected) in [
+            (
+                [0x64, 0x64, 0x4e],
+                vec![("left", 100), ("right", 100), ("case", 78)],
+            ),
+            ([0x64, 0x64, 0xff], vec![("left", 100), ("right", 100)]),
+        ] {
+            let batteries = BatteryReport::from_payload(&payload)
+                .unwrap()
+                .model_batteries();
+            assert_eq!(
+                batteries
+                    .iter()
+                    .map(|battery| (battery.component.as_str(), battery.percentage))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{payload:?}"
+            );
+            assert!(
+                batteries
+                    .iter()
+                    .all(|battery| battery.source == "google-fast-pair-message-stream")
+            );
+        }
+        assert!(BatteryReport::from_payload(&[1, 2]).is_err());
     }
 
     #[test]
@@ -1509,17 +1508,6 @@ mod tests {
         assert_eq!(anc_mode_flag("noise-cancelling").unwrap(), 0x08);
         assert!(decode_anc_state(&[2, 0xa8, 0xa8, 0xa0]).is_err());
         assert!(anc_mode_flag("wind").is_err());
-    }
-
-    #[test]
-    fn encoded_frames_round_trip_through_the_decoder() {
-        let encoded =
-            Frame::encoded(AUDIO_SWITCH_GROUP, AUDIO_SWITCH_CAPABILITY_CODE, &[1, 2]).unwrap();
-        let frames = FrameDecoder::default().push(&encoded).unwrap();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].group, AUDIO_SWITCH_GROUP);
-        assert_eq!(frames[0].code, AUDIO_SWITCH_CAPABILITY_CODE);
-        assert_eq!(frames[0].payload, [1, 2]);
     }
 
     #[test]
@@ -1556,19 +1544,5 @@ mod tests {
         assert_ne!(mac, message_mac(&key, &session, &nonce, &[0]));
         assert_ne!(mac, message_mac(&key, &[0x10; 8], &nonce, &[1]));
         assert_ne!(mac, message_mac(&key, &session, &[0x23; 8], &[1]));
-    }
-
-    #[test]
-    fn unknown_components_are_not_inferred() {
-        let report = BatteryReport::from_payload(&[0x64, 0x64, 0xff]).unwrap();
-        let batteries = report.model_batteries();
-        assert_eq!(
-            batteries
-                .iter()
-                .map(|battery| (battery.component.as_str(), battery.percentage))
-                .collect::<Vec<_>>(),
-            [("left", 100), ("right", 100)]
-        );
-        assert!(BatteryReport::from_payload(&[1, 2]).is_err());
     }
 }

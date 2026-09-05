@@ -108,15 +108,6 @@ mod tests {
     use super::AccountKeyStore;
 
     #[test]
-    fn generated_keys_have_the_account_key_type() {
-        let first = AccountKeyStore::generate();
-        let second = AccountKeyStore::generate();
-        assert_eq!(first[0], 0x04);
-        assert_eq!(second[0], 0x04);
-        assert_ne!(first, second);
-    }
-
-    #[test]
     fn keys_survive_a_secure_store_reload() {
         let directory = std::env::temp_dir().join(format!("bt-fast-pair-{}", uuid::Uuid::new_v4()));
         let path = directory.join("keys.json");

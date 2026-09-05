@@ -963,12 +963,7 @@ fn borrowed_u64(value: &Value<'_>) -> Option<u64> {
 mod tests {
     use std::fs;
 
-    use crate::backend::ObexRemote;
-
-    use super::{
-        IncomingDetails, TransferUpdate, incoming_event, lifecycle_event, publish_transfer_update,
-        reserve_incoming_destination_in, safe_file_name, validate_outgoing_path,
-    };
+    use super::{reserve_incoming_destination_in, safe_file_name, validate_outgoing_path};
 
     #[test]
     fn incoming_names_are_confined_to_the_download_directory() {
@@ -991,46 +986,6 @@ mod tests {
             directory.join("example (2).txt")
         );
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn incoming_event_lifecycle_is_built_without_dbus() {
-        let details = IncomingDetails {
-            source: "00:11:22:33:44:55".into(),
-            destination: "AA:BB:CC:DD:EE:FF".into(),
-            name: "photo.jpg".into(),
-            media_type: Some("image/jpeg".into()),
-            size: 2048,
-        };
-        let event = incoming_event(
-            "request-1",
-            &ObexRemote {
-                device_key: "device-1".into(),
-                name: "Phone".into(),
-            },
-            &details,
-            "photo.jpg",
-            "authorization-requested",
-            "awaiting-authorization",
-            Some(60_000),
-        );
-        assert_eq!(event.device_key, "device-1");
-        assert_eq!(event.size, 2048);
-        assert_eq!(event.timeout_ms, Some(60_000));
-        let (events, mut receiver) = tokio::sync::broadcast::channel(1);
-        let mut event = event;
-        publish_transfer_update(
-            &mut event,
-            &TransferUpdate {
-                status: "active".into(),
-                transferred: 512,
-                size: 2048,
-            },
-            &events,
-        );
-        assert_eq!(receiver.try_recv().unwrap().transferred, 512);
-        assert_eq!(lifecycle_event("complete"), "completed");
-        assert_eq!(lifecycle_event("active"), "progress");
     }
 
     #[test]

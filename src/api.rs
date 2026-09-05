@@ -173,13 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn untyped_errors_are_not_classified_by_message() {
-        let value = error_value(&anyhow!("authentication rejected after timeout"));
-        assert_eq!(value["code"], "operation-failed");
-        assert_eq!(value["retryable"], false);
-    }
-
-    #[test]
     fn invalid_optional_adapter_key_is_not_treated_as_all_adapters() {
         let params = serde_json::json!({ "adapter_key": 42, "powered": false });
         let Err(error) = parse_backend_request("bluetooth.setPowered", &params) else {

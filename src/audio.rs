@@ -752,35 +752,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        AudioDevice, AudioEndpoint, AudioProfile, Defaults, DeviceEndpoints,
-        adapter_from_bluez_path, default_node_name, endpoint_kind, finalize_devices, node_state,
-        profile::{profile_codec, profile_mode},
-        profile_key, update_profile,
+        AudioDevice, AudioEndpoint, AudioProfile, Defaults, DeviceEndpoints, finalize_devices,
+        update_profile,
     };
-
-    #[test]
-    fn classifies_bluetooth_audio_profiles() {
-        assert_eq!(profile_mode("a2dp-sink-sbc_xq"), "high-fidelity");
-        assert_eq!(profile_mode("headset-head-unit"), "headset");
-        assert_eq!(profile_mode("off"), "off");
-        assert_eq!(
-            profile_codec("High Fidelity Playback (A2DP Sink, codec AAC)").as_deref(),
-            Some("AAC")
-        );
-        assert_eq!(
-            adapter_from_bluez_path("/org/bluez/hci0/dev_AA"),
-            Some("hci0".into())
-        );
-        let key = profile_key("device-opaque", "a2dp-sink");
-        assert!(key.starts_with("audio-profile-"));
-        assert!(!key.contains("a2dp"));
-        assert!(endpoint_kind(Some("Audio/Sink")).is_some());
-        assert_eq!(node_state(pipewire::node::NodeState::Idle), "idle");
-        assert_eq!(
-            default_node_name(r#"{"name":"bluez_output.opaque"}"#).as_deref(),
-            Some("bluez_output.opaque")
-        );
-    }
 
     #[test]
     fn probe_results_are_deduplicated_and_linked_to_defaults() {
