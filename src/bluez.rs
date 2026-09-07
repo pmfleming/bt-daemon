@@ -6,10 +6,7 @@ use bluer::{
     Adapter as BluezAdapter, Device as BluezDevice, Session,
     agent::{Agent, AgentHandle},
 };
-use futures::{
-    StreamExt,
-    stream::{BoxStream, SelectAll},
-};
+use futures::StreamExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -30,6 +27,7 @@ use crate::{
     rfkill,
 };
 
+mod monitor;
 mod recovery;
 mod snapshot;
 
@@ -315,7 +313,7 @@ impl BluezBackend {
         let backend = Arc::clone(self);
         self.tasks.spawn("bluez-monitor", async move {
             loop {
-                if let Err(error) = backend.monitor_one_change().await {
+                if let Err(error) = monitor::run(&backend).await {
                     tracing::warn!(error = %error, "BlueZ event monitor is retrying");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -323,24 +321,6 @@ impl BluezBackend {
                 let _ = backend.changes.send(());
             }
         });
-    }
-
-    async fn monitor_one_change(&self) -> Result<()> {
-        let mut streams: SelectAll<BoxStream<'static, ()>> = SelectAll::new();
-        streams.push(
-            self.session
-                .events()
-                .await
-                .backend_context("watch adapter hotplug")?
-                .map(|_| ())
-                .boxed(),
-        );
-        for adapter in self.adapters().await? {
-            if let Err(error) = append_adapter_event_streams(&adapter, &mut streams).await {
-                tracing::warn!(adapter = adapter.name(), error = %error, error_chain = %format!("{error:#}"), "could not monitor BlueZ adapter");
-            }
-        }
-        streams.next().await.context("BlueZ event streams ended")
     }
 
     async fn adapters(&self) -> Result<Vec<BluezAdapter>> {
@@ -663,34 +643,6 @@ async fn validated_obex_remote(
         device_key: identities.device_key(adapter.name(), device.address()),
         name: bluez_result(device.alias().await, "read device alias")?,
     })
-}
-
-async fn append_adapter_event_streams(
-    adapter: &BluezAdapter,
-    streams: &mut SelectAll<BoxStream<'static, ()>>,
-) -> Result<()> {
-    streams.push(
-        adapter
-            .events()
-            .await
-            .backend_context("watch adapter changes")?
-            .map(|_| ())
-            .boxed(),
-    );
-    for address in adapter
-        .device_addresses()
-        .await
-        .backend_context("list monitored adapter devices")?
-    {
-        let device = adapter
-            .device(address)
-            .backend_context("open monitored BlueZ device")?;
-        match device.events().await {
-            Ok(events) => streams.push(events.map(|_| ()).boxed()),
-            Err(error) => tracing::warn!(%address, %error, "could not monitor BlueZ device events"),
-        }
-    }
-    Ok(())
 }
 
 fn unblock_rfkill(before: &Snapshot, no_adapters: bool) -> Result<()> {
