@@ -34,7 +34,7 @@ Follow-up acceptance on the same machine:
 - Sony WF-1000XM5 Fast Pair RFCOMM Message Stream component battery report: **pass**. The authenticated stream reported left `100%`, right `100%`, and case `78%`; the case value was not inferred from BlueZ's aggregate `100%`. BlueZ resolved the documented profile UUID to SDP channel 23 during this run.
 - Pixel Buds Fast Pair RFCOMM Message Stream component battery report: **partial**. The device reported left `100%`, right `100%`, and case `unknown` as the standards-defined `0xFF`; the daemon correctly omitted the unknown case percentage.
 - Fast Pair BLE L2CAP Message Stream: **implementation complete; compatible hardware pending**. GATT PSM state/range parsing and the secure LE credit-based socket path are automated, but neither connected acceptance device selects the BLE-only transport because both expose the RFCOMM Message Stream UUID.
-- Fast Pair Audio Switch/multipoint state and control: **implementation complete; hardware/account-key acceptance pending**. Verify capability discovery, session nonce, authenticated set, ACK/NAK, and provider state notification.
+- Fast Pair Audio Switch/multipoint extensions: **partial; hardware/account-key acceptance pending**. Capability/state discovery, authenticated multipoint configuration, ACK/NAK, and switch-reason notifications are implemented. Full advertisement-driven Audio Switch seeker policy remains unsupported and is explicitly advertised as such; this is not complete Audio Switch support.
 - Fast Pair Hearable Controls/ANC state and control: **implementation complete; hardware/account-key acceptance pending**. Verify supported/settable modes, all hardware modes, authenticated set, ACK/NAK, and provider state notification.
 - Fast Pair retroactive account-key provisioning: **implementation complete; trusted model metadata and hardware acceptance pending**. Verify ECDH response, encrypted account-key write, reconnect persistence, and rejection outside the Provider's one-minute window.
 - The alternate no-trust pairing policy, audio playback/profile readiness, component-update behavior as batteries discharge, and reconnect behavior remain to be checked separately.
@@ -57,7 +57,7 @@ Record a date, device, and result for every row before moving `SUPER+B`.
 | Pair → optional trust → connect | Both trust policies and typed failures | Partial — WF-1000XM5 default-trust pair/connect/remove passed; no-trust policy pending |
 | Connect/disconnect | Sony WF-1000XM5, HX, and Buds | Partial — WF-1000XM5 passed 2026-07-20; HX and Buds pending |
 | Operation cancellation | Pair and connect cancellation produce one terminal event | Pending |
-| BlueZ restart | Daemon restarts, client reconnects, subscriptions resume | Pending |
+| BlueZ restart | API remains available with an unavailable snapshot; retired backend workers terminate; one new generation resumes subscriptions without identity drift | Pending |
 | Adapter hotplug | Stale actions disappear and adapter selection recovers | Pending |
 
 ## Blueman-parity hardware matrix
@@ -70,7 +70,7 @@ Record a date, device, and result for every row before moving `SUPER+B`.
 | Buds audio profiles and wake behavior | Pending |
 | Keyboard passkey entered-count flow | Pending hardware |
 | Mouse/gamepad just-works and wake | Pending hardware |
-| Phone pairing and OBEX send/receive | Pending hardware |
+| Phone pairing and OBEX send/receive | Daemon API hardware acceptance pending; **file transfer is intentionally unsupported by Shelllist**. Incoming daemon agent requires an explicit opt-in and a client capable of approvals. |
 | Suspend/resume and rfkill recovery | Pending |
 | PipeWire restart while Bluetooth UI is open | Pending — stop/restart PipeWire only in an approved hardware session; expect an unavailable audio snapshot followed by fresh cards/routes, with exactly one monitor thread. Core errors and panics now trigger monitor reconstruction. |
 | Two simultaneous discovery clients | Pending |
