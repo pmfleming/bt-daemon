@@ -223,7 +223,11 @@ async fn device_snapshot(
         .as_ref()
         .is_some_and(|seen| seen.live(discovering));
     let present = state.connected || signal_live;
-    let key = backend.identities.device_key(adapter.name(), identity);
+    let key = if state.paired {
+        backend.identities.promote_device(adapter.name(), identity)
+    } else {
+        backend.identities.device_key(adapter.name(), identity)
+    };
     let now_ms = unix_time_ms();
     let cached = backend
         .device_cache

@@ -956,10 +956,11 @@ impl FastPairBatteryProvider {
             provisioning_request(anti_spoofing_key, ble_address, local_address)?;
         complete_key_pairing(&pairing, &request, &shared_key, device.address()).await?;
 
-        let account_key = write_account_key(&account_key_characteristic, &shared_key).await?;
         let device_key = self
             .identities
-            .device_key(device.adapter_name(), device.address());
+            .promote_device(device.adapter_name(), device.address());
+        self.identities.flush().await?;
+        let account_key = write_account_key(&account_key_characteristic, &shared_key).await?;
         self.account_keys.insert(device_key, account_key)?;
         tracing::info!(
             address = %device.address(),

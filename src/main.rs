@@ -70,13 +70,16 @@ async fn run() -> Result<()> {
             bluez.apply_startup_policy().await;
             bluez.start_monitoring();
             bluez.start_lifecycle_monitoring();
-            let pairing = PairingBroker::new(bluez.identity_registry());
+            let identities = bluez.identity_registry();
+            let pairing = PairingBroker::new(Arc::clone(&identities));
             let agent = bluez.register_agent(pairing.agent()).await?;
             let recovering = RecoveringBackend::new(bluez);
             recovering.set_agent(agent).await;
             recovering.start_recovery(Arc::clone(&pairing));
             let backend: Arc<dyn BluetoothBackend> = recovering;
-            daemon::run(backend, pairing).await
+            let result = daemon::run(backend, pairing).await;
+            identities.flush().await?;
+            result
         }
         Command::Client => client::run().await,
         Command::ProbeBluez => {

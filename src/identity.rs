@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
@@ -14,7 +15,9 @@ use crate::{
     state,
 };
 
+mod persistence;
 const REGISTRY_VERSION: u8 = 1;
+const EPHEMERAL_LIMIT: usize = 4096;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct RememberedPresentation {
@@ -39,18 +42,20 @@ pub(crate) struct RememberedPresentationValues {
     pub battery: Vec<Battery>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct RegistryFile {
     version: u8,
     #[serde(default)]
     adapters: HashMap<String, String>,
     devices: HashMap<String, String>,
+    #[serde(skip)]
+    ephemeral: HashMap<String, (String, Instant)>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     presentations: HashMap<String, RememberedPresentation>,
 }
 
 pub struct DeviceIdentityRegistry {
-    path: Option<PathBuf>,
+    writer: Option<persistence::Writer>,
     state: Mutex<RegistryFile>,
 }
 
@@ -63,7 +68,7 @@ impl DeviceIdentityRegistry {
     #[cfg(test)]
     pub fn in_memory() -> Arc<Self> {
         Arc::new(Self {
-            path: None,
+            writer: None,
             state: Mutex::new(RegistryFile {
                 version: REGISTRY_VERSION,
                 ..RegistryFile::default()
@@ -89,9 +94,21 @@ impl DeviceIdentityRegistry {
             },
         };
         Ok(Arc::new(Self {
-            path,
+            writer: path.map(persistence::Writer::new).transpose()?,
             state: Mutex::new(state),
         }))
+    }
+
+    /// Flush before associating durable credentials with an opaque device ID.
+    pub async fn flush(self: &Arc<Self>) -> Result<()> {
+        let registry = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            if let Some(writer) = &registry.writer {
+                writer.flush()?;
+            }
+            Ok(())
+        })
+        .await?
     }
 
     pub fn register_adapter(&self, adapter: &str, stable_identity: &str) {
@@ -120,9 +137,41 @@ impl DeviceIdentityRegistry {
         if let Some(key) = state.devices.get(&identity) {
             return key.clone();
         }
+        if let Some((key, seen)) = state.ephemeral.get_mut(&identity) {
+            *seen = Instant::now();
+            return key.clone();
+        }
+        state
+            .ephemeral
+            .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(300));
+        if state.ephemeral.len() >= EPHEMERAL_LIMIT
+            && let Some(oldest) = state
+                .ephemeral
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(identity, _)| identity.clone())
+        {
+            state.ephemeral.remove(&oldest);
+        }
         let key = format!("device-{}", Uuid::new_v4().simple());
-        state.devices.insert(identity, key.clone());
-        self.persist(&state, "device identity");
+        state
+            .ephemeral
+            .insert(identity, (key.clone(), Instant::now()));
+        key
+    }
+
+    /// Promote the same opaque ID only once BlueZ confirms pairing. Merely
+    /// observing an advertising/private address must not leave a disk history.
+    pub fn promote_device(&self, adapter: &str, address: Address) -> String {
+        let key = self.device_key(adapter, address);
+        let mut state = self.state();
+        let stable = state.adapters.get(adapter).map_or(adapter, String::as_str);
+        let identity = format!("{stable}:{address}");
+        if !state.devices.contains_key(&identity) {
+            state.ephemeral.remove(&identity);
+            state.devices.insert(identity, key.clone());
+            self.persist(&state, "paired device identity");
+        }
         key
     }
 
@@ -166,11 +215,15 @@ impl DeviceIdentityRegistry {
         }
     }
 
-    fn persist(&self, state: &RegistryFile, description: &str) {
-        if let Some(path) = &self.path
-            && let Err(error) = state::write_json(path, state, "identity registry")
-        {
-            tracing::warn!(%error, %description, "could not persist Bluetooth registry state");
+    fn persist(&self, state: &RegistryFile, _description: &str) {
+        if let Some(writer) = &self.writer {
+            writer.schedule(RegistryFile {
+                version: state.version,
+                adapters: state.adapters.clone(),
+                devices: state.devices.clone(),
+                presentations: state.presentations.clone(),
+                ephemeral: HashMap::new(),
+            });
         }
     }
 }
@@ -313,7 +366,7 @@ mod tests {
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let registry = DeviceIdentityRegistry::load(Some(path.clone())).unwrap();
         registry.register_adapter("hci0", "00:11:22:33:44:55");
-        let key = registry.device_key("hci0", address);
+        let key = registry.promote_device("hci0", address);
         let expected_battery = component_battery("left", 64);
         registry.remember_presentation(
             "device-known",
@@ -334,7 +387,23 @@ mod tests {
         assert_eq!(presentation.model_id.as_deref(), Some("a1b2c3"));
         assert_eq!(presentation.components, ["left"]);
 
+        drop(registry);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn discovery_identities_are_ephemeral_until_promoted() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let key = registry.device_key("hci0", address);
+        let encoded = serde_json::to_string(&*registry.state()).unwrap();
+        assert!(!encoded.contains("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(registry.promote_device("hci0", address), key);
+        assert!(
+            serde_json::to_string(&*registry.state())
+                .unwrap()
+                .contains("AA:BB:CC:DD:EE:FF")
+        );
     }
 
     #[test]
