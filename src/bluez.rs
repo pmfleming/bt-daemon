@@ -53,6 +53,7 @@ pub struct BluezBackend {
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
     management: Arc<ManagementStore>,
     tasks: crate::task::TaskGroup,
+    sleeping: tokio::sync::watch::Sender<bool>,
 }
 
 impl BluezBackend {
@@ -113,6 +114,7 @@ impl BluezBackend {
             fast_pair,
             management,
             tasks: crate::task::TaskGroup::default(),
+            sleeping: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -136,7 +138,7 @@ impl BluezBackend {
             .backend_context("register BlueZ pairing agent")
     }
 
-    pub async fn apply_startup_policy(&self) {
+    pub async fn apply_startup_policy(self: &Arc<Self>) {
         let policy = self.management.policy();
         let result = match policy.launch_state.as_str() {
             "enable" => self.set_powered(None, true).await.map(|_| ()),
@@ -157,7 +159,7 @@ impl BluezBackend {
         });
     }
 
-    async fn monitor_sleep_events(&self) -> Result<()> {
+    async fn monitor_sleep_events(self: &Arc<Self>) -> Result<()> {
         let connection = zbus::Connection::system()
             .await
             .context("connect Bluetooth lifecycle monitor to system D-Bus")?;
@@ -178,6 +180,7 @@ impl BluezBackend {
                 .body()
                 .deserialize()
                 .context("decode logind sleep event")?;
+            self.sleeping.send_replace(sleeping);
             if sleeping {
                 self.remember_runtime_state().await;
             } else if let Err(error) = self.restore_runtime_state().await {
@@ -194,7 +197,7 @@ impl BluezBackend {
         }
     }
 
-    async fn restore_runtime_state(&self) -> Result<()> {
+    async fn restore_runtime_state(self: &Arc<Self>) -> Result<()> {
         let runtime = self.management.runtime();
         self.restore_adapter_power(runtime.adapter_power()).await?;
         for device_key in runtime.connected_device_keys() {
@@ -203,7 +206,13 @@ impl BluezBackend {
                 .device_policy(device_key)
                 .reconnect_on_resume
             {
-                self.reconnect_device(device_key).await?;
+                let backend = Arc::clone(self);
+                let key = device_key.to_owned();
+                self.tasks.spawn("bluetooth-resume-reconnect", async move {
+                    if let Err(error) = backend.reconnect_device(&key).await {
+                        tracing::warn!(%error, device_key = %key, "Bluetooth reconnection failed");
+                    }
+                });
             }
         }
         Ok(())
@@ -226,18 +235,52 @@ impl BluezBackend {
     }
 
     async fn reconnect_device(&self, device_key: &str) -> Result<()> {
-        let Ok((_, device)) = self.find_device(device_key).await else {
-            return Ok(());
-        };
-        if bluez_result(device.is_connected().await, "read reconnect device state")? {
-            return Ok(());
+        let mut sleeping = self.sleeping.subscribe();
+        tokio::select! {
+            result = self.reconnect_while_awake(device_key) => result,
+            _ = async {
+                loop {
+                    if *sleeping.borrow() || sleeping.changed().await.is_err() { return; }
+                }
+            } => Ok(()),
         }
-        match tokio::time::timeout(Duration::from_secs(15), device.connect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, %device_key, "could not reconnect Bluetooth device")
+    }
+
+    async fn reconnect_while_awake(&self, device_key: &str) -> Result<()> {
+        // Give BlueZ/WirePlumber's own restoration time to settle. Retry with
+        // bounded backoff rather than racing their first connection attempt.
+        for attempt in 0..3 {
+            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            if !self
+                .management
+                .device_policy(device_key)
+                .reconnect_on_resume
+            {
+                return Ok(());
             }
-            Err(_) => tracing::warn!(%device_key, "Bluetooth reconnect timed out"),
+            let Ok((_, device)) = self.find_device(device_key).await else {
+                return Ok(());
+            };
+            if !device.is_paired().await? || device.is_blocked().await? {
+                return Ok(());
+            }
+            let progress: OperationProgress =
+                Arc::new(|stage| tracing::debug!(stage, "Bluetooth reconnect progress"));
+            match self
+                .device_operation(
+                    device_key,
+                    DeviceOperation::Connect,
+                    &serde_json::json!({"power_on": false}),
+                    progress,
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if attempt < 2 => {
+                    tracing::debug!(%error, %device_key, attempt, "Bluetooth reconnection will retry")
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -537,6 +580,8 @@ impl BluetoothBackend for BluezBackend {
         progress: OperationProgress,
     ) -> Result<Snapshot> {
         tracing::info!(%device_key, %operation, "Bluetooth device operation started");
+        let gate = crate::task::device_gate(device_key);
+        let _exclusive = gate.lock().await;
         let (adapter, device) = self.find_device(device_key).await?;
         let policy = self.management.device_policy(device_key);
         if matches!(operation, DeviceOperation::Pair | DeviceOperation::Connect) {
@@ -1059,7 +1104,13 @@ fn apply_preferred_audio_profile(
 }
 
 async fn connect_device(device: &BluezDevice, operation: &'static str) -> Result<()> {
-    operation_timeout(Duration::from_secs(25), operation, device.connect()).await
+    operation_timeout(Duration::from_secs(25), operation, async {
+        match device.connect().await {
+            Err(error) if error.kind == bluer::ErrorKind::AlreadyConnected => Ok(()),
+            result => result,
+        }
+    })
+    .await
 }
 
 async fn disconnect_device(device: &BluezDevice, operation: &'static str) -> Result<()> {

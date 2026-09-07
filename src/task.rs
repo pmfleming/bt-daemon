@@ -1,8 +1,30 @@
-use std::{future::Future, panic::AssertUnwindSafe, sync::Mutex};
+use std::{
+    collections::HashMap,
+    future::Future,
+    panic::AssertUnwindSafe,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use anyhow::{Result, anyhow};
 use futures::FutureExt;
 use tokio::task::JoinHandle;
+
+/// A shared device gate also covers resume policy and native audio operations,
+/// which do not originate in OperationCoordinator.
+pub(crate) fn device_gate(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static GATES: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key.to_owned(), Arc::downgrade(&gate));
+    gate
+}
 
 /// Owns one backend generation's workers. Shutdown closes the spawn gate before
 /// aborting and joining, so a racing reconnect cannot install an orphan worker.
@@ -50,6 +72,18 @@ impl Drop for TaskGroup {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn device_gates_serialize_same_device_only() {
+        let first = super::device_gate("a");
+        let same = super::device_gate("a");
+        let other = super::device_gate("b");
+        let held = first.lock().await;
+        assert!(same.try_lock().is_err());
+        assert!(other.try_lock().is_ok());
+        drop(held);
+        assert!(same.try_lock().is_ok());
+    }
+
     #[tokio::test]
     async fn shutdown_joins_workers_and_prevents_new_spawns() {
         let tasks = super::TaskGroup::default();

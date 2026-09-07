@@ -67,12 +67,12 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Daemon => {
             let bluez = Arc::new(BluezBackend::new().await?);
-            bluez.apply_startup_policy().await;
             bluez.start_monitoring();
             bluez.start_lifecycle_monitoring();
             let identities = bluez.identity_registry();
             let pairing = PairingBroker::new(Arc::clone(&identities));
             let agent = bluez.register_agent(pairing.agent()).await?;
+            bluez.apply_startup_policy().await;
             let recovering = RecoveringBackend::new(bluez);
             recovering.set_agent(agent).await;
             recovering.start_recovery(Arc::clone(&pairing));

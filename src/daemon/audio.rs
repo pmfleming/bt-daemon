@@ -114,6 +114,8 @@ async fn apply_change(
         Ok(params) => params,
         Err(error) => return api::error("validation-error", error.to_string()),
     };
+    let gate = crate::task::device_gate(device_key);
+    let _exclusive = gate.lock().await;
     let devices = match devices().await {
         Ok(devices) => devices,
         Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
