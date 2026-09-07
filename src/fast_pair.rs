@@ -34,6 +34,8 @@ use crate::{
 };
 
 mod commands;
+mod retry;
+use retry::RetryPolicy;
 mod keys;
 use commands::PendingCommands;
 use keys::AccountKeyStore;
@@ -61,7 +63,6 @@ const KEY_BASED_PAIRING_UUID: &str = "fe2c1234-8366-4814-8eb0-01de32100bea";
 const ACCOUNT_KEY_UUID: &str = "fe2c1236-8366-4814-8eb0-01de32100bea";
 const MAX_FRAME_PAYLOAD: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
-const RETRY_DELAY: Duration = Duration::from_secs(15);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,7 +383,8 @@ enum LinkState {
 struct ConnectionState {
     links: HashMap<Address, LinkState>,
     writers: HashMap<Address, mpsc::Sender<Vec<u8>>>,
-    retry_after: HashMap<Address, Instant>,
+    retry: RetryPolicy,
+    connected_since: HashMap<Address, Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -1137,6 +1139,7 @@ impl FastPairBatteryProvider {
             .context("read Fast Pair device connection state")?
         {
             self.remove_report(address).await;
+            self.connections.lock().await.retry.reset_session(address);
             return Ok(());
         }
         let Some(uuids) = device
@@ -1182,6 +1185,15 @@ impl FastPairBatteryProvider {
     }
 
     async fn ensure_l2cap_connected(self: &Arc<Self>, device: Device) {
+        if !self
+            .connections
+            .lock()
+            .await
+            .retry
+            .l2cap_allowed(device.address())
+        {
+            return;
+        }
         let Some(provider) = self.begin_device_connection(device.address()).await else {
             return;
         };
@@ -1210,9 +1222,23 @@ impl FastPairBatteryProvider {
     async fn connect_l2cap(&self, device: &Device) -> Result<L2capStream> {
         let psm = match self.read_message_stream_psm(device).await? {
             PsmAvailability::Ready(psm) => psm,
-            PsmAvailability::Unknown => bail!("Fast Pair Message Stream PSM is not ready"),
+            PsmAvailability::Unknown => {
+                self.connections
+                    .lock()
+                    .await
+                    .retry
+                    .psm_unknown(device.address());
+                bail!("Fast Pair Message Stream PSM is not ready (bounded retry)")
+            }
             PsmAvailability::Unavailable => {
-                bail!("Fast Pair Message Stream PSM is unavailable")
+                // Google BLE Device specification: do not use this component
+                // again in this connection session; this is not a transient I/O error.
+                self.connections
+                    .lock()
+                    .await
+                    .retry
+                    .psm_unavailable(device.address());
+                bail!("Fast Pair Message Stream PSM is unavailable for this connection")
             }
         };
         let address_type = device
@@ -1316,12 +1342,7 @@ impl FastPairBatteryProvider {
 
     async fn begin_device_connection(self: &Arc<Self>, address: Address) -> Option<Arc<Self>> {
         let mut state = self.connections.lock().await;
-        if state.links.contains_key(&address)
-            || state
-                .retry_after
-                .get(&address)
-                .is_some_and(|retry| *retry > Instant::now())
-        {
+        if state.links.contains_key(&address) || !state.retry.ready(address) {
             return None;
         }
         state.links.insert(address, LinkState::Connecting);
@@ -1334,7 +1355,8 @@ impl FastPairBatteryProvider {
             false
         } else {
             state.links.insert(address, LinkState::Connected);
-            state.retry_after.remove(&address);
+            state.retry.connected(address);
+            state.connected_since.insert(address, Instant::now());
             true
         }
     }
@@ -1363,9 +1385,7 @@ impl FastPairBatteryProvider {
         let mut state = self.connections.lock().await;
         if state.links.get(&address) == Some(&LinkState::Connecting) {
             state.links.remove(&address);
-            state
-                .retry_after
-                .insert(address, Instant::now() + RETRY_DELAY);
+            state.retry.failed(address);
         }
     }
 
@@ -1374,9 +1394,14 @@ impl FastPairBatteryProvider {
             let mut state = self.connections.lock().await;
             state.links.remove(&address);
             state.writers.remove(&address);
-            state
-                .retry_after
-                .insert(address, Instant::now() + RETRY_DELAY);
+            if state
+                .connected_since
+                .remove(&address)
+                .is_some_and(|start| start.elapsed() >= Duration::from_secs(60))
+            {
+                state.retry.reset_session(address);
+            }
+            state.retry.failed(address);
         }
         self.pending_commands.disconnect(address);
         let runtime_changed = self.runtime.write().await.remove(&address).is_some();
