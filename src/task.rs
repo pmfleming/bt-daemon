@@ -1,8 +1,75 @@
-use std::{future::Future, panic::AssertUnwindSafe};
+use std::{future::Future, panic::AssertUnwindSafe, sync::Mutex};
 
 use anyhow::{Result, anyhow};
 use futures::FutureExt;
 use tokio::task::JoinHandle;
+
+/// Owns one backend generation's workers. Shutdown closes the spawn gate before
+/// aborting and joining, so a racing reconnect cannot install an orphan worker.
+#[derive(Default)]
+pub(crate) struct TaskGroup(Mutex<TaskGroupState>);
+
+#[derive(Default)]
+struct TaskGroupState {
+    closed: bool,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl TaskGroup {
+    pub fn spawn(&self, name: &'static str, future: impl Future<Output = ()> + Send + 'static) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return;
+        }
+        state.handles.retain(|handle| !handle.is_finished());
+        state.handles.push(spawn(name, future));
+    }
+
+    pub async fn shutdown(&self) {
+        let handles = {
+            let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            state.closed = true;
+            std::mem::take(&mut state.handles)
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for TaskGroup {
+    fn drop(&mut self) {
+        for handle in &self.0.get_mut().unwrap_or_else(|p| p.into_inner()).handles {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn shutdown_joins_workers_and_prevents_new_spawns() {
+        let tasks = super::TaskGroup::default();
+        let marker = std::sync::Arc::new(());
+        let held = marker.clone();
+        tasks.spawn("test", async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        tasks.shutdown().await;
+        assert_eq!(std::sync::Arc::strong_count(&marker), 1);
+        let held = marker.clone();
+        tasks.spawn("closed", async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(std::sync::Arc::strong_count(&marker), 1);
+        tasks.shutdown().await;
+    }
+}
 
 async fn catch_unwind<T>(name: &'static str, future: impl Future<Output = T>) -> Result<T> {
     AssertUnwindSafe(future)

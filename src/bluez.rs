@@ -51,19 +51,29 @@ pub struct BluezBackend {
     device_cache: Mutex<HashMap<String, CachedDevice>>,
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
-    management: ManagementStore,
+    management: Arc<ManagementStore>,
+    tasks: crate::task::TaskGroup,
 }
 
 impl BluezBackend {
     pub async fn new() -> Result<Self> {
+        Self::with_state(
+            DeviceIdentityRegistry::load_default()?,
+            Arc::new(ManagementStore::load_default()?),
+        )
+        .await
+    }
+
+    async fn with_state(
+        identities: Arc<DeviceIdentityRegistry>,
+        management: Arc<ManagementStore>,
+    ) -> Result<Self> {
         tracing::info!("initializing BlueZ backend");
         let (changes, _) = broadcast::channel(64);
         let session = Session::new().await.backend_context("open BlueZ session")?;
         let system_bus = zbus::Connection::system()
             .await
             .context("open system D-Bus for BlueZ compatibility properties")?;
-        let identities = DeviceIdentityRegistry::load_default()?;
-        let management = ManagementStore::load_default()?;
         for name in session
             .adapter_names()
             .await
@@ -101,7 +111,17 @@ impl BluezBackend {
             system_bus,
             fast_pair,
             management,
+            tasks: crate::task::TaskGroup::default(),
         })
+    }
+
+    pub async fn shutdown(&self) {
+        // Close monitoring first so no old lifecycle callback can reconnect.
+        self.tasks.shutdown().await;
+        self.stop_discovery(None).await;
+        if let Some(provider) = &self.fast_pair {
+            provider.shutdown().await;
+        }
     }
 
     pub fn identity_registry(&self) -> Arc<DeviceIdentityRegistry> {
@@ -129,7 +149,7 @@ impl BluezBackend {
 
     pub fn start_lifecycle_monitoring(self: &Arc<Self>) {
         let backend = Arc::clone(self);
-        crate::task::spawn("logind-bluetooth-lifecycle", async move {
+        self.tasks.spawn("logind-bluetooth-lifecycle", async move {
             if let Err(error) = backend.monitor_sleep_events().await {
                 tracing::warn!(%error, "Bluetooth suspend/resume monitoring stopped");
             }
@@ -293,7 +313,7 @@ impl BluezBackend {
     pub fn start_monitoring(self: &Arc<Self>) {
         tracing::info!("BlueZ event monitor started");
         let backend = Arc::clone(self);
-        crate::task::spawn("bluez-monitor", async move {
+        self.tasks.spawn("bluez-monitor", async move {
             loop {
                 if let Err(error) = backend.monitor_one_change().await {
                     tracing::warn!(error = %error, "BlueZ event monitor is retrying");
@@ -414,7 +434,7 @@ impl BluezBackend {
         drop(tasks);
         if stopped {
             let changes = self.changes.clone();
-            crate::task::spawn("bluetooth-cache-expiry", async move {
+            self.tasks.spawn("bluetooth-cache-expiry", async move {
                 tokio::time::sleep(DISCOVERED_DEVICE_CACHE_TTL).await;
                 let _ = changes.send(());
             });

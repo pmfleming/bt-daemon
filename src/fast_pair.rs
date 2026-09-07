@@ -417,6 +417,7 @@ pub struct FastPairBatteryProvider {
     changes: broadcast::Sender<()>,
     uuids: FastPairUuids,
     rfcomm_available: bool,
+    tasks: crate::task::TaskGroup,
 }
 
 async fn run_message_stream<S>(
@@ -836,12 +837,21 @@ impl FastPairBatteryProvider {
             changes,
             uuids,
             rfcomm_available: requests.is_some(),
+            tasks: crate::task::TaskGroup::default(),
         });
         if let Some(requests) = requests {
             Self::spawn_request_handler(Arc::clone(&provider), requests);
         }
         Self::spawn_reconciler(Arc::clone(&provider));
         Ok(provider)
+    }
+
+    pub async fn shutdown(&self) {
+        self.tasks.shutdown().await;
+        *self.connections.lock().await = ConnectionState::default();
+        self.pending_commands.lock().await.clear();
+        self.runtime.write().await.clear();
+        self.reports.write().await.clear();
     }
 
     pub async fn batteries(&self, address: Address) -> Vec<Battery> {
@@ -1024,7 +1034,8 @@ impl FastPairBatteryProvider {
     }
 
     fn spawn_request_handler(provider: Arc<Self>, mut requests: ProfileHandle) {
-        crate::task::spawn("fast-pair-rfcomm-requests", async move {
+        let owner = Arc::clone(&provider);
+        owner.tasks.spawn("fast-pair-rfcomm-requests", async move {
             while let Some(request) = requests.next().await {
                 let address = request.device();
                 if !provider.mark_connected(address).await {
@@ -1050,7 +1061,8 @@ impl FastPairBatteryProvider {
     where
         R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        crate::task::spawn("fast-pair-reader", async move {
+        let owner = Arc::clone(&provider);
+        owner.tasks.spawn("fast-pair-reader", async move {
             tracing::info!(%address, %transport, "Fast Pair battery stream started");
             let result = crate::task::catch(
                 "Fast Pair message stream",
@@ -1068,7 +1080,8 @@ impl FastPairBatteryProvider {
 
     fn spawn_reconciler(provider: Arc<Self>) {
         let mut changes = provider.changes.subscribe();
-        crate::task::spawn("fast-pair-reconciler", async move {
+        let owner = Arc::clone(&provider);
+        owner.tasks.spawn("fast-pair-reconciler", async move {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1153,7 +1166,7 @@ impl FastPairBatteryProvider {
             return;
         };
         let address = device.address();
-        crate::task::spawn("fast-pair-rfcomm-connect", async move {
+        self.tasks.spawn("fast-pair-rfcomm-connect", async move {
             let result = crate::task::catch("Fast Pair RFCOMM connection", async {
                 tokio::time::timeout(
                     CONNECT_TIMEOUT,
@@ -1176,7 +1189,7 @@ impl FastPairBatteryProvider {
             return;
         };
         let address = device.address();
-        crate::task::spawn("fast-pair-l2cap-connect", async move {
+        self.tasks.spawn("fast-pair-l2cap-connect", async move {
             let result = crate::task::catch("Fast Pair BLE L2CAP connection", async {
                 tokio::time::timeout(CONNECT_TIMEOUT, provider.connect_l2cap(&device))
                     .await

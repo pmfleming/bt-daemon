@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -12,8 +15,8 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::{
     backend::{
-        AdapterOperation, BluetoothBackend, DeviceOperation, ObexRemote, ObexTarget,
-        OperationProgress,
+        AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
+        ObexRemote, ObexTarget, OperationProgress,
     },
     model::Snapshot,
     pairing::PairingBroker,
@@ -25,6 +28,7 @@ pub struct RecoveringBackend {
     current: RwLock<Arc<BluezBackend>>,
     changes: broadcast::Sender<()>,
     agent: Mutex<Option<AgentHandle>>,
+    available: AtomicBool,
 }
 
 impl RecoveringBackend {
@@ -34,6 +38,7 @@ impl RecoveringBackend {
             current: RwLock::new(Arc::clone(&initial)),
             changes,
             agent: Mutex::new(None),
+            available: AtomicBool::new(true),
         });
         backend.forward_changes(initial);
         backend
@@ -53,16 +58,18 @@ impl RecoveringBackend {
     fn forward_changes(&self, backend: Arc<BluezBackend>) {
         let mut receiver = backend.subscribe_changes();
         let changes = self.changes.clone();
-        crate::task::spawn("recovering-bluez-change-forwarder", async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = changes.send(());
+        backend
+            .tasks
+            .spawn("recovering-bluez-change-forwarder", async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = changes.send(());
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
                     }
-                    Err(broadcast::error::RecvError::Closed) => return,
                 }
-            }
-        });
+            });
     }
 
     pub fn start_recovery(self: &Arc<Self>, pairing: Arc<PairingBroker>) {
@@ -98,7 +105,10 @@ impl RecoveringBackend {
             if name != "org.bluez" || old_owner == new_owner {
                 continue;
             }
+            self.available.store(false, Ordering::Release);
             let _ = self.changes.send(());
+            self.current().shutdown().await;
+            self.agent.lock().await.take();
             if new_owner.is_empty() {
                 tracing::warn!(
                     "BlueZ disappeared; retaining daemon API while waiting for recovery"
@@ -113,7 +123,8 @@ impl RecoveringBackend {
     async fn recover(&self, pairing: &Arc<PairingBroker>) {
         tracing::info!("BlueZ appeared; rebuilding Bluetooth backend");
         loop {
-            match Self::replacement(pairing).await {
+            let previous = self.current();
+            match Self::replacement(pairing, &previous).await {
                 Ok((replacement, agent)) => {
                     *self.agent.lock().await = Some(agent);
                     *self
@@ -121,6 +132,7 @@ impl RecoveringBackend {
                         .write()
                         .unwrap_or_else(|poison| poison.into_inner()) = Arc::clone(&replacement);
                     self.forward_changes(replacement);
+                    self.available.store(true, Ordering::Release);
                     let _ = self.changes.send(());
                     tracing::info!("Bluetooth backend recovered without restarting bt-daemon");
                     return;
@@ -133,15 +145,27 @@ impl RecoveringBackend {
         }
     }
 
-    async fn replacement(pairing: &Arc<PairingBroker>) -> Result<(Arc<BluezBackend>, AgentHandle)> {
-        let replacement = Arc::new(BluezBackend::new().await?);
+    async fn replacement(
+        pairing: &Arc<PairingBroker>,
+        previous: &BluezBackend,
+    ) -> Result<(Arc<BluezBackend>, AgentHandle)> {
+        let replacement = Arc::new(
+            BluezBackend::with_state(
+                Arc::clone(&previous.identities),
+                Arc::clone(&previous.management),
+            )
+            .await?,
+        );
+        let agent = match replacement.register_agent(pairing.agent()).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                replacement.shutdown().await;
+                return Err(error.context("restore the Bluetooth pairing agent"));
+            }
+        };
         replacement.apply_startup_policy().await;
         replacement.start_monitoring();
         replacement.start_lifecycle_monitoring();
-        let agent = replacement
-            .register_agent(pairing.agent())
-            .await
-            .context("restore the Bluetooth pairing agent")?;
         Ok((replacement, agent))
     }
 }
@@ -155,6 +179,9 @@ macro_rules! impl_recovering_backend {
             }
 
             $(async fn $name(&self, $($argument: $type),*) -> Result<$output> {
+                if !self.available.load(Ordering::Acquire) {
+                    return Err(BackendError::new(BackendErrorKind::Unavailable, "BlueZ is recovering").into());
+                }
                 self.current().$name($($argument),*).await
             })+
         }
