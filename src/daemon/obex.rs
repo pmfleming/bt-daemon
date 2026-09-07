@@ -79,17 +79,6 @@ fn incoming_agent_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-#[cfg(test)]
-mod support_tests {
-    #[test]
-    fn incoming_agent_requires_explicit_opt_in() {
-        for value in [None, Some(""), Some("0"), Some("true")] {
-            assert!(!super::incoming_agent_enabled(value));
-        }
-        assert!(super::incoming_agent_enabled(Some("1")));
-    }
-}
-
 pub(super) async fn respond(incoming: &obex::IncomingBroker, params: &Value) -> Value {
     let request = params
         .require_string("request_id")
@@ -221,5 +210,16 @@ impl OutgoingTransfers {
         let _ = cancel.sender.send(());
         tracing::info!(%request_id, "outgoing OBEX transfer cancellation sent");
         true
+    }
+}
+
+#[cfg(test)]
+mod support_tests {
+    #[test]
+    fn incoming_agent_requires_explicit_opt_in() {
+        for value in [None, Some(""), Some("0"), Some("true")] {
+            assert!(!super::incoming_agent_enabled(value));
+        }
+        assert!(super::incoming_agent_enabled(Some("1")));
     }
 }
