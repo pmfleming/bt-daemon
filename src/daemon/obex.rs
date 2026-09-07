@@ -37,6 +37,17 @@ impl ObexCoordinator {
     }
 
     pub(super) async fn activate(&self, connection: zbus::Connection) {
+        // OBEX file transfer is implemented by bt-daemon, but Shelllist does NOT
+        // implement a transfer UI (in particular, incoming approval/progress).
+        // Do not take ownership from Blueman or leave invisible prompts waiting
+        // for 60 seconds. Only an explicitly configured, OBEX-capable API client
+        // should enable our incoming agent. Outgoing API transfers remain usable.
+        if !incoming_agent_enabled(std::env::var("BT_DAEMON_OBEX_INCOMING").ok().as_deref()) {
+            tracing::info!(
+                "incoming OBEX agent disabled: Shelllist does not support file transfers"
+            );
+            return;
+        }
         self.incoming.set_connection(connection.clone());
         if let Err(error) = obex::register_agent(&connection, &self.incoming).await {
             tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "incoming OBEX authorization is unavailable");
@@ -61,6 +72,21 @@ impl ObexCoordinator {
     pub(super) async fn cancel(&self, request_id: &str) -> Option<&'static str> {
         (self.outgoing.cancel(request_id).await || self.incoming.cancel_transfer(request_id).await)
             .then_some("obex-transfer")
+    }
+}
+
+fn incoming_agent_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(test)]
+mod support_tests {
+    #[test]
+    fn incoming_agent_requires_explicit_opt_in() {
+        for value in [None, Some(""), Some("0"), Some("true")] {
+            assert!(!super::incoming_agent_enabled(value));
+        }
+        assert!(super::incoming_agent_enabled(Some("1")));
     }
 }
 
