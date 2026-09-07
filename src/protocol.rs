@@ -46,7 +46,7 @@ macro_rules! stream_registry {
 
 pub const STREAMS: &[(&str, &[&str])] = stream_registry! {
     stream::CHANGED => ["subscribed", "changed", "unavailable"];
-    stream::PAIRING => ["requested", "display", "cancelled", "lagged"];
+    stream::PAIRING => ["requested", "display", "answered", "cancelled", "lagged"];
     stream::OPERATION => ["started", "progress", "completed", "failed", "cancelled", "lagged"];
     stream::SCAN => ["started", "completed", "failed", "cancelled", "lagged"];
     stream::OBEX => ["authorization-requested", "queued", "progress", "completed", "failed", "cancelled", "lagged"];

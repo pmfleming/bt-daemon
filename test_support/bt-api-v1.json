@@ -897,6 +897,7 @@
         "events": [
           "requested",
           "display",
+          "answered",
           "cancelled",
           "lagged"
         ],

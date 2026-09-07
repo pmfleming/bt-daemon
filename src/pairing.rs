@@ -141,6 +141,7 @@ pub struct PairingBroker {
     sequence: AtomicU64,
     // Synchronous so a dropped callback can remove its prompt in Drop without a race.
     pending: Mutex<HashMap<String, PendingRequest>>,
+    displays: Mutex<HashMap<String, PairingEvent>>,
     events: broadcast::Sender<PairingEvent>,
     identities: Arc<DeviceIdentityRegistry>,
     prompt_timeout: Duration,
@@ -159,6 +160,7 @@ impl PairingBroker {
         Arc::new(Self {
             sequence: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
+            displays: Mutex::new(HashMap::new()),
             events,
             identities,
             prompt_timeout,
@@ -170,12 +172,22 @@ impl PairingBroker {
     }
 
     pub fn pending_events(&self) -> Vec<PairingEvent> {
-        self.pending
+        let mut events: Vec<_> = self
+            .pending
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .values()
             .map(|request| request.event.clone())
-            .collect()
+            .collect();
+        events.extend(
+            self.displays
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .cloned(),
+        );
+        events.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        events
     }
 
     pub fn device_key(&self, adapter: &str, address: Address) -> String {
@@ -210,16 +222,20 @@ impl PairingBroker {
             request.response.validate(params)?;
         }
         tracing::info!(%request_id, accept, kind = %request.event.kind, device_key = %request.event.device_key, "pairing response received");
-        let response = pending
+        let request = pending
             .remove(request_id)
-            .context("pairing request is no longer pending")?
-            .response;
+            .context("pairing request is no longer pending")?;
         drop(pending);
         if accept {
-            response.accept(params)?;
+            request.response.accept(params)?;
         } else {
-            reject(response);
+            reject(request.response);
         }
+        let mut answered = request
+            .event
+            .cancelled(if accept { "accepted" } else { "rejected" });
+        answered.event = "answered".into();
+        self.emit(answered);
         Ok(accept)
     }
 
@@ -335,7 +351,7 @@ impl PairingBroker {
         );
         let device_key = self.identities.device_key(adapter, device);
         tracing::info!(request_id = %id, %kind, %device_key, "pairing display started");
-        self.emit(PairingEvent {
+        let event = PairingEvent {
             event: "display".to_string(),
             request_id: id.clone(),
             kind: kind.to_string(),
@@ -346,7 +362,12 @@ impl PairingBroker {
             service: None,
             reason: None,
             timeout_ms: 0,
-        });
+        };
+        let mut displays = self.displays.lock().unwrap_or_else(|p| p.into_inner());
+        displays.retain(|_, old| old.device_key != event.device_key || old.kind != event.kind);
+        displays.insert(id.clone(), event.clone());
+        drop(displays);
+        self.emit(event);
         id
     }
 
@@ -358,6 +379,10 @@ impl PairingBroker {
         device: Address,
         reason: &str,
     ) {
+        self.displays
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&request_id);
         tracing::warn!(%request_id, %kind, %reason, "pairing interaction cancelled");
         self.emit(PairingEvent {
             event: "cancelled".to_string(),
@@ -494,6 +519,21 @@ mod tests {
                 .await
         });
         (events, request)
+    }
+
+    #[test]
+    fn display_prompts_are_recoverable_and_replaced_by_progress() {
+        let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let old = broker.display("display-passkey", "hci0", address, "000123".into(), Some(1));
+        let current = broker.display("display-passkey", "hci0", address, "000123".into(), Some(2));
+        broker.cancelled(old, "display-passkey", "hci0", address, "updated");
+        let events = broker.pending_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, current);
+        assert_eq!(events[0].entered, Some(2));
+        broker.cancelled(current, "display-passkey", "hci0", address, "cancelled");
+        assert!(broker.pending_events().is_empty());
     }
 
     #[tokio::test]
