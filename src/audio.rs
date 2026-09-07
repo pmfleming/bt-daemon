@@ -261,10 +261,9 @@ fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
     let applied_for_registry = Rc::clone(&applied);
     let retained = Rc::new(RefCell::new(None::<Metadata>));
     let retained_for_registry = Rc::clone(&retained);
-    let key = match kind {
-        EndpointKind::Sink => "default.audio.sink",
-        EndpointKind::Source => "default.audio.source",
-    };
+    // Match wpctl set-default: effective default.audio.* belongs to policy;
+    // configured defaults express a user choice and are persisted by WirePlumber.
+    let key = configured_default_key(kind);
     let value = serde_json::json!({ "name": node_name }).to_string();
     let _registry_listener = registry
         .add_listener_local()
@@ -690,6 +689,13 @@ enum EndpointKind {
     Source,
 }
 
+fn configured_default_key(kind: EndpointKind) -> &'static str {
+    match kind {
+        EndpointKind::Sink => "default.configured.audio.sink",
+        EndpointKind::Source => "default.configured.audio.source",
+    }
+}
+
 fn endpoint_kind(media_class: Option<&str>) -> Option<EndpointKind> {
     match media_class {
         Some("Audio/Sink") => Some(EndpointKind::Sink),
@@ -755,6 +761,18 @@ mod tests {
         AudioDevice, AudioEndpoint, AudioProfile, Defaults, DeviceEndpoints, finalize_devices,
         update_profile,
     };
+
+    #[test]
+    fn routing_writes_configured_defaults_not_policy_outputs() {
+        assert_eq!(
+            super::configured_default_key(super::EndpointKind::Sink),
+            "default.configured.audio.sink"
+        );
+        assert_eq!(
+            super::configured_default_key(super::EndpointKind::Source),
+            "default.configured.audio.source"
+        );
+    }
 
     #[test]
     fn probe_results_are_deduplicated_and_linked_to_defaults() {
