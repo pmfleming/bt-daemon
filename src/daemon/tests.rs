@@ -20,6 +20,18 @@ use super::{
     operation::OperationEvent, scan::ScanEvent,
 };
 
+#[test]
+fn identical_snapshots_do_not_wake_subscribers() {
+    let (sender, mut receiver) = watch::channel(json!({"devices": []}));
+    super::send_changed(&sender, json!({"devices": []}));
+    assert!(!receiver.has_changed().unwrap());
+    super::send_changed(&sender, json!({"devices": ["new"]}));
+    assert!(receiver.has_changed().unwrap());
+    receiver.borrow_and_update();
+    super::send_changed(&sender, json!({"devices": ["new"]}));
+    assert!(!receiver.has_changed().unwrap());
+}
+
 type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
 
 struct TestBackend {

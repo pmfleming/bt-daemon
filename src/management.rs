@@ -14,7 +14,7 @@ const POLICY_VERSION: u8 = 1;
 const RUNTIME_VERSION: u8 = 1;
 const DEVICE_POLICY_VERSION: u8 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManagementPolicy {
     #[serde(default = "default_policy_version")]
     pub version: u8,
@@ -46,7 +46,7 @@ impl Default for ManagementPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DevicePolicy {
     pub reconnect_on_resume: bool,
     pub trust_after_pair: bool,

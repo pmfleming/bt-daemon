@@ -25,7 +25,7 @@ mod subscription;
 
 use self::{obex::ObexCoordinator, operation::OperationCoordinator, scan::ScanCoordinator};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) enum SharedSnapshot {
     Loading,
     Available(Arc<crate::model::Snapshot>),
@@ -346,7 +346,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     tokio::spawn(async move {
         snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
         while receive_refresh(&mut changes, std::time::Duration::from_millis(80)).await {
-            snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
+            send_changed(&snapshot_updates, load_snapshot(&snapshot_backend).await);
         }
     });
     let audio_updates = audio_snapshots.clone();
@@ -354,7 +354,10 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     tokio::spawn(async move {
         audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
         while receive_refresh(&mut audio_changes, std::time::Duration::from_millis(150)).await {
-            audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
+            send_changed(
+                &audio_updates,
+                audio::snapshot(Arc::clone(&audio_pairing)).await,
+            );
         }
     });
     tracing::info!(
@@ -363,6 +366,17 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         "bt-daemon started"
     );
     shelllist_daemon_tokio::wait_for_shutdown().await
+}
+
+fn send_changed<T: PartialEq>(sender: &watch::Sender<T>, next: T) {
+    // Do not serialize and send an identical full snapshot to every frontend.
+    sender.send_if_modified(|current| {
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
+    });
 }
 
 fn snapshot_response(snapshot: &SharedSnapshot) -> Value {

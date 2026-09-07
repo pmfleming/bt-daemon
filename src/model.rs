@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::management::{DevicePolicy, ManagementPolicy};
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Snapshot {
     pub radio: RadioState,
     pub management: ManagementPolicy,
@@ -12,7 +12,7 @@ pub struct Snapshot {
     pub devices: Vec<Device>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RadioState {
     pub available: bool,
     pub operational: bool,
@@ -23,7 +23,7 @@ pub struct RadioState {
     pub hard_blocked: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Adapter {
     pub key: String,
     pub name: String,
@@ -39,7 +39,7 @@ pub struct Adapter {
     pub modalias: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Device {
     pub key: String,
     pub adapter_key: String,
@@ -55,7 +55,7 @@ pub struct Device {
     pub capabilities: DeviceCapabilities,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeviceIdentity {
     pub name: String,
     pub alias: String,
@@ -67,7 +67,7 @@ pub struct DeviceIdentity {
     pub modalias: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeviceState {
     pub paired: bool,
     pub bonded: Option<bool>,
@@ -78,14 +78,14 @@ pub struct DeviceState {
     pub legacy_pairing: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeviceServices {
     pub services_resolved: bool,
     pub uuids: Vec<String>,
     pub services: Vec<Service>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DevicePresentation {
     pub battery: Vec<Battery>,
     pub battery_live: bool,
@@ -102,7 +102,7 @@ pub struct DevicePresentation {
     pub last_seen_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Service {
     pub uuid: String,
     pub label: String,
@@ -188,7 +188,7 @@ const TYPE_RULES: &[(&[&str], &str)] = &[
     (&["watch", "wearable"], "Wearable"),
 ];
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FastPairFeatures {
     pub model_id: Option<String>,
     pub ble_address: Option<String>,
@@ -214,7 +214,7 @@ pub struct FastPairNoiseControl {
     pub active_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeviceCapabilities {
     pub can_pair: bool,
     pub can_connect: bool,
