@@ -70,6 +70,7 @@ struct BatteryReport {
     left: Option<u8>,
     right: Option<u8>,
     case: Option<u8>,
+    charging: [bool; 3],
 }
 
 impl BatteryReport {
@@ -84,6 +85,11 @@ impl BatteryReport {
             left: decode_component(payload[0])?,
             right: decode_component(payload[1])?,
             case: decode_component(payload[2])?,
+            charging: [
+                payload[0] & 0x80 != 0,
+                payload[1] & 0x80 != 0,
+                payload[2] & 0x80 != 0,
+            ],
         })
     }
 
@@ -94,12 +100,14 @@ impl BatteryReport {
             ("fast-pair-case", "Case", "case", self.case),
         ]
         .into_iter()
-        .filter_map(|(id, label, component, reading)| {
+        .enumerate()
+        .filter_map(|(index, (id, label, component, reading))| {
             reading.map(|percentage| Battery {
                 id: id.to_string(),
                 label: label.to_string(),
                 component: component.to_string(),
                 percentage,
+                charging: Some(self.charging[index]),
                 source: "google-fast-pair-message-stream".to_string(),
                 confidence: "high".to_string(),
             })
@@ -1489,6 +1497,12 @@ mod tests {
 
     #[test]
     fn battery_values_mask_charging_and_decode_unknown_states() {
+        let reports = BatteryReport::from_payload(&[0xe4, 0x32, 0xff])
+            .unwrap()
+            .model_batteries();
+        assert_eq!(reports[0].charging, Some(true));
+        assert_eq!(reports[1].charging, Some(false));
+        assert_eq!(reports.len(), 2); // Unknown percentage is still not invented.
         assert_eq!(decode_component(0xe4).unwrap(), Some(100));
         assert_eq!(decode_component(0x7f).unwrap(), None);
         assert_eq!(decode_component(0xff).unwrap(), None);

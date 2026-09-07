@@ -114,6 +114,9 @@ pub struct Battery {
     pub label: String,
     pub component: String,
     pub percentage: u8,
+    /// None means the source (e.g. BlueZ Battery1) does not report charging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
     pub source: String,
     pub confidence: String,
 }
@@ -125,6 +128,7 @@ impl Battery {
             label: "Battery".into(),
             component: "main".into(),
             percentage,
+            charging: None,
             source: "bluez".into(),
             confidence: "standard".into(),
         }

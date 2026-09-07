@@ -354,6 +354,7 @@ mod tests {
             label: component.into(),
             component: component.into(),
             percentage,
+            charging: None,
             source: "test".into(),
             confidence: "standard".into(),
         }]
