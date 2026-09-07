@@ -72,6 +72,7 @@ Record a date, device, and result for every row before moving `SUPER+B`.
 | Mouse/gamepad just-works and wake | Pending hardware |
 | Phone pairing and OBEX send/receive | Pending hardware |
 | Suspend/resume and rfkill recovery | Pending |
+| PipeWire restart while Bluetooth UI is open | Pending — stop/restart PipeWire only in an approved hardware session; expect an unavailable audio snapshot followed by fresh cards/routes, with exactly one monitor thread. Core errors and panics now trigger monitor reconstruction. |
 | Two simultaneous discovery clients | Pending |
 
 Do not remove Blueman until the actually used audio, input, incoming pairing, OBEX, networking, and serial rows have explicit pass or intentionally-unsupported decisions.

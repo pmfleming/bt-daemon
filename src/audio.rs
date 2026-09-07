@@ -171,6 +171,23 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
     let core = context
         .connect_rc(None)
         .context("connect PipeWire monitor")?;
+    // A disconnected PipeWire core does not stop MainLoop by itself. Without
+    // this listener the outer retry loop can never build a fresh connection.
+    let failed = Rc::new(RefCell::new(None::<String>));
+    let error_state = Rc::clone(&failed);
+    let error_loop = main_loop.clone();
+    let _core_listener = core
+        .add_listener_local()
+        .error(move |id, _, result, message| {
+            if id == pw::core::PW_ID_CORE {
+                *error_state.borrow_mut() =
+                    Some(format!("PipeWire core disconnected ({result}): {message}"));
+                error_loop.quit();
+            } else {
+                tracing::warn!(id, result, message, "PipeWire monitor object error");
+            }
+        })
+        .register();
     let registry = core
         .get_registry_rc()
         .context("open PipeWire monitor registry")?;
@@ -214,7 +231,12 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
         })
         .register();
     main_loop.run();
-    anyhow::bail!("PipeWire monitor loop ended")
+    anyhow::bail!(
+        failed
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| "PipeWire monitor loop ended".into())
+    )
 }
 
 pub fn probe() -> Result<Vec<AudioDevice>> {

@@ -10,16 +10,17 @@ pub(super) fn start_monitor(events: broadcast::Sender<()>) -> Result<()> {
     std::thread::Builder::new()
         .name("bt-pipewire-monitor".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+            loop {
                 let sender = events.clone();
                 let notify = Arc::new(move || drop(sender.send(())));
-                if let Err(error) = audio::monitor(notify) {
-                    tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "PipeWire audio monitor is retrying");
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audio::monitor(notify))) {
+                    Ok(Err(error)) => tracing::warn!(error = %error, error_chain = %format!("{error:#}"), "PipeWire audio monitor is retrying"),
+                    Err(_) => tracing::error!("PipeWire audio monitor panicked; rebuilding connection"),
+                    Ok(Ok(())) => {}
                 }
+                // Force a probe/unavailable event even if no globals were removed.
+                let _ = events.send(());
                 std::thread::sleep(std::time::Duration::from_secs(1));
-            }));
-            if result.is_err() {
-                tracing::error!("PipeWire audio monitor thread panicked");
             }
         })
         .context("start PipeWire audio monitor thread")?;
