@@ -548,6 +548,15 @@ impl BluetoothBackend for BluezBackend {
             )
             .await?;
         }
+        // Revoke local Fast Pair credentials before BlueZ removes the device;
+        // if persistence fails, retain the device so Forget remains retryable.
+        if operation == DeviceOperation::Remove
+            && let Some(provider) = &self.fast_pair
+        {
+            let provider = Arc::clone(provider);
+            let key = device_key.to_owned();
+            tokio::task::spawn_blocking(move || provider.forget_account_key(&key)).await??;
+        }
         run_device_operation(
             &adapter,
             &device,

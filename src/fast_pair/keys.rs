@@ -73,13 +73,19 @@ impl AccountKeyStore {
         key
     }
 
-    pub(super) fn insert(&self, device_key: String, key: [u8; 16]) -> Result<()> {
-        validate_key(&key, "Fast Pair account key")?;
-        let mut keys = self
-            .keys
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        keys.insert(device_key, key);
+    pub(super) fn remove(&self, device_key: &str) -> Result<()> {
+        let mut keys = self.keys.lock().unwrap_or_else(|p| p.into_inner());
+        if !keys.contains_key(device_key) {
+            return Ok(());
+        }
+        let mut updated = keys.clone();
+        updated.remove(device_key);
+        self.persist(&updated)?;
+        *keys = updated;
+        Ok(())
+    }
+
+    fn persist(&self, keys: &HashMap<String, [u8; 16]>) -> Result<()> {
         if let Some(path) = &self.path {
             let file = KeyFile {
                 version: STORE_VERSION,
@@ -90,6 +96,19 @@ impl AccountKeyStore {
             };
             crate::state::write_json(path, &file, "Fast Pair account key store")?;
         }
+        Ok(())
+    }
+
+    pub(super) fn insert(&self, device_key: String, key: [u8; 16]) -> Result<()> {
+        validate_key(&key, "Fast Pair account key")?;
+        let mut keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut updated = keys.clone();
+        updated.insert(device_key, key);
+        self.persist(&updated)?;
+        *keys = updated;
         Ok(())
     }
 }
@@ -121,6 +140,15 @@ mod tests {
                 .unwrap()
                 .get("device-test"),
             Some(key)
+        );
+        let store = AccountKeyStore::load(Some(path.clone())).unwrap();
+        store.remove("device-test").unwrap();
+        assert_eq!(store.get("device-test"), None);
+        assert_eq!(
+            AccountKeyStore::load(Some(path.clone()))
+                .unwrap()
+                .get("device-test"),
+            None
         );
         let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

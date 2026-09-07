@@ -848,6 +848,10 @@ impl FastPairBatteryProvider {
         Ok(provider)
     }
 
+    pub fn forget_account_key(&self, device_key: &str) -> Result<()> {
+        self.account_keys.remove(device_key)
+    }
+
     pub async fn shutdown(&self) {
         self.tasks.shutdown().await;
         *self.connections.lock().await = ConnectionState::default();
