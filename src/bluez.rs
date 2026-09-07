@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod monitor;
+mod observations;
 mod recovery;
 mod snapshot;
 
@@ -47,6 +48,7 @@ pub struct BluezBackend {
     changes: broadcast::Sender<()>,
     identities: Arc<DeviceIdentityRegistry>,
     device_cache: Mutex<HashMap<String, CachedDevice>>,
+    observations: Mutex<observations::Observations>,
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
     management: Arc<ManagementStore>,
@@ -106,6 +108,7 @@ impl BluezBackend {
             changes,
             identities,
             device_cache: Mutex::new(HashMap::new()),
+            observations: Mutex::new(observations::Observations::default()),
             system_bus,
             fast_pair,
             management,
@@ -382,7 +385,7 @@ impl BluezBackend {
             return Ok(false);
         }
         let mut events = adapter
-            .discover_devices_with_changes()
+            .discover_devices()
             .await
             .backend_context(&format!("start discovery on {name}"))?;
         tasks.insert(

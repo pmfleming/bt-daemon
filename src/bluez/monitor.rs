@@ -109,17 +109,39 @@ pub(super) async fn run(backend: &BluezBackend) -> Result<()> {
         watches.adapter(backend, &name).await?;
     }
     loop {
-        let event = watches
-            .streams
-            .next()
-            .await
-            .context("BlueZ event streams ended")?;
+        let expiry = backend.observations.lock().await.next_expiry();
+        let expiration = async {
+            if let Some(deadline) = expiry {
+                tokio::time::sleep_until(deadline.into()).await;
+            } else {
+                futures::future::pending::<()>().await;
+            }
+        };
+        let event = tokio::select! {
+            event = watches.streams.next() => event.context("BlueZ event streams ended")?,
+            _ = expiration => { let _ = backend.changes.send(()); continue; }
+        };
         match event {
             Event::Session(SessionEvent::AdapterAdded(name)) => {
                 watches.adapter(backend, &name).await?
             }
             Event::Session(SessionEvent::AdapterRemoved(name)) => watches.remove_adapter(&name),
             Event::Adapter(name, AdapterEvent::DeviceAdded(address)) => {
+                // This is a real InterfacesAdded event, not BlueR's synthetic
+                // enumeration of cached devices at discovery start.
+                if let Ok(adapter) = backend.session.adapter(&name)
+                    && adapter.is_discovering().await.unwrap_or(false)
+                {
+                    let rssi = match adapter.device(address) {
+                        Ok(device) => device.rssi().await.ok().flatten(),
+                        Err(_) => None,
+                    };
+                    backend
+                        .observations
+                        .lock()
+                        .await
+                        .record(&name, address, rssi);
+                }
                 if let Err(error) = watches.device(backend, &name, address).await {
                     tracing::debug!(%error, "new device disappeared before monitoring");
                 }
@@ -131,6 +153,13 @@ pub(super) async fn run(backend: &BluezBackend) -> Result<()> {
                 // Preserve useful connection chronology without dumping arbitrary
                 // device properties (names/manufacturer data may be sensitive).
                 match property {
+                    DeviceProperty::Rssi(rssi) => {
+                        backend
+                            .observations
+                            .lock()
+                            .await
+                            .record(&adapter, address, Some(rssi))
+                    }
                     DeviceProperty::Connected(connected) => {
                         tracing::info!(%adapter, %address, connected, "BlueZ device connection changed")
                     }

@@ -159,7 +159,6 @@ struct BluezDeviceState {
     trusted: bool,
     blocked: bool,
     wake_allowed: Option<bool>,
-    live_rssi: Option<i16>,
 }
 
 impl BluezDeviceState {
@@ -173,12 +172,7 @@ impl BluezDeviceState {
                 device.is_wake_allowed().await,
                 "read device wake permission",
             )?,
-            live_rssi: bluez_result(device.rssi().await, "read device signal strength")?,
         })
-    }
-
-    fn present(&self) -> bool {
-        self.live_rssi.is_some() || self.connected
     }
 }
 
@@ -218,8 +212,17 @@ async fn device_snapshot(
     adapter_key: &str,
 ) -> Result<Option<Device>> {
     let state = BluezDeviceState::read(device).await?;
-    let present = state.present();
     let identity = device.address();
+    let observation = backend
+        .observations
+        .lock()
+        .await
+        .get(adapter.name(), identity);
+    let discovering = bluez_result(adapter.is_discovering().await, "read discovery freshness")?;
+    let signal_live = observation
+        .as_ref()
+        .is_some_and(|seen| seen.live(discovering));
+    let present = state.connected || signal_live;
     let key = backend.identities.device_key(adapter.name(), identity);
     let now_ms = unix_time_ms();
     let cached = backend
@@ -242,12 +245,15 @@ async fn device_snapshot(
             label: service_label(uuid).to_string(),
         })
         .collect();
-    let last_seen_ms = present.then_some(now_ms).or_else(|| {
-        cached
-            .as_ref()
-            .and_then(|cached| cached.device.presentation.last_seen_ms)
-    });
-    let rssi = state.live_rssi.or_else(|| {
+    let last_seen_ms = observation
+        .as_ref()
+        .map(|seen| seen.last_seen_ms)
+        .or_else(|| {
+            cached
+                .as_ref()
+                .and_then(|cached| cached.device.presentation.last_seen_ms)
+        });
+    let rssi = observation.as_ref().and_then(|seen| seen.rssi).or_else(|| {
         cached
             .as_ref()
             .and_then(|cached| cached.device.presentation.rssi)
@@ -322,7 +328,7 @@ async fn device_snapshot(
             fast_pair: fast_pair_features,
             rssi,
             signal_strength: rssi.map(signal_strength),
-            signal_live: state.live_rssi.is_some(),
+            signal_live,
             present,
             last_seen_ms,
         },
@@ -334,7 +340,11 @@ async fn device_snapshot(
             key,
             CachedDevice {
                 device: snapshot.clone(),
-                observed_at_ms: now_ms,
+                observed_at_ms: if state.connected {
+                    now_ms
+                } else {
+                    last_seen_ms.unwrap_or(now_ms)
+                },
             },
         );
     }
