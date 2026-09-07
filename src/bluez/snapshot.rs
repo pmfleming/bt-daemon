@@ -529,7 +529,7 @@ fn fast_pair_capabilities(
     let noise_control = authenticated
         && features
             .and_then(|features| features.noise_control.as_ref())
-            .is_some_and(|noise| !noise.settable_modes.is_empty());
+            .is_some_and(|noise| noise.version == 2 && !noise.settable_modes.is_empty());
     (provision, multipoint, noise_control)
 }
 

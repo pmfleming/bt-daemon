@@ -580,6 +580,18 @@ async fn apply_frame(
         }
         AUDIO_SWITCH_GROUP if frame.code == AUDIO_SWITCH_CAPABILITY_CODE => {
             let capability = decode_audio_switch_capability(&frame.payload)?;
+            // SASS Notify Capability is bidirectional and requires an ACK.
+            // Provider-to-Seeker notifications do not carry a MAC.
+            provider
+                .send_frame(
+                    address,
+                    Frame::encoded(
+                        ACKNOWLEDGEMENT_GROUP,
+                        ACK_CODE,
+                        &[AUDIO_SWITCH_GROUP, AUDIO_SWITCH_CAPABILITY_CODE],
+                    )?,
+                )
+                .await?;
             provider
                 .update_runtime(address, |state| state.multipoint = Some(capability))
                 .await;
@@ -967,6 +979,12 @@ impl FastPairBatteryProvider {
         })
     }
 
+    pub async fn note_connection_change(&self, address: Address) {
+        // Observe real Connected transitions, including fast disconnect/reconnect
+        // cycles that the reconciler's sampled is_connected() could miss.
+        self.connections.lock().await.retry.reset_session(address);
+    }
+
     pub async fn note_pairing(&self, adapter: &str, address: Address, paired: bool) {
         let key = self.identities.device_key(adapter, address);
         let mut windows = self.paired_at.write().await;
@@ -1075,6 +1093,10 @@ impl FastPairBatteryProvider {
             .get(&device.address())
             .and_then(|state| state.noise_control.clone())
             .context("Fast Pair ANC state has not been reported")?;
+        ensure!(
+            state.version == 2,
+            "unsupported Fast Pair ANC protocol version"
+        );
         let mode_flag = anc_mode_flag(mode)?;
         if !state
             .settable_modes
@@ -1499,9 +1521,9 @@ impl FastPairBatteryProvider {
             .get(&address)
             .cloned()
             .context("Fast Pair Message Stream is not connected")?;
-        writer
-            .send(frame)
+        tokio::time::timeout(Duration::from_secs(1), writer.send(frame))
             .await
+            .context("Fast Pair Message Stream writer is stalled")?
             .context("Fast Pair Message Stream writer ended")
     }
 
@@ -1762,6 +1784,8 @@ mod tests {
         let session = [0x11; 8];
         let nonce = [0x22; 8];
         let mac = message_mac(&key, &session, &nonce, &[1]);
+        // Independent Python hmac/SHA-256 reference for K, session || nonce || message.
+        assert_eq!(hex::encode(mac), "13cfdae51949437e");
         assert_ne!(mac, message_mac(&key, &session, &nonce, &[0]));
         assert_ne!(mac, message_mac(&key, &[0x10; 8], &nonce, &[1]));
         assert_ne!(mac, message_mac(&key, &session, &[0x23; 8], &[1]));
