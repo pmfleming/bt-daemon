@@ -804,9 +804,7 @@
                 "type": "string"
               }
             },
-            "required": [
-              "anti_spoofing_public_key"
-            ]
+            "required": []
           },
           "remove": {
             "properties": {}

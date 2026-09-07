@@ -38,6 +38,7 @@ mod commands;
 mod retry;
 use retry::RetryPolicy;
 mod keys;
+mod metadata;
 use commands::PendingCommands;
 use keys::AccountKeyStore;
 
@@ -422,6 +423,8 @@ pub struct FastPairBatteryProvider {
     session: Session,
     identities: Arc<DeviceIdentityRegistry>,
     account_keys: AccountKeyStore,
+    catalog: metadata::Catalog,
+    paired_at: RwLock<HashMap<String, Instant>>,
     reports: RwLock<HashMap<Address, BatteryReport>>,
     runtime: RwLock<HashMap<Address, RuntimeReport>>,
     connections: Mutex<ConnectionState>,
@@ -848,6 +851,10 @@ impl FastPairBatteryProvider {
     ) -> Result<Arc<Self>> {
         let uuids = FastPairUuids::parse().context("parse fixed Fast Pair UUIDs")?;
         let account_keys = AccountKeyStore::load_default()?;
+        let catalog = metadata::Catalog::load_default().unwrap_or_else(|error| {
+            tracing::warn!(%error, "trusted Fast Pair metadata unavailable; battery monitoring remains enabled");
+            metadata::Catalog::default()
+        });
         let profile = Profile {
             uuid: uuids.message_stream,
             name: Some("Shelllist Fast Pair battery provider".to_string()),
@@ -868,6 +875,8 @@ impl FastPairBatteryProvider {
             session,
             identities,
             account_keys,
+            catalog,
+            paired_at: RwLock::new(HashMap::new()),
             reports: RwLock::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
             connections: Mutex::new(ConnectionState::default()),
@@ -906,21 +915,113 @@ impl FastPairBatteryProvider {
             .unwrap_or_default()
     }
 
-    pub async fn features(&self, device: &Device) -> Option<FastPairFeatures> {
-        let runtime = self.runtime.read().await.get(&device.address()).cloned()?;
+    pub async fn features(&self, device: &Device, connected: bool) -> Option<FastPairFeatures> {
+        let reported = self.runtime.read().await.get(&device.address()).cloned();
+        let mut runtime = reported.clone().unwrap_or_default();
+        if runtime.model_id.is_none() {
+            runtime.model_id = device.service_data().await.ok().flatten().and_then(|data| {
+                data.get(&self.uuids.service)
+                    .and_then(|data| metadata::advertised_model_id(data))
+            });
+        }
+        if reported.is_none() && runtime.model_id.is_none() {
+            return None;
+        }
         let device_key = self
             .identities
             .device_key(device.adapter_name(), device.address());
+        let account_key_available = self.account_keys.get(&device_key).is_some();
+        let model = runtime
+            .model_id
+            .as_ref()
+            .and_then(|id| self.catalog.get(id));
+        let recent = self
+            .paired_at
+            .read()
+            .await
+            .get(&device_key)
+            .is_some_and(|start| start.elapsed() < Duration::from_secs(60));
+        let reason = if account_key_available {
+            Some("Account key already provisioned")
+        } else if model.is_none() {
+            Some("Trusted model metadata is missing; configure fast-pair-models.json")
+        } else if !recent {
+            Some("Re-pair this device to open its one-minute Fast Pair provisioning window")
+        } else {
+            None
+        };
         Some(FastPairFeatures {
             model_id: runtime.model_id.map(hex::encode),
             ble_address: runtime.ble_address.map(|address| address.to_string()),
-            authenticated_controls: runtime.session_nonce.is_some()
-                && self.account_keys.get(&device_key).is_some(),
+            authenticated_controls: connected
+                && runtime.session_nonce.is_some()
+                && account_key_available,
+            account_key_available,
+            provisioning_available: reason.is_none(),
+            provisioning_reason: reason.map(Into::into),
+            trusted_model_name: model.map(|model| model.name.clone()),
             multipoint: runtime.multipoint,
             noise_control: runtime.noise_control,
             last_switch: runtime.last_switch,
             audio_switch_seeker_supported: false,
         })
+    }
+
+    pub async fn note_pairing(&self, adapter: &str, address: Address, paired: bool) {
+        let key = self.identities.device_key(adapter, address);
+        let mut windows = self.paired_at.write().await;
+        windows.retain(|_, start| start.elapsed() < Duration::from_secs(60));
+        if paired {
+            if let std::collections::hash_map::Entry::Vacant(entry) = windows.entry(key) {
+                entry.insert(Instant::now());
+                let changes = self.changes.clone();
+                self.tasks.spawn("fast-pair-pairing-window", async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let _ = changes.send(());
+                });
+            }
+        } else {
+            windows.remove(&key);
+        }
+        let _ = self.changes.send(());
+    }
+
+    pub async fn provision_from_catalog(&self, adapter: &Adapter, device: &Device) -> Result<()> {
+        let runtime = self
+            .wait_for_provisioning_metadata(device.address())
+            .await?;
+        let model = runtime.model_id.as_ref().and_then(|id| self.catalog.get(id))
+            .context("trusted Fast Pair model metadata is missing; configure /etc/bluetooth/fast-pair-models.json")?;
+        self.provision_account_key(adapter, device, &model.anti_spoofing_public_key)
+            .await
+    }
+
+    pub async fn auto_provision(&self, adapter: &Adapter, device: &Device) -> Result<()> {
+        if self.catalog.is_empty() {
+            return Ok(());
+        }
+        let key = self
+            .identities
+            .device_key(device.adapter_name(), device.address());
+        if self.account_keys.get(&key).is_some() {
+            return Ok(());
+        }
+        let uuids = device.uuids().await?.unwrap_or_default();
+        if !uuids.contains(&self.uuids.message_stream) && !uuids.contains(&self.uuids.service) {
+            return Ok(());
+        }
+        let runtime = self
+            .wait_for_provisioning_metadata(device.address())
+            .await?;
+        if let Some(model) = runtime
+            .model_id
+            .as_ref()
+            .and_then(|id| self.catalog.get(id))
+        {
+            self.provision_account_key(adapter, device, &model.anti_spoofing_public_key)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn answer_audio_switch_query(&self, address: Address) -> Result<()> {
@@ -1003,6 +1104,25 @@ impl FastPairBatteryProvider {
         device: &Device,
         anti_spoofing_key: &str,
     ) -> Result<()> {
+        ensure!(
+            device.is_paired().await? && !device.is_blocked().await?,
+            "pair and unblock the device before provisioning Fast Pair"
+        );
+        let key = self
+            .identities
+            .device_key(device.adapter_name(), device.address());
+        ensure!(
+            self.account_keys.get(&key).is_none(),
+            "Fast Pair account key is already provisioned"
+        );
+        ensure!(
+            self.paired_at
+                .read()
+                .await
+                .get(&key)
+                .is_some_and(|start| start.elapsed() < Duration::from_secs(60)),
+            "Fast Pair retroactive provisioning requires pairing within the last minute; re-pair the device"
+        );
         let runtime = self
             .wait_for_provisioning_metadata(device.address())
             .await?;
@@ -1055,6 +1175,12 @@ impl FastPairBatteryProvider {
         code: u8,
         message: &[u8],
     ) -> Result<()> {
+        ensure!(
+            device.is_paired().await?
+                && device.is_connected().await?
+                && !device.is_blocked().await?,
+            "Fast Pair controls require a connected, paired, unblocked device"
+        );
         let address = device.address();
         let session_nonce = self
             .runtime

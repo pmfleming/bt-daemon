@@ -188,7 +188,7 @@ fn operation_parameters() -> Value {
             "set-wake-allowed": { "required": ["wake_allowed"], "properties": { "wake_allowed": { "type": "boolean" } } },
             "set-alias": { "required": ["alias"], "properties": { "alias": { "type": "string", "minLength": 1 } } },
             "reset-alias": { "properties": {} },
-            "provision-fast-pair": { "required": ["anti_spoofing_public_key"], "properties": { "anti_spoofing_public_key": { "type": "string" } } },
+            "provision-fast-pair": { "required": [], "properties": { "anti_spoofing_public_key": { "type": "string" } } },
             "set-multipoint": { "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } },
             "set-noise-control": { "required": ["mode"], "properties": { "mode": { "enum": ["transparent", "adaptive", "off", "noise-cancelling"] } } },
         }

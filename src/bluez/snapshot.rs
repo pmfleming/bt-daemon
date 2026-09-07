@@ -269,9 +269,9 @@ async fn device_snapshot(
         backend.fast_pair.as_deref(),
     )
     .await?;
-    let fast_pair_features = match (state.connected, backend.fast_pair.as_deref()) {
-        (true, Some(provider)) => provider.features(device).await,
-        _ => None,
+    let fast_pair_features = match backend.fast_pair.as_deref() {
+        Some(provider) => provider.features(device, state.connected).await,
+        None => None,
     };
     let presentation = presentation(
         &backend.identities,
@@ -494,9 +494,9 @@ fn device_capabilities(
         can_wake: wake_allowed.is_some(),
         can_rename: true,
         can_send_file: paired && !blocked,
-        can_provision_fast_pair,
-        can_set_multipoint,
-        can_set_noise_control,
+        can_provision_fast_pair: can_provision_fast_pair && !blocked,
+        can_set_multipoint: can_set_multipoint && !blocked,
+        can_set_noise_control: can_set_noise_control && !blocked,
         unsupported_reasons: unsupported_reasons(
             paired,
             connected,
@@ -514,13 +514,14 @@ fn fast_pair_capabilities(
     has_fast_pair: bool,
     features: Option<&crate::model::FastPairFeatures>,
 ) -> (bool, bool, bool) {
-    let authenticated = features.is_some_and(|features| features.authenticated_controls);
+    let authenticated = paired
+        && connected
+        && has_fast_pair
+        && features.is_some_and(|features| features.authenticated_controls);
     let provision = paired
         && connected
         && has_fast_pair
-        && features.is_some_and(|features| {
-            features.model_id.is_some() && !features.authenticated_controls
-        });
+        && features.is_some_and(|features| features.provisioning_available);
     let multipoint = authenticated
         && features
             .and_then(|features| features.multipoint)

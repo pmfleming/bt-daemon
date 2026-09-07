@@ -866,6 +866,7 @@ async fn pair_with_policy(
         trust_after_pair,
         default_wait_for_services,
         progress,
+        fast_pair,
     )
     .await?;
     provision_after_pair(adapter, device, public_key, fast_pair).await
@@ -881,13 +882,10 @@ async fn run_fast_pair_operation(
     let provider = fast_pair.context("Fast Pair provider is unavailable")?;
     match operation {
         DeviceOperation::ProvisionFastPair => {
-            provider
-                .provision_account_key(
-                    adapter,
-                    device,
-                    params.require_string("anti_spoofing_public_key")?,
-                )
-                .await
+            match params.optional_string("anti_spoofing_public_key")? {
+                Some(key) => provider.provision_account_key(adapter, device, key).await,
+                None => provider.provision_from_catalog(adapter, device).await,
+            }
         }
         DeviceOperation::SetMultipoint => {
             provider
@@ -944,6 +942,12 @@ async fn provision_after_pair(
             .context("Fast Pair provider is unavailable")?
             .provision_account_key(adapter, device, public_key)
             .await?;
+    } else if let Some(provider) = fast_pair
+        && let Err(error) = provider.auto_provision(adapter, device).await
+    {
+        // Traditional pairing already succeeded. Optional Fast Pair support
+        // must not misreport it as a failed Bluetooth bond.
+        tracing::warn!(%error, "paired successfully, but automatic Fast Pair provisioning failed");
     }
     Ok(())
 }
@@ -953,6 +957,7 @@ async fn pair_device(
     trust_after_pair: bool,
     wait_for_service_resolution: bool,
     progress: &OperationProgress,
+    fast_pair: Option<&FastPairBatteryProvider>,
 ) -> Result<()> {
     progress("pairing");
     operation_timeout(
@@ -961,6 +966,11 @@ async fn pair_device(
         device.pair(),
     )
     .await?;
+    if let Some(provider) = fast_pair {
+        provider
+            .note_pairing(device.adapter_name(), device.address(), true)
+            .await;
+    }
     if trust_after_pair {
         progress("trusting");
         device

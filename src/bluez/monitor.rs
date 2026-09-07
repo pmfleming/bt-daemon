@@ -160,6 +160,11 @@ pub(super) async fn run(backend: &BluezBackend) -> Result<()> {
                             .await
                             .record(&adapter, address, Some(rssi))
                     }
+                    DeviceProperty::Paired(paired) => {
+                        if let Some(provider) = &backend.fast_pair {
+                            provider.note_pairing(&adapter, address, paired).await;
+                        }
+                    }
                     DeviceProperty::Connected(connected) => {
                         tracing::info!(%adapter, %address, connected, "BlueZ device connection changed")
                     }
