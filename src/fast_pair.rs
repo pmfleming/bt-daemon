@@ -24,7 +24,7 @@ use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Mutex, RwLock, broadcast, mpsc, oneshot},
+    sync::{Mutex, RwLock, broadcast, mpsc},
 };
 use uuid::Uuid;
 
@@ -33,7 +33,9 @@ use crate::{
     model::{Battery, FastPairFeatures, FastPairMultipoint, FastPairNoiseControl},
 };
 
+mod commands;
 mod keys;
+use commands::PendingCommands;
 use keys::AccountKeyStore;
 
 pub const MESSAGE_STREAM_UUID: &str = "df21fe2c-2515-4fdb-8886-f12c4d67927c";
@@ -383,8 +385,6 @@ struct ConnectionState {
     retry_after: HashMap<Address, Instant>,
 }
 
-type PendingCommand = oneshot::Sender<std::result::Result<(), String>>;
-
 #[derive(Clone, Copy)]
 struct FastPairUuids {
     message_stream: Uuid,
@@ -413,7 +413,7 @@ pub struct FastPairBatteryProvider {
     reports: RwLock<HashMap<Address, BatteryReport>>,
     runtime: RwLock<HashMap<Address, RuntimeReport>>,
     connections: Mutex<ConnectionState>,
-    pending_commands: Mutex<HashMap<(Address, u8, u8), PendingCommand>>,
+    pending_commands: PendingCommands,
     changes: broadcast::Sender<()>,
     uuids: FastPairUuids,
     rfcomm_available: bool,
@@ -833,7 +833,7 @@ impl FastPairBatteryProvider {
             reports: RwLock::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
             connections: Mutex::new(ConnectionState::default()),
-            pending_commands: Mutex::new(HashMap::new()),
+            pending_commands: PendingCommands::default(),
             changes,
             uuids,
             rfcomm_available: requests.is_some(),
@@ -849,7 +849,7 @@ impl FastPairBatteryProvider {
     pub async fn shutdown(&self) {
         self.tasks.shutdown().await;
         *self.connections.lock().await = ConnectionState::default();
-        self.pending_commands.lock().await.clear();
+        self.pending_commands.clear();
         self.runtime.write().await.clear();
         self.reports.write().await.clear();
     }
@@ -1010,21 +1010,18 @@ impl FastPairBatteryProvider {
         payload.extend_from_slice(&message_nonce);
         payload.extend_from_slice(&mac);
         let frame = Frame::encoded(group, code, &payload)?;
-        let (sender, receiver) = oneshot::channel();
-        let command = (address, group, code);
-        {
-            let mut pending = self.pending_commands.lock().await;
-            if pending.contains_key(&command) {
-                bail!("a matching Fast Pair control command is already pending");
-            }
-            pending.insert(command, sender);
-        }
-        if let Err(error) = self.send_frame(address, frame).await {
-            self.pending_commands.lock().await.remove(&command);
-            return Err(error);
-        }
-        let result = tokio::time::timeout(Duration::from_secs(2), receiver).await;
-        self.pending_commands.lock().await.remove(&command);
+        let (_reservation, receiver) = self.pending_commands.reserve((address, group, code))?;
+        // Include writer backpressure in the deadline. The reservation is removed
+        // on errors, timeout, and cancellation, not only on the happy path.
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            self.send_frame(address, frame).await?;
+            Ok::<_, anyhow::Error>(receiver.await)
+        })
+        .await;
+        let result = match result {
+            Ok(result) => Ok(result?),
+            Err(error) => Err(error),
+        };
         match result {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(reason))) => bail!("Fast Pair provider rejected control command: {reason}"),
@@ -1300,14 +1297,8 @@ impl FastPairBatteryProvider {
         code: u8,
         result: std::result::Result<(), String>,
     ) {
-        if let Some(sender) = self
-            .pending_commands
-            .lock()
-            .await
-            .remove(&(address, group, code))
-        {
-            let _ = sender.send(result);
-        }
+        self.pending_commands
+            .resolve((address, group, code), result);
     }
 
     async fn update_runtime(&self, address: Address, update: impl FnOnce(&mut RuntimeReport)) {
@@ -1387,10 +1378,7 @@ impl FastPairBatteryProvider {
                 .retry_after
                 .insert(address, Instant::now() + RETRY_DELAY);
         }
-        self.pending_commands
-            .lock()
-            .await
-            .retain(|(pending_address, _, _), _| *pending_address != address);
+        self.pending_commands.disconnect(address);
         let runtime_changed = self.runtime.write().await.remove(&address).is_some();
         self.remove_report(address).await;
         if runtime_changed {
