@@ -33,6 +33,7 @@ use crate::{
     model::{Battery, FastPairFeatures, FastPairMultipoint, FastPairNoiseControl},
 };
 
+mod audio_switch;
 mod commands;
 mod retry;
 use retry::RetryPolicy;
@@ -123,6 +124,7 @@ struct RuntimeReport {
     ble_address: Option<Address>,
     multipoint: Option<FastPairMultipoint>,
     noise_control: Option<FastPairNoiseControl>,
+    last_switch: Option<crate::model::FastPairSwitchEvent>,
 }
 
 fn decode_audio_switch_capability(payload: &[u8]) -> Result<FastPairMultipoint> {
@@ -533,19 +535,45 @@ async fn apply_frames(
     mut frames: mpsc::Receiver<Frame>,
 ) -> Result<()> {
     while let Some(frame) = frames.recv().await {
-        apply_frame(&provider, address, frame).await?;
+        // An unsupported/malformed extension message must not tear down an
+        // otherwise healthy battery stream and trigger reconnect churn.
+        if let Err(error) = apply_frame(&provider, address, frame).await {
+            tracing::warn!(%address, %error, "ignored invalid Fast Pair message");
+        }
     }
     Ok(())
 }
 
 async fn apply_frame(
-    provider: &FastPairBatteryProvider,
+    provider: &Arc<FastPairBatteryProvider>,
     address: Address,
     frame: Frame,
 ) -> Result<()> {
     match frame.group {
         DEVICE_INFORMATION_GROUP => {
             apply_device_information(provider, address, frame.code, &frame.payload).await
+        }
+        AUDIO_SWITCH_GROUP if frame.code == GET_AUDIO_SWITCH_CAPABILITY_CODE => {
+            let worker = Arc::clone(provider);
+            provider.tasks.spawn("fast-pair-seeker-capability", async move {
+                if let Err(error) = worker.answer_audio_switch_query(address).await {
+                    // Per SASS, no response within 1s also means unsupported.
+                    tracing::debug!(%address, %error, "Audio Switch seeker capability unavailable");
+                }
+            });
+            Ok(())
+        }
+        AUDIO_SWITCH_GROUP if frame.code == 0x32 => {
+            let mut event = audio_switch::decode_switch(&frame.payload)?;
+            event.observed_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            tracing::info!(%address, reason = %event.reason, target = %event.target, "Fast Pair audio switched");
+            provider
+                .update_runtime(address, |state| state.last_switch = Some(event))
+                .await;
+            Ok(())
         }
         AUDIO_SWITCH_GROUP if frame.code == AUDIO_SWITCH_CAPABILITY_CODE => {
             let capability = decode_audio_switch_capability(&frame.payload)?;
@@ -890,7 +918,29 @@ impl FastPairBatteryProvider {
                 && self.account_keys.get(&device_key).is_some(),
             multipoint: runtime.multipoint,
             noise_control: runtime.noise_control,
+            last_switch: runtime.last_switch,
+            audio_switch_seeker_supported: false,
         })
+    }
+
+    async fn answer_audio_switch_query(&self, address: Address) -> Result<()> {
+        // Version zero is deliberate. Multipoint/ANC controls are implemented,
+        // but encrypted-advertisement-driven Audio Switch seeker policy is not.
+        // Never advertise 0x0102 just because the Provider supports that version.
+        for name in self.session.adapter_names().await? {
+            let adapter = self.session.adapter(&name)?;
+            if adapter.device_addresses().await?.contains(&address) {
+                return self
+                    .send_authenticated(
+                        &adapter.device(address)?,
+                        AUDIO_SWITCH_GROUP,
+                        AUDIO_SWITCH_CAPABILITY_CODE,
+                        &[0, 0, 0, 0],
+                    )
+                    .await;
+            }
+        }
+        bail!("Audio Switch peer disappeared")
     }
 
     pub async fn set_multipoint(&self, device: &Device, enabled: bool) -> Result<()> {

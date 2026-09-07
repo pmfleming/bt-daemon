@@ -199,6 +199,16 @@ pub struct FastPairFeatures {
     pub authenticated_controls: bool,
     pub multipoint: Option<FastPairMultipoint>,
     pub noise_control: Option<FastPairNoiseControl>,
+    pub last_switch: Option<FastPairSwitchEvent>,
+    pub audio_switch_seeker_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FastPairSwitchEvent {
+    pub reason: String,
+    pub target: String,
+    pub target_name: Option<String>,
+    pub observed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
