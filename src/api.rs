@@ -41,9 +41,21 @@ impl BackendRequest<'_> {
                 backend.adapter_operation(key, operation, params).await
             }
             Self::UpdateManagement => backend.update_management(params).await,
-            Self::UpdateDevicePolicy { key } => backend.update_device_policy(key, params).await,
+            Self::UpdateDevicePolicy { key } => {
+                backend
+                    .update_device_policy(key, &policy_values(params))
+                    .await
+            }
         }
     }
+}
+
+fn policy_values(params: &Value) -> Value {
+    let mut values = params.clone();
+    if let Some(object) = values.as_object_mut() {
+        object.remove("key");
+    }
+    values
 }
 
 pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: Value) -> Value {
@@ -159,6 +171,28 @@ mod tests {
     use crate::backend::{BackendError, BackendErrorKind};
 
     use super::{error_value, parse_backend_request};
+
+    #[test]
+    fn policy_routing_key_is_not_treated_as_a_setting() {
+        let params = serde_json::json!({"key": "device-1", "reconnect_on_resume": false});
+        let settings = super::policy_values(&params);
+        let store = crate::management::ManagementStore::in_memory();
+        assert!(
+            !store
+                .update_device_policy("device-1", &settings)
+                .unwrap()
+                .reconnect_on_resume
+        );
+        assert!(params.get("key").is_some());
+        assert!(
+            store
+                .update_device_policy(
+                    "device-1",
+                    &super::policy_values(&serde_json::json!({"key":"device-1", "unknown": true}))
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn classifies_typed_errors_through_context() {
