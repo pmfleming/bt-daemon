@@ -29,6 +29,7 @@ use crate::{
 
 mod monitor;
 mod observations;
+mod operations;
 mod recovery;
 mod snapshot;
 
@@ -291,13 +292,9 @@ impl BluezBackend {
     async fn ensure_operation_adapter_powered(
         &self,
         adapter: &BluezAdapter,
-        params: &Value,
-        default_power_on: bool,
+        power_on: bool,
         progress: &OperationProgress,
     ) -> Result<()> {
-        let power_on = params
-            .optional_bool("power_on")?
-            .unwrap_or(default_power_on);
         if bluez_result(adapter.is_powered().await, "read operation adapter power")? {
             return Ok(());
         }
@@ -587,40 +584,18 @@ impl BluetoothBackend for BluezBackend {
         let _exclusive = gate.lock().await;
         let (adapter, device) = self.find_device(device_key).await?;
         let policy = self.management.device_policy(device_key);
-        if matches!(operation, DeviceOperation::Pair | DeviceOperation::Connect) {
-            self.ensure_operation_adapter_powered(
-                &adapter,
-                params,
-                policy.power_on_connect,
-                &progress,
-            )
-            .await?;
-        }
-        // Revoke local Fast Pair credentials before BlueZ removes the device;
-        // if persistence fails, retain the device so Forget remains retryable.
-        if operation == DeviceOperation::Remove
-            && let Some(provider) = &self.fast_pair
-        {
-            let provider = Arc::clone(provider);
-            let key = device_key.to_owned();
-            tokio::task::spawn_blocking(move || provider.forget_account_key(&key)).await??;
-        }
-        run_device_operation(
-            &adapter,
-            &device,
-            operation,
+        let plan = operations::Plan::new(operation, params, &policy)?;
+        operations::DeviceEffects {
+            backend: self,
+            key: device_key,
+            adapter: &adapter,
+            device: &device,
             params,
-            self.fast_pair.as_deref(),
-            &policy,
-            &progress,
-        )
-        .await?;
-        if matches!(operation, DeviceOperation::Pair | DeviceOperation::Connect)
-            && (policy.audio_route_on_connect == "switch"
-                || policy.preferred_audio_profile_key.is_some())
-        {
-            apply_audio_policy(device_key, device.address(), &policy, &progress).await?;
+            policy: &policy,
+            progress: &progress,
         }
+        .execute(plan)
+        .await?;
         if operation == DeviceOperation::Remove {
             self.device_cache.lock().await.remove(device_key);
             self.identities.forget_presentation(device_key);
