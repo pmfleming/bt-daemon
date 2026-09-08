@@ -8,8 +8,8 @@ use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::DeviceIdentityRegistry,
     model::{
-        Adapter, Battery, Device, DeviceCapabilities, DeviceIdentity, DevicePresentation,
-        DeviceServices, DeviceState, Service, Snapshot, presentation_components, presentation_type,
+        Adapter, Battery, Device, DeviceCapabilities, Snapshot, presentation_components,
+        presentation_type,
     },
 };
 
@@ -17,6 +17,8 @@ use super::{
     BluezBackend, BluezResultExt, CachedDevice, DISCOVERED_DEVICE_CACHE_TTL, bluez_result,
     opaque_key,
 };
+
+mod assembly;
 
 pub(super) async fn build(backend: &BluezBackend) -> Result<Snapshot> {
     let now_ms = unix_time_ms();
@@ -241,27 +243,7 @@ async fn device_snapshot(
         return Ok(None);
     }
     let metadata = DeviceMetadata::read(device).await?;
-    let services = metadata
-        .uuids
-        .iter()
-        .map(|uuid| Service {
-            uuid: uuid.clone(),
-            label: service_label(uuid).to_string(),
-        })
-        .collect();
-    let last_seen_ms = observation
-        .as_ref()
-        .map(|seen| seen.last_seen_ms)
-        .or_else(|| {
-            cached
-                .as_ref()
-                .and_then(|cached| cached.device.presentation.last_seen_ms)
-        });
-    let rssi = observation.as_ref().and_then(|seen| seen.rssi).or_else(|| {
-        cached
-            .as_ref()
-            .and_then(|cached| cached.device.presentation.rssi)
-    });
+    let signal = assembly::Signal::resolve(observation.as_ref(), cached.as_ref(), signal_live);
     let observed_battery = device_batteries(
         device,
         identity,
@@ -278,79 +260,30 @@ async fn device_snapshot(
         &key,
         state.paired,
         state.connected,
-        metadata.icon,
+        metadata.icon.clone(),
         fast_pair_features
             .as_ref()
             .and_then(|features| features.model_id.as_deref()),
         observed_battery,
     );
-    let has_fast_pair = metadata.uuids.iter().any(|uuid| {
-        uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
-            || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
-    });
-    let capabilities = device_capabilities(
-        state.paired,
-        state.connected,
-        state.blocked,
-        state.wake_allowed,
-        has_fast_pair,
-        fast_pair_features.as_ref(),
-    );
-    let snapshot = Device {
-        key: key.clone(),
-        adapter_key: adapter_key.to_string(),
-        identity: DeviceIdentity {
-            name: metadata.alias.clone(),
-            alias: metadata.alias,
-            remote_name: metadata.remote_name,
-            device_type: presentation.device_type,
+    let snapshot = assembly::build(
+        assembly::Context {
+            key: key.clone(),
+            adapter_key: adapter_key.to_string(),
             address: identity.to_string(),
-            address_type: metadata.address_type,
-            icon: presentation.icon,
-            modalias: metadata.modalias,
+            policy: backend.management.device_policy(&key),
         },
-        state: DeviceState {
-            paired: state.paired,
+        assembly::Reading {
+            state,
+            metadata,
             bonded: bonded_property(&backend.system_bus, adapter.name(), identity).await,
-            connected: state.connected,
-            trusted: state.trusted,
-            blocked: state.blocked,
-            wake_allowed: state.wake_allowed,
-            legacy_pairing: metadata.legacy_pairing,
+            features: fast_pair_features,
         },
-        services: DeviceServices {
-            services_resolved: metadata.services_resolved,
-            uuids: metadata.uuids,
-            services,
-        },
-        presentation: DevicePresentation {
-            battery: presentation.battery,
-            battery_live: presentation.battery_live,
-            battery_last_known: presentation.battery_last_known,
-            components: presentation.components,
-            model_id: presentation.model_id,
-            fast_pair: fast_pair_features,
-            rssi,
-            signal_strength: rssi.map(signal_strength),
-            signal_live,
-            present,
-            last_seen_ms,
-        },
-        policy: backend.management.device_policy(&key),
-        capabilities,
-    };
-    if present {
-        backend.device_cache.lock().await.insert(
-            key,
-            CachedDevice {
-                device: snapshot.clone(),
-                observed_at_ms: if state.connected {
-                    now_ms
-                } else {
-                    last_seen_ms.unwrap_or(now_ms)
-                },
-            },
-        );
+        presentation,
+        signal,
+    );
+    if let Some(entry) = assembly::cache_entry(&snapshot, now_ms) {
+        backend.device_cache.lock().await.insert(key, entry);
     }
     Ok(Some(snapshot))
 }
