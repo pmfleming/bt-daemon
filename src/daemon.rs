@@ -336,7 +336,9 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         .build()
         .await
         .context("start bt-daemon D-Bus service")?;
-    obex.activate(connection).await;
+    // The daemon owns this connection even when the optional OBEX agent is disabled.
+    // Moving its last handle into activate() releases our bus name on that path.
+    obex.activate(connection.clone()).await;
 
     // Claim the service name before probing BlueZ or PipeWire. Clients can
     // connect immediately and observe a typed loading state while snapshots
@@ -365,7 +367,9 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         object_path = OBJECT_PATH,
         "bt-daemon started"
     );
-    shelllist_daemon_tokio::wait_for_shutdown().await
+    let result = shelllist_daemon_tokio::wait_for_shutdown().await;
+    drop(connection);
+    result
 }
 
 fn send_changed<T: PartialEq>(sender: &watch::Sender<T>, next: T) {
