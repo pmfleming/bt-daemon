@@ -13,17 +13,23 @@ lint:
 
 test:
     cargo test --all-features
+    python3 -m unittest discover -s scripts -p 'test_quality_gate.py'
 
 audit:
     cargo audit
 
 coverage:
-    cargo llvm-cov --all-features --fail-under-lines 40
+    cargo llvm-cov --all-features --fail-under-lines "$(python3 -c 'import json; print(json.load(open("quality-gates.json"))["metrics"]["line_coverage_percent"]["min"])')"
 
 quality:
     bash scripts/check-quality.sh
 
+mutations:
+    bash scripts/check-mutations.sh
+
 check: fmt-check lint test audit coverage
+
+ci: check quality mutations
 
 probe:
     cargo run -- probe-bluez

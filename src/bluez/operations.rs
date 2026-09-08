@@ -31,11 +31,15 @@ impl Plan {
             } else {
                 None
             },
-            route_audio: connects
-                && (policy.audio_route_on_connect == "switch"
-                    || policy.preferred_audio_profile_key.is_some()),
+            route_audio: audio_route_required(connects, policy),
         })
     }
+}
+
+fn audio_route_required(connects: bool, policy: &DevicePolicy) -> bool {
+    connects
+        && (policy.audio_route_on_connect == "switch"
+            || policy.preferred_audio_profile_key.is_some())
 }
 
 #[async_trait]
@@ -228,6 +232,36 @@ mod tests {
             };
             assert!(execute(&fake, plan(op)).now_or_never().is_none());
             assert_eq!(*fake.calls.lock().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn preferred_profiles_and_route_switches_only_apply_to_connecting_operations() {
+        for route in ["keep", "switch"] {
+            for profile in [None, Some("opaque-profile")] {
+                let store = ManagementStore::in_memory();
+                let policy = store
+                    .update_device_policy(
+                        "peer",
+                        &json!({
+                            "audio_route_on_connect": route,
+                            "preferred_audio_profile_key": profile,
+                        }),
+                    )
+                    .unwrap();
+                let expected = route == "switch" || profile.is_some();
+                for op in [DeviceOperation::Connect, DeviceOperation::Pair] {
+                    assert_eq!(
+                        Plan::new(op, &json!({}), &policy).unwrap().route_audio,
+                        expected
+                    );
+                }
+                assert!(
+                    !Plan::new(DeviceOperation::Remove, &json!({}), &policy)
+                        .unwrap()
+                        .route_audio
+                );
+            }
         }
     }
 

@@ -67,6 +67,7 @@
             cargo
             cargo-audit
             cargo-llvm-cov
+            cargo-mutants
             clippy
             dbus
             gcc
