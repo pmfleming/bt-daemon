@@ -152,6 +152,41 @@ mod tests {
         assert!(pending.reserve(key).is_ok());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn backpressure_and_missing_ack_share_a_bounded_deadline_and_release_reservations() {
+        let pending = PendingCommands::default();
+        let key = (Address::default(), 8, 0x12);
+        for stalled_writer in [false, true] {
+            let start = tokio::time::Instant::now();
+            let error = pending
+                .execute(key, async {
+                    if stalled_writer {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+            assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+            assert!(pending.reserve(key).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_execution_drops_its_reservation_even_during_send() {
+        use futures::FutureExt;
+        let pending = PendingCommands::default();
+        let key = (Address::default(), 8, 0x12);
+        assert!(
+            pending
+                .execute(key, std::future::pending())
+                .now_or_never()
+                .is_none()
+        );
+        assert!(pending.reserve(key).is_ok());
+    }
+
     #[tokio::test]
     async fn execution_reports_ack_rejection_send_failure_and_disconnect() {
         let pending = PendingCommands::default();

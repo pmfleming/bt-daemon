@@ -47,6 +47,16 @@ impl TaskGroup {
         state.handles.push(spawn(name, future));
     }
 
+    /// Close the spawn gate and abort workers synchronously, including from Drop.
+    /// `shutdown` additionally waits for their cancellation cleanup to finish.
+    pub fn abort(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        for handle in &state.handles {
+            handle.abort();
+        }
+    }
+
     pub async fn shutdown(&self) {
         let handles = {
             let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -116,6 +126,35 @@ mod tests {
         assert!(other.try_lock().is_ok());
         drop(held);
         assert!(same.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn abort_closes_spawn_gate_before_worker_cancellation_cleanup() {
+        use std::sync::Arc;
+        struct ReconnectOnDrop(Arc<super::TaskGroup>, Arc<()>);
+        impl Drop for ReconnectOnDrop {
+            fn drop(&mut self) {
+                let marker = self.1.clone();
+                self.0.spawn("late-reconnect", async move {
+                    let _marker = marker;
+                    std::future::pending::<()>().await;
+                });
+            }
+        }
+        let tasks = Arc::new(super::TaskGroup::default());
+        let marker = Arc::new(());
+        let guard = ReconnectOnDrop(tasks.clone(), marker.clone());
+        let (ready, started) = tokio::sync::oneshot::channel();
+        tasks.spawn("candidate", async move {
+            let _guard = guard;
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        tasks.abort();
+        tasks.shutdown().await;
+        assert_eq!(Arc::strong_count(&marker), 1);
+        assert_eq!(Arc::strong_count(&tasks), 1);
     }
 
     #[tokio::test]

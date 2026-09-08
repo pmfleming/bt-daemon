@@ -35,6 +35,20 @@ fn failed_connect_only_changes_the_matching_connecting_peer() {
     assert!(state.retry.ready(unknown));
 }
 
+#[tokio::test(start_paused = true)]
+async fn only_a_stable_stream_resets_session_suppression_at_disconnect() {
+    let peer = Address::default();
+    for (seconds, reset) in [(59, false), (60, true)] {
+        let mut state = ConnectionState::default();
+        state.retry.psm_unavailable(peer);
+        state.mark_connected(peer);
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        state.ended(peer);
+        assert_eq!(state.retry.l2cap_allowed(peer), reset);
+        assert!(!state.retry.ready(peer));
+    }
+}
+
 #[test]
 fn beginning_and_ending_connections_owns_links_writers_and_retry_state() {
     let peer = Address::default();

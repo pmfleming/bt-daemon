@@ -2,8 +2,9 @@
 use bluer::Address;
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::Duration,
 };
+use tokio::time::Instant;
 
 #[derive(Default)]
 pub(super) struct RetryPolicy {
@@ -58,6 +59,24 @@ impl RetryPolicy {
 mod tests {
     use super::RetryPolicy;
     use bluer::Address;
+    #[tokio::test(start_paused = true)]
+    async fn retry_deadlines_are_bounded_and_testable_without_sleeping() {
+        let peer = Address::default();
+        let mut retry = RetryPolicy::default();
+        for _ in 0..12 {
+            retry.failed(peer);
+            let deadline = retry.after[&peer];
+            let delay = deadline - tokio::time::Instant::now();
+            assert!(delay >= std::time::Duration::from_secs(15));
+            assert!(delay <= std::time::Duration::from_secs(360));
+            assert!(!retry.ready(peer));
+            tokio::time::advance(delay).await;
+            assert!(retry.ready(peer));
+        }
+        retry.reset_session(peer);
+        assert!(retry.ready(peer));
+    }
+
     #[test]
     fn unavailable_stays_suppressed_until_a_new_physical_connection() {
         let mut retry = RetryPolicy::default();

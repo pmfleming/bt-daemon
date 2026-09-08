@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -17,6 +17,10 @@ use zbus::{DBusError, fdo::PropertiesProxy};
 use zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::backend::{BluetoothBackend, ObexRemote};
+
+mod authorization;
+#[cfg(test)]
+mod lifecycle_tests;
 
 const BUS_NAME: &str = "org.bluez.obex";
 const OBJECT_PATH: &str = "/org/bluez/obex";
@@ -172,7 +176,7 @@ struct IncomingAuthorization {
     remote: ObexRemote,
     details: IncomingDetails,
     file_name: String,
-    destination: PathBuf,
+    destination: authorization::Destination,
 }
 
 impl IncomingAuthorization {
@@ -221,7 +225,7 @@ pub struct IncomingBroker {
     sequence: AtomicU64,
     available: AtomicBool,
     connection: OnceLock<zbus::Connection>,
-    pending: Mutex<HashMap<String, PendingAuthorization>>,
+    pending: StdMutex<HashMap<String, PendingAuthorization>>,
     cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
 }
 
@@ -236,7 +240,7 @@ impl IncomingBroker {
             sequence: AtomicU64::new(1),
             available: AtomicBool::new(false),
             connection: OnceLock::new(),
-            pending: Mutex::new(HashMap::new()),
+            pending: StdMutex::new(HashMap::new()),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -254,7 +258,7 @@ impl IncomingBroker {
         let pending = self
             .pending
             .lock()
-            .await
+            .unwrap_or_else(|p| p.into_inner())
             .remove(request_id)
             .context("incoming transfer authorization is no longer pending")?;
         let decision = if accept {
@@ -267,7 +271,12 @@ impl IncomingBroker {
     }
 
     pub async fn cancel_transfer(&self, request_id: &str) -> bool {
-        if let Some(pending) = self.pending.lock().await.remove(request_id) {
+        if let Some(pending) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(request_id)
+        {
             tracing::info!(%request_id, "cancelling pending incoming OBEX authorization");
             let _ = pending.sender.send(AuthorizationDecision::Cancel);
             return true;
@@ -281,7 +290,12 @@ impl IncomingBroker {
     }
 
     async fn cancel_authorizations(&self) {
-        for (_, pending) in self.pending.lock().await.drain() {
+        for (_, pending) in self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain()
+        {
             let _ = pending.sender.send(AuthorizationDecision::Cancel);
         }
     }
@@ -291,7 +305,6 @@ impl IncomingBroker {
         let decision = match self.request_decision(&authorization).await {
             Ok(decision) => decision,
             Err(error) => {
-                remove_reservation(&authorization.destination);
                 return Err(error);
             }
         };
@@ -336,7 +349,10 @@ impl IncomingBroker {
             remote,
             details,
             file_name,
-            destination,
+            destination: authorization::Destination {
+                path: destination,
+                accepted: false,
+            },
         })
     }
 
@@ -345,16 +361,23 @@ impl IncomingBroker {
         authorization: &IncomingAuthorization,
     ) -> Result<AuthorizationDecision, ObexAgentError> {
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(
-            authorization.request_id.clone(),
-            PendingAuthorization { sender },
-        );
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                authorization.request_id.clone(),
+                PendingAuthorization { sender },
+            );
         tracing::info!(request_id = %authorization.request_id, device_key = %authorization.remote.device_key, file_name = %authorization.file_name, size = authorization.details.size, "incoming OBEX authorization requested");
         let requested = authorization.event(
             "authorization-requested",
             "awaiting-authorization",
             Some(AUTHORIZATION_TIMEOUT.as_millis() as u64),
         );
+        let _prompt = authorization::Prompt {
+            broker: self,
+            event: requested.clone(),
+        };
         let _ = self.events.send(requested);
         match tokio::time::timeout(AUTHORIZATION_TIMEOUT, receiver).await {
             Ok(Ok(decision)) => {
@@ -367,7 +390,10 @@ impl IncomingBroker {
             }
             Err(_) => {
                 tracing::warn!(request_id = %authorization.request_id, "incoming OBEX authorization timed out");
-                self.pending.lock().await.remove(&authorization.request_id);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&authorization.request_id);
                 let _ = self
                     .events
                     .send(authorization.event("cancelled", "cancelled", None));
@@ -383,14 +409,13 @@ impl IncomingBroker {
         authorization: IncomingAuthorization,
         error: ObexAgentError,
     ) -> ObexAgentError {
-        remove_reservation(&authorization.destination);
         let _ = self
             .events
             .send(authorization.event("cancelled", "cancelled", None));
         error
     }
 
-    async fn start_incoming(&self, authorization: IncomingAuthorization) -> String {
+    async fn start_incoming(&self, mut authorization: IncomingAuthorization) -> String {
         let (cancel_sender, cancel_receiver) = oneshot::channel();
         self.cancellations
             .lock()
@@ -400,7 +425,12 @@ impl IncomingBroker {
         let cancellations = Arc::clone(&self.cancellations);
         let task_id = authorization.request_id.clone();
         let event = authorization.event("queued", "queued", None);
-        let destination = authorization.destination.to_string_lossy().into_owned();
+        let destination = authorization
+            .destination
+            .path
+            .to_string_lossy()
+            .into_owned();
+        authorization.destination.accepted = true;
         tracing::info!(request_id = %authorization.request_id, device_key = %authorization.remote.device_key, file_name = %authorization.file_name, "incoming OBEX transfer queued");
         crate::task::spawn("incoming-obex-transfer", async move {
             let result = crate::task::catch(

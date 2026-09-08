@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bluer::agent::AgentHandle;
 use futures::StreamExt;
@@ -23,6 +23,26 @@ use crate::{
 };
 
 use super::BluezBackend;
+
+mod owner;
+
+// A candidate owns workers before publication. Cancellation while registering
+// its agent or restoring startup policy must not leave Arc-owned workers alive.
+struct Candidate {
+    backend: Arc<BluezBackend>,
+    installed: bool,
+}
+
+impl Drop for Candidate {
+    fn drop(&mut self) {
+        if !self.installed {
+            self.backend.tasks.abort();
+            if let Some(provider) = &self.backend.fast_pair {
+                provider.abort();
+            }
+        }
+    }
+}
 
 /// Rebuilds the BlueZ backend and pairing agent when the BlueZ bus owner changes.
 /// Callers receive typed unavailability errors while recovery is in progress.
@@ -77,10 +97,24 @@ impl RecoveringBackend {
     pub fn start_recovery(self: &Arc<Self>, pairing: Arc<PairingBroker>) {
         let backend = Arc::clone(self);
         crate::task::spawn("bluez-session-recovery", async move {
-            if let Err(error) = backend.monitor_owner(pairing).await {
+            if let Err(error) = backend.monitor_owner(Arc::clone(&pairing)).await {
+                // Setup/stream failure is not proof that the last backend is live.
+                backend.invalidate(&pairing);
+                backend.stop_generation().await;
                 tracing::error!(%error, "BlueZ recovery monitor stopped");
             }
         });
+    }
+
+    fn invalidate(&self, pairing: &PairingBroker) {
+        self.available.store(false, Ordering::Release);
+        pairing.cancel_all("bluez-unavailable");
+        let _ = self.changes.send(());
+    }
+
+    async fn stop_generation(&self) {
+        self.current().shutdown().await;
+        self.agent.lock().await.take();
     }
 
     async fn monitor_owner(&self, pairing: Arc<PairingBroker>) -> Result<()> {
@@ -95,31 +129,31 @@ impl RecoveringBackend {
         )
         .await
         .context("create BlueZ recovery owner proxy")?;
-        let mut changes = proxy
+        let changes = proxy
             .receive_signal("NameOwnerChanged")
             .await
             .context("subscribe to BlueZ owner changes")?;
-        while let Some(message) = changes.next().await {
-            let (name, old_owner, new_owner): (String, String, String) = message
+        let events = changes.map(|message| {
+            message
                 .body()
                 .deserialize()
-                .context("decode BlueZ owner change")?;
-            if name != "org.bluez" || old_owner == new_owner {
-                continue;
+                .context("decode BlueZ owner change")
+        });
+        owner::drive(events, |new_owner| {
+            self.invalidate(&pairing);
+            let pairing = &pairing;
+            async move {
+                self.stop_generation().await;
+                if new_owner.is_empty() {
+                    tracing::warn!(
+                        "BlueZ disappeared; retaining daemon API while waiting for recovery"
+                    );
+                } else {
+                    self.recover(pairing).await;
+                }
             }
-            self.available.store(false, Ordering::Release);
-            let _ = self.changes.send(());
-            self.current().shutdown().await;
-            self.agent.lock().await.take();
-            if new_owner.is_empty() {
-                tracing::warn!(
-                    "BlueZ disappeared; retaining daemon API while waiting for recovery"
-                );
-            } else {
-                self.recover(&pairing).await;
-            }
-        }
-        bail!("BlueZ recovery owner stream ended")
+        })
+        .await
     }
 
     async fn recover(&self, pairing: &Arc<PairingBroker>) {
@@ -127,13 +161,15 @@ impl RecoveringBackend {
         loop {
             let previous = self.current();
             match Self::replacement(pairing, &previous).await {
-                Ok((replacement, agent)) => {
+                Ok((mut replacement, agent)) => {
                     *self.agent.lock().await = Some(agent);
                     *self
                         .current
                         .write()
-                        .unwrap_or_else(|poison| poison.into_inner()) = Arc::clone(&replacement);
-                    self.forward_changes(replacement);
+                        .unwrap_or_else(|poison| poison.into_inner()) =
+                        Arc::clone(&replacement.backend);
+                    self.forward_changes(Arc::clone(&replacement.backend));
+                    replacement.installed = true;
                     self.available.store(true, Ordering::Release);
                     let _ = self.changes.send(());
                     tracing::info!("Bluetooth backend recovered without restarting bt-daemon");
@@ -150,24 +186,25 @@ impl RecoveringBackend {
     async fn replacement(
         pairing: &Arc<PairingBroker>,
         previous: &BluezBackend,
-    ) -> Result<(Arc<BluezBackend>, AgentHandle)> {
-        let replacement = Arc::new(
-            BluezBackend::with_state(
-                Arc::clone(&previous.identities),
-                Arc::clone(&previous.management),
-            )
-            .await?,
-        );
-        let agent = match replacement.register_agent(pairing.agent()).await {
-            Ok(agent) => agent,
-            Err(error) => {
-                replacement.shutdown().await;
-                return Err(error.context("restore the Bluetooth pairing agent"));
-            }
+    ) -> Result<(Candidate, AgentHandle)> {
+        let replacement = Candidate {
+            backend: Arc::new(
+                BluezBackend::with_state(
+                    Arc::clone(&previous.identities),
+                    Arc::clone(&previous.management),
+                )
+                .await?,
+            ),
+            installed: false,
         };
-        replacement.apply_startup_policy().await;
-        replacement.start_monitoring();
-        replacement.start_lifecycle_monitoring();
+        let agent = replacement
+            .backend
+            .register_agent(pairing.agent())
+            .await
+            .context("restore the Bluetooth pairing agent")?;
+        replacement.backend.apply_startup_policy().await;
+        replacement.backend.start_monitoring();
+        replacement.backend.start_lifecycle_monitoring();
         Ok((replacement, agent))
     }
 }

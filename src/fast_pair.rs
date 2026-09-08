@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use aes::{
     Aes128,
@@ -22,6 +18,7 @@ use futures::StreamExt;
 use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Mutex, RwLock, broadcast, mpsc},
@@ -955,6 +952,11 @@ impl FastPairBatteryProvider {
 
     pub fn forget_account_key(&self, device_key: &str) -> Result<()> {
         self.account_keys.remove(device_key)
+    }
+
+    pub(crate) fn abort(&self) {
+        self.tasks.abort();
+        self.pending_commands.clear();
     }
 
     pub async fn shutdown(&self) {

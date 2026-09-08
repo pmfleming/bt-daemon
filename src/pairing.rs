@@ -193,6 +193,19 @@ impl PairingBroker {
         events
     }
 
+    pub(crate) fn cancel_all(&self, reason: &str) {
+        let requests = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()));
+        let displays =
+            std::mem::take(&mut *self.displays.lock().unwrap_or_else(|p| p.into_inner()));
+        for request in requests.into_values() {
+            cancel(request.response);
+            self.emit(request.event.cancelled(reason));
+        }
+        for display in displays.into_values() {
+            self.emit(display.cancelled(reason));
+        }
+    }
+
     pub fn device_key(&self, adapter: &str, address: Address) -> String {
         self.identities.device_key(adapter, address)
     }
@@ -506,6 +519,41 @@ mod tests {
         (events, request)
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn owner_loss_cancels_prompts_and_displays_once_and_rejects_late_answers() {
+        let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
+        let (mut events, request) = confirmation_request(&broker, Some("123456".into()));
+        let prompt = events.recv().await.unwrap();
+        broker.display(
+            "display-pin",
+            "hci0",
+            "AA:BB:CC:DD:EE:FF".parse().unwrap(),
+            "secret".into(),
+            None,
+        );
+        assert_eq!(events.recv().await.unwrap().event, "display");
+        broker.cancel_all("bluez-unavailable");
+        assert!(matches!(request.await.unwrap(), Err(ReqError::Canceled)));
+        for _ in 0..2 {
+            let cancelled = events.recv().await.unwrap();
+            assert_eq!(cancelled.event, "cancelled");
+            assert_eq!(cancelled.reason.as_deref(), Some("bluez-unavailable"));
+            assert!(cancelled.value.is_none());
+            assert!(!cancelled.response_required);
+        }
+        assert!(broker.pending_events().is_empty());
+        assert!(
+            broker
+                .respond(&json!({"request_id":prompt.request_id,"accept":true}))
+                .await
+                .is_err()
+        );
+        broker.cancel_all("again");
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn display_interactions_clear_sensitive_values_on_cancellation() {
         for (kind, entered) in [("display-pin", None), ("display-passkey", Some(2))] {
@@ -614,7 +662,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timeout_cancels_request_and_emits_terminal_event() {
         let broker = PairingBroker::with_timeout(
             DeviceIdentityRegistry::in_memory(),
