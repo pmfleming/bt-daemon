@@ -25,7 +25,47 @@ pub(super) struct Reservation<'a> {
     generation: u64,
 }
 
+pub(super) fn authenticated_frame(
+    group: u8,
+    code: u8,
+    message: &[u8],
+    account_key: &[u8; 16],
+    session_nonce: &[u8; 8],
+    message_nonce: &[u8; 8],
+) -> Result<Vec<u8>> {
+    let mac = super::message_mac(account_key, session_nonce, message_nonce, message);
+    let mut payload = Vec::with_capacity(message.len() + 16);
+    payload.extend_from_slice(message);
+    payload.extend_from_slice(message_nonce);
+    payload.extend_from_slice(&mac);
+    super::Frame::encoded(group, code, &payload)
+}
+
 impl PendingCommands {
+    pub async fn execute(
+        &self,
+        key: Key,
+        send: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        let (_reservation, receiver) = self.reserve(key)?;
+        // The deadline includes writer backpressure. Drop releases the slot on
+        // send failure, disconnect, timeout and task cancellation alike.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            send.await?;
+            Ok::<_, anyhow::Error>(receiver.await)
+        })
+        .await;
+        match result {
+            Ok(Ok(Ok(Ok(())))) => Ok(()),
+            Ok(Ok(Ok(Err(reason)))) => {
+                bail!("Fast Pair provider rejected control command: {reason}")
+            }
+            Ok(Ok(Err(_))) => bail!("Fast Pair control acknowledgement was cancelled"),
+            Ok(Err(error)) => Err(error),
+            Err(_) => bail!("Fast Pair control acknowledgement timed out"),
+        }
+    }
+
     pub fn reserve(&self, key: Key) -> Result<(Reservation<'_>, oneshot::Receiver<Reply>)> {
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if entries.contains_key(&key) {
@@ -110,6 +150,55 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert!(pending.reserve(key).is_ok());
+    }
+
+    #[tokio::test]
+    async fn execution_reports_ack_rejection_send_failure_and_disconnect() {
+        let pending = PendingCommands::default();
+        let key = (Address::default(), 8, 0x12);
+        pending
+            .execute(key, async {
+                pending.resolve(key, Ok(()));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let rejected = pending
+            .execute(key, async {
+                pending.resolve(key, Err("unsupported".into()));
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(rejected.to_string().contains("unsupported"));
+        let failed = pending
+            .execute(key, async { anyhow::bail!("transport closed") })
+            .await
+            .unwrap_err();
+        assert_eq!(failed.to_string(), "transport closed");
+        let disconnected = pending
+            .execute(key, async {
+                pending.disconnect(key.0);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(disconnected.to_string().contains("cancelled"));
+        assert!(pending.reserve(key).is_ok());
+    }
+
+    #[test]
+    fn encoding_binds_message_and_both_nonces() {
+        let frame = super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[2; 8], &[3; 8]).unwrap();
+        assert_eq!(&frame[..5], &[8, 0x12, 0, 17, 1]);
+        assert_eq!(&frame[5..13], &[3; 8]);
+        for other in [
+            super::authenticated_frame(8, 0x12, &[0], &[4; 16], &[2; 8], &[3; 8]).unwrap(),
+            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[5; 8], &[3; 8]).unwrap(),
+            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[2; 8], &[6; 8]).unwrap(),
+        ] {
+            assert_ne!(&frame[13..], &other[13..]);
+        }
     }
 
     #[test]

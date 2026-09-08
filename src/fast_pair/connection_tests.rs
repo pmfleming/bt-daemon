@@ -35,6 +35,27 @@ fn failed_connect_only_changes_the_matching_connecting_peer() {
     assert!(state.retry.ready(unknown));
 }
 
+#[test]
+fn beginning_and_ending_connections_owns_links_writers_and_retry_state() {
+    let peer = Address::default();
+    let other = "11:22:33:44:55:66".parse().unwrap();
+    let mut state = ConnectionState::default();
+    assert!(state.begin(peer));
+    assert!(!state.begin(peer));
+    assert!(state.mark_connected(peer));
+    assert!(!state.begin(peer));
+    state.mark_connected(other);
+    let (writer, mut receiver) = mpsc::channel(1);
+    state.writers.insert(peer, writer);
+    state.ended(peer);
+    assert!(receiver.try_recv().is_err());
+    assert!(!state.writers.contains_key(&peer));
+    assert!(!state.connected_since.contains_key(&peer));
+    assert!(!state.links.contains_key(&peer));
+    assert!(!state.begin(peer));
+    assert_eq!(state.links[&other], LinkState::Connected);
+}
+
 #[tokio::test]
 async fn framed_transport_roundtrips_under_backpressure_and_stops_on_eof() {
     let (writer, reader) = tokio::io::duplex(8);

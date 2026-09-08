@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod audio_switch;
+mod capabilities;
 mod commands;
 mod retry;
 use retry::RetryPolicy;
@@ -401,6 +402,27 @@ struct ConnectionState {
 }
 
 impl ConnectionState {
+    fn begin(&mut self, address: Address) -> bool {
+        if self.links.contains_key(&address) || !self.retry.ready(address) {
+            return false;
+        }
+        self.links.insert(address, LinkState::Connecting);
+        true
+    }
+
+    fn ended(&mut self, address: Address) {
+        self.links.remove(&address);
+        self.writers.remove(&address);
+        if self
+            .connected_since
+            .remove(&address)
+            .is_some_and(|start| start.elapsed() >= Duration::from_secs(60))
+        {
+            self.retry.reset_session(address);
+        }
+        self.retry.failed(address);
+    }
+
     fn mark_connected(&mut self, address: Address) -> bool {
         if self.links.get(&address) == Some(&LinkState::Connected) {
             return false;
@@ -979,29 +1001,11 @@ impl FastPairBatteryProvider {
             .await
             .get(&device_key)
             .is_some_and(|start| start.elapsed() < Duration::from_secs(60));
-        let reason = if account_key_available {
-            Some("Account key already provisioned")
-        } else if model.is_none() {
-            Some("Trusted model metadata is missing; configure fast-pair-models.json")
-        } else if !recent {
-            Some("Re-pair this device to open its one-minute Fast Pair provisioning window")
-        } else {
-            None
-        };
         Some(FastPairFeatures {
-            model_id: runtime.model_id.map(hex::encode),
-            ble_address: runtime.ble_address.map(|address| address.to_string()),
             authenticated_controls: connected
                 && runtime.session_nonce.is_some()
                 && account_key_available,
-            account_key_available,
-            provisioning_available: reason.is_none(),
-            provisioning_reason: reason.map(Into::into),
-            trusted_model_name: model.map(|model| model.name.clone()),
-            multipoint: runtime.multipoint,
-            noise_control: runtime.noise_control,
-            last_switch: runtime.last_switch,
-            audio_switch_seeker_supported: false,
+            ..capabilities::describe(runtime, account_key_available, model, recent)
         })
     }
 
@@ -1243,30 +1247,17 @@ impl FastPairBatteryProvider {
         )?;
         let mut message_nonce = [0_u8; 8];
         OsRng.fill_bytes(&mut message_nonce);
-        let mac = message_mac(&account_key, &session_nonce, &message_nonce, message);
-        let mut payload = Vec::with_capacity(message.len() + 16);
-        payload.extend_from_slice(message);
-        payload.extend_from_slice(&message_nonce);
-        payload.extend_from_slice(&mac);
-        let frame = Frame::encoded(group, code, &payload)?;
-        let (_reservation, receiver) = self.pending_commands.reserve((address, group, code))?;
-        // Include writer backpressure in the deadline. The reservation is removed
-        // on errors, timeout, and cancellation, not only on the happy path.
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            self.send_frame(address, frame).await?;
-            Ok::<_, anyhow::Error>(receiver.await)
-        })
-        .await;
-        let result = match result {
-            Ok(result) => Ok(result?),
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(reason))) => bail!("Fast Pair provider rejected control command: {reason}"),
-            Ok(Err(_)) => bail!("Fast Pair control acknowledgement was cancelled"),
-            Err(_) => bail!("Fast Pair control acknowledgement timed out"),
-        }
+        let frame = commands::authenticated_frame(
+            group,
+            code,
+            message,
+            &account_key,
+            &session_nonce,
+            &message_nonce,
+        )?;
+        self.pending_commands
+            .execute((address, group, code), self.send_frame(address, frame))
+            .await
     }
 
     fn spawn_request_handler(provider: Arc<Self>, mut requests: ProfileHandle) {
@@ -1400,9 +1391,10 @@ impl FastPairBatteryProvider {
     }
 
     async fn ensure_rfcomm_connected(self: &Arc<Self>, device: Device) {
-        let Some(provider) = self.begin_device_connection(device.address()).await else {
+        if !self.connections.lock().await.begin(device.address()) {
             return;
-        };
+        }
+        let provider = Arc::clone(self);
         let address = device.address();
         self.tasks.spawn("fast-pair-rfcomm-connect", async move {
             let result = crate::task::catch("Fast Pair RFCOMM connection", async {
@@ -1432,9 +1424,10 @@ impl FastPairBatteryProvider {
         {
             return;
         }
-        let Some(provider) = self.begin_device_connection(device.address()).await else {
+        if !self.connections.lock().await.begin(device.address()) {
             return;
-        };
+        }
+        let provider = Arc::clone(self);
         let address = device.address();
         self.tasks.spawn("fast-pair-l2cap-connect", async move {
             let result = crate::task::catch("Fast Pair BLE L2CAP connection", async {
@@ -1570,15 +1563,6 @@ impl FastPairBatteryProvider {
         }
     }
 
-    async fn begin_device_connection(self: &Arc<Self>, address: Address) -> Option<Arc<Self>> {
-        let mut state = self.connections.lock().await;
-        if state.links.contains_key(&address) || !state.retry.ready(address) {
-            return None;
-        }
-        state.links.insert(address, LinkState::Connecting);
-        Some(Arc::clone(self))
-    }
-
     async fn update_report(&self, address: Address, report: BatteryReport) {
         let changed = self.reports.write().await.insert(address, report) != Some(report);
         if changed {
@@ -1600,19 +1584,7 @@ impl FastPairBatteryProvider {
     }
 
     async fn connection_ended(&self, address: Address) {
-        {
-            let mut state = self.connections.lock().await;
-            state.links.remove(&address);
-            state.writers.remove(&address);
-            if state
-                .connected_since
-                .remove(&address)
-                .is_some_and(|start| start.elapsed() >= Duration::from_secs(60))
-            {
-                state.retry.reset_session(address);
-            }
-            state.retry.failed(address);
-        }
+        self.connections.lock().await.ended(address);
         self.pending_commands.disconnect(address);
         let runtime_changed = self.runtime.write().await.remove(&address).is_some();
         self.remove_report(address).await;
