@@ -217,16 +217,30 @@ async fn operation_emits_started_and_completed_events() {
     assert_eq!(recovered["recent"][0]["event"], "completed");
 }
 
+async fn operation_request_id(
+    response: &Value,
+    events: &mut broadcast::Receiver<OperationEvent>,
+) -> String {
+    let id = response["data"]["operation"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let started = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.event, "started");
+    assert_eq!(started.request_id, id);
+    id
+}
+
 #[tokio::test]
 async fn active_operation_can_be_cancelled() {
     let (daemon, mut events, _) = daemon(false);
     let response = start_operation(&daemon, "pair").await;
-    let request_id = response["data"]["operation"]["request_id"]
-        .as_str()
-        .unwrap();
-    assert_eq!(events.recv().await.unwrap().event, "started");
+    let request_id = operation_request_id(&response, &mut events).await;
     let response: Value =
-        serde_json::from_str(&daemon.cancel_owned(request_id, None).await).unwrap();
+        serde_json::from_str(&daemon.cancel_owned(&request_id, None).await).unwrap();
     assert_eq!(response["data"]["kind"], "operation");
     let mut cancelled = events.recv().await.unwrap();
     while cancelled.event != "cancelled" {
@@ -239,11 +253,10 @@ async fn active_operation_can_be_cancelled() {
 async fn rejects_concurrent_operations_for_one_device() {
     let (daemon, mut events, _) = daemon(false);
     let first = start_operation(&daemon, "connect").await;
-    let request_id = first["data"]["operation"]["request_id"].as_str().unwrap();
-    assert_eq!(events.recv().await.unwrap().event, "started");
+    let request_id = operation_request_id(&first, &mut events).await;
     let second = start_operation(&daemon, "remove").await;
     assert_eq!(second["error"]["code"], "device-busy");
-    let _ = daemon.cancel_owned(request_id, None).await;
+    let _ = daemon.cancel_owned(&request_id, None).await;
 }
 
 #[tokio::test]

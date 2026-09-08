@@ -32,6 +32,7 @@ mod observations;
 mod recovery;
 mod snapshot;
 
+/// Backend wrapper that restores BlueZ state after service-owner changes.
 pub use recovery::RecoveringBackend;
 
 const DISCOVERED_DEVICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -42,6 +43,8 @@ struct CachedDevice {
     observed_at_ms: u64,
 }
 
+/// Live BlueZ session with identity, management policy and observation caches.
+/// Use `RecoveringBackend` when the session must survive BlueZ restarts.
 pub struct BluezBackend {
     session: Session,
     discovery_tasks: Mutex<HashMap<String, JoinHandle<()>>>,

@@ -6,6 +6,7 @@ use shelllist_daemon_core::{ApiError as EnvelopeError, ApiIdentity};
 
 use crate::backend::{AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, Params};
 
+/// Protocol identity shared by every response envelope.
 pub use crate::protocol::{NAME as PROTOCOL, VERSION};
 const API: ApiIdentity = ApiIdentity::new(PROTOCOL, VERSION as u32);
 
@@ -58,6 +59,8 @@ fn policy_values(params: &Value) -> Value {
     values
 }
 
+/// Validate and dispatch a backend request, returning a versioned success or error envelope.
+/// Validation errors never invoke a backend operation.
 pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: Value) -> Value {
     tracing::debug!(%method, "backend API request started");
     let request = match parse_backend_request(method, &params) {
@@ -105,6 +108,7 @@ fn parse_backend_request<'a>(method: &str, params: &'a Value) -> Result<BackendR
     }
 }
 
+/// Log an action's outcome without dumping the request or snapshot payload.
 pub fn log_response(action: &str, response: &Value) {
     if response["ok"].as_bool() == Some(true) {
         tracing::info!(%action, "request completed");
@@ -130,10 +134,12 @@ fn validation_error(error: Error) -> Value {
     self::error("validation-error", error.to_string())
 }
 
+/// Wrap response data in the bt-api success envelope.
 pub fn success(data: Value) -> Value {
     shelllist_daemon_core::success(API, data)
 }
 
+/// Preserve typed backend error codes and retryability through an anyhow context chain.
 pub fn error_value(error: &Error) -> Value {
     let kind = error
         .chain()
@@ -160,6 +166,7 @@ fn backend_error(cause: &Error) -> Value {
     )
 }
 
+/// Construct a versioned error response with the supplied code and human-readable message.
 pub fn error(code: &str, message: String) -> Value {
     shelllist_daemon_core::error(API, EnvelopeError::new(code, message))
 }

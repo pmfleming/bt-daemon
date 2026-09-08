@@ -18,7 +18,10 @@ audit:
     cargo audit
 
 coverage:
-    cargo llvm-cov --all-features --fail-under-lines 34
+    cargo llvm-cov --all-features --fail-under-lines 40
+
+quality:
+    bash scripts/check-quality.sh
 
 check: fmt-check lint test audit coverage
 

@@ -24,6 +24,8 @@ use crate::{
 
 use super::BluezBackend;
 
+/// Rebuilds the BlueZ backend and pairing agent when the BlueZ bus owner changes.
+/// Callers receive typed unavailability errors while recovery is in progress.
 pub struct RecoveringBackend {
     current: RwLock<Arc<BluezBackend>>,
     changes: broadcast::Sender<()>,

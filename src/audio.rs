@@ -20,6 +20,7 @@ use serde::Serialize;
 
 mod profile;
 use profile::parse_profile;
+/// Deterministic, device-scoped identifiers that do not expose PipeWire node names.
 pub use profile::{endpoint_key, profile_key};
 
 macro_rules! bind_or_return {
@@ -35,6 +36,8 @@ macro_rules! bind_or_return {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// A probed Bluetooth PipeWire device and its profiles/endpoints.
+/// Transport addresses are internal; the daemon maps them to opaque keys for clients.
 pub struct AudioDevice {
     pub pipewire_id: u32,
     pub address: String,
@@ -47,6 +50,7 @@ pub struct AudioDevice {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Current PipeWire node lifecycle state and default-route status.
 pub struct AudioEndpoint {
     pub name: String,
     pub state: String,
@@ -54,6 +58,7 @@ pub struct AudioEndpoint {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// PipeWire profile metadata, including availability, selection index and codec.
 pub struct AudioProfile {
     pub index: u32,
     pub name: String,
@@ -163,6 +168,8 @@ fn bind_monitor_object(
     Ok(())
 }
 
+/// Run the blocking PipeWire change monitor until its connection ends.
+/// Invoke on a dedicated thread; callbacks should return promptly.
 pub fn monitor(on_change: ChangeCallback) -> Result<()> {
     initialize();
     let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire monitor loop")?;
@@ -239,20 +246,26 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
     )
 }
 
+/// Probe Bluetooth PipeWire objects using bounded synchronization round trips.
+/// This is blocking I/O and should not run on a Tokio worker thread.
 pub fn probe() -> Result<Vec<AudioDevice>> {
     initialize();
     probe_inner()
 }
 
+/// Activate a PipeWire profile for the Bluetooth address and confirm the result.
+/// Returns an error if the device/profile disappears or activation is not observed.
 pub fn set_profile(address: &str, index: u32) -> Result<()> {
     initialize();
     set_profile_inner(address, index)
 }
 
+/// Make this Bluetooth device's sink the PipeWire default; performs blocking I/O.
 pub fn set_default_sink(address: &str) -> Result<()> {
     set_default_endpoint(address, EndpointKind::Sink)
 }
 
+/// Make this Bluetooth device's source the PipeWire default; performs blocking I/O.
 pub fn set_default_source(address: &str) -> Result<()> {
     set_default_endpoint(address, EndpointKind::Source)
 }

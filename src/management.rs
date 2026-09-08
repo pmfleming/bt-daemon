@@ -8,13 +8,14 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::{model::Snapshot, state};
+use crate::state;
 
 const POLICY_VERSION: u8 = 1;
 const RUNTIME_VERSION: u8 = 1;
 const DEVICE_POLICY_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Persistent global Bluetooth startup and reconnect defaults.
 pub struct ManagementPolicy {
     #[serde(default = "default_policy_version")]
     pub version: u8,
@@ -47,6 +48,7 @@ impl Default for ManagementPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// Effective per-device policy after applying overrides to global defaults.
 pub struct DevicePolicy {
     pub reconnect_on_resume: bool,
     pub trust_after_pair: bool,
@@ -90,6 +92,8 @@ impl Default for DevicePolicyFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Minimal persisted observations used to restore adapter power and connections.
+/// Kept independent of presentation snapshots to avoid a policy/model dependency cycle.
 pub struct RuntimeState {
     #[serde(default = "default_runtime_version")]
     version: u8,
@@ -109,6 +113,7 @@ impl Default for RuntimeState {
     }
 }
 
+/// Validates and persists global/per-device policy plus remembered runtime state.
 pub struct ManagementStore {
     policy_path: Option<PathBuf>,
     runtime_path: Option<PathBuf>,
@@ -238,21 +243,8 @@ impl ManagementStore {
         }
     }
 
-    pub fn remember_snapshot(&self, snapshot: &Snapshot) {
-        let runtime = RuntimeState {
-            version: RUNTIME_VERSION,
-            adapter_power: snapshot
-                .adapters
-                .iter()
-                .map(|adapter| (adapter.key.clone(), adapter.powered))
-                .collect(),
-            connected_device_keys: snapshot
-                .devices
-                .iter()
-                .filter(|device| device.state.connected)
-                .map(|device| device.key.clone())
-                .collect(),
-        };
+    pub fn remember_snapshot(&self, snapshot: impl Into<RuntimeState>) {
+        let runtime = snapshot.into();
         let mut current = self.runtime_lock();
         if let Some(path) = &self.runtime_path
             && let Err(error) = state::write_json(path, &runtime, "Bluetooth runtime state")
@@ -383,6 +375,17 @@ impl DevicePolicyOverrides {
 }
 
 impl RuntimeState {
+    pub(crate) fn observed(
+        adapter_power: HashMap<String, bool>,
+        connected_device_keys: Vec<String>,
+    ) -> Self {
+        Self {
+            version: RUNTIME_VERSION,
+            adapter_power,
+            connected_device_keys,
+        }
+    }
+
     pub fn adapter_power(&self) -> &HashMap<String, bool> {
         &self.adapter_power
     }

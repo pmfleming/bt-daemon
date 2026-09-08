@@ -2,14 +2,23 @@ use serde_json::{Map, Value, json};
 
 use crate::backend::{AdapterOperation, BackendErrorKind, DeviceOperation};
 
+/// Stable protocol name included in every bt-api envelope.
 pub const NAME: &str = "bt-api";
+/// Wire-contract version; incompatible schema changes require a new version.
 pub const VERSION: u8 = 1;
+/// Event stream identifiers accepted by subscription requests.
 pub mod stream {
+    /// Cached Bluetooth snapshot updates.
     pub const CHANGED: &str = "bluetooth.changed";
+    /// Pairing prompts and their terminal outcomes.
     pub const PAIRING: &str = "pairing.request";
+    /// Cancellable device-operation progress.
     pub const OPERATION: &str = "bluetooth.operation";
+    /// Caller-owned discovery lease lifecycle events.
     pub const SCAN: &str = "bluetooth.scan";
+    /// Bluetooth PipeWire endpoint/profile snapshot updates.
     pub const AUDIO: &str = "bluetooth.audio.changed";
+    /// File-transfer progress and incoming authorization requests.
     pub const OBEX: &str = "bluetooth.obex.transfer";
 }
 
@@ -19,6 +28,7 @@ macro_rules! method_registry {
     };
 }
 
+/// Method names, parameter examples, response keys and associated event streams.
 pub const METHODS: &[(&str, &str, &str, Option<&str>)] = method_registry! {
     "bluetooth.protocol.describe", "{}", "registry", None;
     "bluetooth.snapshot", "{}", "snapshot", Some(stream::CHANGED);
@@ -44,6 +54,7 @@ macro_rules! stream_registry {
     };
 }
 
+/// Stream names and supported lifecycle event names.
 pub const STREAMS: &[(&str, &[&str])] = stream_registry! {
     stream::CHANGED => ["subscribed", "changed", "unavailable"];
     stream::PAIRING => ["requested", "display", "answered", "cancelled", "lagged"];
@@ -90,7 +101,19 @@ fn required_capability(name: &str) -> Option<&'static str> {
 }
 
 fn params_schema(name: &str, encoded: &str) -> Value {
-    let example = serde_json::from_str::<Value>(encoded).expect("valid protocol fixture");
+    let example = match serde_json::from_str::<Value>(encoded) {
+        Ok(example) if example.is_object() => example,
+        result => {
+            // A broken built-in fixture must not panic the running daemon or
+            // advertise an unconstrained schema. Boolean false rejects all values.
+            tracing::error!(
+                method = name,
+                ?result,
+                "invalid protocol example; advertising a rejecting parameter schema"
+            );
+            return Value::Bool(false);
+        }
+    };
     let mut properties = Map::new();
     let mut required = Vec::new();
     if let Some(object) = example.as_object() {
@@ -220,6 +243,7 @@ fn error_registry() -> Value {
     Value::Array(errors)
 }
 
+/// Build the offline machine-readable method, parameter-schema and event registry.
 pub fn registry() -> Value {
     json!({
         "protocol": NAME,
@@ -271,6 +295,22 @@ pub fn contract_fixture() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{METHODS, STREAMS, VERSION, contract_fixture, registry};
+
+    #[test]
+    fn malformed_parameter_examples_fail_closed_without_panicking() {
+        for encoded in ["{broken", "null", "[]", "true", "42"] {
+            assert_eq!(
+                super::params_schema("test-method", encoded),
+                serde_json::json!(false)
+            );
+        }
+        for (method, example, _, _) in METHODS {
+            assert!(
+                super::params_schema(method, example).is_object(),
+                "{method}"
+            );
+        }
+    }
 
     #[test]
     fn registry_names_are_unique_and_fixture_matches_registry() {

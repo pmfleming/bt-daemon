@@ -54,6 +54,8 @@ struct RegistryFile {
     presentations: HashMap<String, RememberedPresentation>,
 }
 
+/// Stable opaque device identities and remembered presentation metadata.
+/// Discovery-only identities remain ephemeral until promoted after pairing.
 pub struct DeviceIdentityRegistry {
     writer: Option<persistence::Writer>,
     state: Mutex<RegistryFile>,

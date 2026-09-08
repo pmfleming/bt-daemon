@@ -75,6 +75,8 @@ fn call_failure(method: &str, error: &anyhow::Error) -> CallFailure {
     ))
 }
 
+/// Bridge JSON Lines on standard input/output to the session D-Bus daemon.
+/// Owns subscriptions for this frontend session and releases them on disconnect.
 pub async fn run() -> Result<()> {
     tracing::info!("JSON-lines client started");
     run_jsonl_client(JsonlClientConfig {

@@ -7,9 +7,11 @@ use tokio::sync::broadcast;
 
 use crate::model::Snapshot;
 
+/// Thread-safe callback for non-sensitive operation stage names.
 pub type OperationProgress = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stable failure categories used to derive bt-api codes and retryability.
 pub enum BackendErrorKind {
     Timeout,
     DeviceUnavailable,
@@ -40,6 +42,7 @@ impl BackendErrorKind {
 }
 
 #[derive(Debug)]
+/// A classified backend failure whose kind survives additional anyhow context.
 pub struct BackendError {
     pub kind: BackendErrorKind,
     message: String,
@@ -188,18 +191,23 @@ operation_enum!(DeviceOperation, "device", {
 });
 
 #[derive(Debug, Clone)]
+/// Local and remote transport addresses resolved from an opaque device key.
 pub struct ObexTarget {
     pub source: String,
     pub destination: String,
 }
 
 #[derive(Debug, Clone)]
+/// Client-facing identity resolved for an incoming OBEX peer.
 pub struct ObexRemote {
     pub device_key: String,
     pub name: String,
 }
 
 #[async_trait]
+/// Injectable Bluetooth backend used by request coordinators and hardware-free tests.
+/// Implementations must validate current hardware state, even when a prior snapshot
+/// advertised an operation as available. Mutations return the resulting snapshot.
 pub trait BluetoothBackend: Send + Sync {
     fn subscribe_changes(&self) -> broadcast::Receiver<()>;
     async fn snapshot(&self) -> Result<Snapshot>;

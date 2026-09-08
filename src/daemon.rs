@@ -9,9 +9,13 @@ use zbus::{connection, message::Header, object_server::SignalEmitter};
 
 use crate::{api, backend::BluetoothBackend, pairing::PairingBroker, protocol};
 
+/// Well-known session bus name claimed while the service is running.
 pub const BUS_NAME: &str = "org.laufan.BluetoothDaemon";
+/// Object path exporting the bt-api D-Bus interface.
 pub const OBJECT_PATH: &str = "/org/laufan/BluetoothDaemon";
+/// Versioned D-Bus interface for calls, subscriptions and cancellation.
 pub const INTERFACE: &str = "org.laufan.BluetoothDaemon1";
+/// Stream names accepted by the subscription API.
 pub use crate::protocol::stream::{
     AUDIO as AUDIO_STREAM, CHANGED as CHANGED_STREAM, OBEX as OBEX_STREAM,
     OPERATION as OPERATION_STREAM, PAIRING as PAIRING_STREAM, SCAN as SCAN_STREAM,
@@ -32,6 +36,7 @@ pub(super) enum SharedSnapshot {
     Unavailable(Arc<String>),
 }
 
+/// Owns request coordinators and cached snapshots shared by session-bus clients.
 pub struct BluetoothDaemon {
     backend: Arc<dyn BluetoothBackend>,
     pairing: Arc<PairingBroker>,
@@ -298,6 +303,8 @@ async fn emit_audio(
     }
 }
 
+/// Export the session service and run until shutdown is requested.
+/// Returns an error if service registration or monitor startup fails.
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
     let mut changes = backend.subscribe_changes();
     let (snapshots, _) = watch::channel(SharedSnapshot::Loading);

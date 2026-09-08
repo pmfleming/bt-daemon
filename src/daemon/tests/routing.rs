@@ -104,15 +104,8 @@ async fn routed_operations_preserve_caller_ownership() {
             None,
         )
         .await;
-    let id = operation["data"]["operation"]["request_id"]
-        .as_str()
-        .unwrap();
-    assert_eq!(events.recv().await.unwrap().event, "started");
-    let denied: Value =
-        serde_json::from_str(&daemon.cancel_owned(id, Some(":other")).await).unwrap();
-    assert_eq!(denied["error"]["code"], "request-not-found");
-    let cancelled: Value =
-        serde_json::from_str(&daemon.cancel_owned(id, Some(":owner")).await).unwrap();
+    let id = super::operation_request_id(&operation, &mut events).await;
+    let cancelled = assert_owned_cancellation(&daemon, &id).await;
     assert_eq!(cancelled["data"]["kind"], "operation");
 }
 
@@ -128,12 +121,18 @@ async fn routed_scans_preserve_caller_ownership_without_a_bus_connection() {
         )
         .await;
     let id = scan["data"]["scan"]["request_id"].as_str().unwrap();
+    assert_owned_cancellation(&daemon, id).await;
+    assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
+}
+
+async fn assert_owned_cancellation(daemon: &crate::daemon::BluetoothDaemon, id: &str) -> Value {
     let denied: Value =
         serde_json::from_str(&daemon.cancel_owned(id, Some(":other")).await).unwrap();
     assert_eq!(denied["error"]["code"], "request-not-found");
     let cancelled: Value =
         serde_json::from_str(&daemon.cancel_owned(id, Some(":owner")).await).unwrap();
     assert_eq!(cancelled["ok"], true);
+    cancelled
 }
 
 #[tokio::test]

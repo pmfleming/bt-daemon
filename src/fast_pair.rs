@@ -42,7 +42,9 @@ mod metadata;
 use commands::PendingCommands;
 use keys::AccountKeyStore;
 
+/// RFCOMM service UUID for the Google Fast Pair Message Stream.
 pub const MESSAGE_STREAM_UUID: &str = "df21fe2c-2515-4fdb-8886-f12c4d67927c";
+/// Bluetooth-base UUID advertising the Fast Pair service.
 pub const FAST_PAIR_SERVICE_UUID: &str = "0000fe2c-0000-1000-8000-00805f9b34fb";
 const MESSAGE_STREAM_PSM_UUID: &str = "fe2c1239-8366-4814-8eb0-01de32100bea";
 const DEVICE_INFORMATION_GROUP: u8 = 0x03;
@@ -398,6 +400,28 @@ struct ConnectionState {
     connected_since: HashMap<Address, Instant>,
 }
 
+impl ConnectionState {
+    fn mark_connected(&mut self, address: Address) -> bool {
+        if self.links.get(&address) == Some(&LinkState::Connected) {
+            return false;
+        }
+        self.links.insert(address, LinkState::Connected);
+        self.retry.connected(address);
+        self.connected_since.insert(address, Instant::now());
+        true
+    }
+
+    fn connection_failed(&mut self, address: Address) {
+        if self.links.get(&address) == Some(&LinkState::Connecting) {
+            self.links.remove(&address);
+            self.retry.failed(address);
+        }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests;
+
 #[derive(Clone, Copy)]
 struct FastPairUuids {
     message_stream: Uuid,
@@ -419,6 +443,8 @@ impl FastPairUuids {
     }
 }
 
+/// Owns Fast Pair message streams, battery observations and authenticated controls.
+/// Account keys and operator-provisioned metadata are required for privileged actions.
 pub struct FastPairBatteryProvider {
     session: Session,
     identities: Arc<DeviceIdentityRegistry>,
@@ -664,8 +690,8 @@ async fn apply_acknowledgement(
         _ => return,
     };
     provider
-        .resolve_command(address, group, message, result)
-        .await;
+        .pending_commands
+        .resolve((address, group, message), result);
 }
 
 fn decode_fixed<const N: usize>(payload: &[u8], label: &str) -> Result<[u8; N]> {
@@ -1248,7 +1274,8 @@ impl FastPairBatteryProvider {
         owner.tasks.spawn("fast-pair-rfcomm-requests", async move {
             while let Some(request) = requests.next().await {
                 let address = request.device();
-                if !provider.mark_connected(address).await {
+                let newly_connected = provider.connections.lock().await.mark_connected(address);
+                if !newly_connected {
                     request.reject(ReqError::Rejected);
                     continue;
                 }
@@ -1390,7 +1417,7 @@ impl FastPairBatteryProvider {
             .await;
             if let Err(error) = result {
                 tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "Fast Pair RFCOMM connection failed");
-                provider.connection_failed(address).await;
+                provider.connections.lock().await.connection_failed(address);
             }
         });
     }
@@ -1417,14 +1444,17 @@ impl FastPairBatteryProvider {
             })
             .await;
             match result {
-                Ok(stream) if provider.mark_connected(address).await => {
+                Ok(stream) if {
+                    let mut state = provider.connections.lock().await;
+                    state.mark_connected(address)
+                } => {
                     tracing::debug!(%address, transport = "BLE L2CAP", "Fast Pair Message Stream connected");
                     Self::spawn_reader(Arc::clone(&provider), address, "BLE L2CAP", stream);
                 }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "Fast Pair BLE L2CAP connection failed");
-                    provider.connection_failed(address).await;
+                    provider.connections.lock().await.connection_failed(address);
                 }
             }
         });
@@ -1527,17 +1557,6 @@ impl FastPairBatteryProvider {
             .context("Fast Pair Message Stream writer ended")
     }
 
-    async fn resolve_command(
-        &self,
-        address: Address,
-        group: u8,
-        code: u8,
-        result: std::result::Result<(), String>,
-    ) {
-        self.pending_commands
-            .resolve((address, group, code), result);
-    }
-
     async fn update_runtime(&self, address: Address, update: impl FnOnce(&mut RuntimeReport)) {
         let changed = {
             let mut reports = self.runtime.write().await;
@@ -1560,18 +1579,6 @@ impl FastPairBatteryProvider {
         Some(Arc::clone(self))
     }
 
-    async fn mark_connected(&self, address: Address) -> bool {
-        let mut state = self.connections.lock().await;
-        if state.links.get(&address) == Some(&LinkState::Connected) {
-            false
-        } else {
-            state.links.insert(address, LinkState::Connected);
-            state.retry.connected(address);
-            state.connected_since.insert(address, Instant::now());
-            true
-        }
-    }
-
     async fn update_report(&self, address: Address, report: BatteryReport) {
         let changed = self.reports.write().await.insert(address, report) != Some(report);
         if changed {
@@ -1589,14 +1596,6 @@ impl FastPairBatteryProvider {
     async fn remove_report(&self, address: Address) {
         if self.reports.write().await.remove(&address).is_some() {
             let _ = self.changes.send(());
-        }
-    }
-
-    async fn connection_failed(&self, address: Address) {
-        let mut state = self.connections.lock().await;
-        if state.links.get(&address) == Some(&LinkState::Connecting) {
-            state.links.remove(&address);
-            state.retry.failed(address);
         }
     }
 

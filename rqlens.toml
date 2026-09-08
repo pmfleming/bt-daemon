@@ -9,3 +9,13 @@ identity_resolution = "auto"
 rust_analyzer = "rust-analyzer"
 identity_timeout_seconds = 60
 identity_offline = true
+
+[[architecture.rules]]
+id = "management-independent-of-presentation"
+from = ["**::management"]
+deny = ["**::model", "**::bluez::**", "**::daemon::**", "**::audio::**", "**::fast_pair::**"]
+
+[[architecture.rules]]
+id = "data-contracts-independent-of-hardware"
+from = ["**::model", "**::protocol"]
+deny = ["**::bluez::**", "**::daemon::**", "**::audio::**", "**::fast_pair::**"]

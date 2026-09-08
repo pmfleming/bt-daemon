@@ -76,6 +76,7 @@
             llvmPackages.llvm
             pkg-config
             pipewire
+            python3
             rust-analyzer
             rustc
             rustfmt

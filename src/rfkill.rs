@@ -11,6 +11,8 @@ use crate::model::RadioState;
 const RFKILL_TYPE_BLUETOOTH: u8 = 2;
 const RFKILL_OP_CHANGE_ALL: u8 = 3;
 
+/// Combine adapter availability/power with readable Bluetooth rfkill entries.
+/// Missing or unreadable sysfs state is reported as unavailable rfkill evidence.
 pub fn radio_state(adapter_count: usize, powered: bool) -> RadioState {
     let (rfkill_present, soft_blocked, hard_blocked) = read_bluetooth_state("/sys/class/rfkill")
         .unwrap_or_else(|error| {
@@ -28,6 +30,8 @@ pub fn radio_state(adapter_count: usize, powered: bool) -> RadioState {
     }
 }
 
+/// Change the Bluetooth software radio block through `/dev/rfkill`.
+/// Requires write permission and never overrides a hardware radio block.
 pub fn set_bluetooth_soft_blocked(blocked: bool) -> Result<()> {
     let mut device = fs::OpenOptions::new()
         .write(true)

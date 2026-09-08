@@ -25,10 +25,12 @@ const AGENT_MANAGER_INTERFACE: &str = "org.bluez.obex.AgentManager1";
 const PUSH_INTERFACE: &str = "org.bluez.obex.ObjectPush1";
 const TRANSFER_INTERFACE: &str = "org.bluez.obex.Transfer1";
 const SESSION_INTERFACE: &str = "org.bluez.obex.Session1";
+/// Session-bus object path for the optional incoming-transfer authorization agent.
 pub const AGENT_PATH: &str = "/org/laufan/BluetoothDaemon/ObexAgent";
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize)]
+/// Transfer features currently available from obexd and the local authorization agent.
 pub struct ObexCapabilities {
     pub available: bool,
     pub outgoing_object_push: bool,
@@ -38,6 +40,7 @@ pub struct ObexCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Transfer progress or authorization event correlated by request and opaque device IDs.
 pub struct ObexEvent {
     pub event: String,
     pub request_id: String,
@@ -94,6 +97,7 @@ impl ObexEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Latest obexd transfer state; byte counts accumulate across property updates.
 pub struct TransferUpdate {
     pub status: String,
     pub transferred: u64,
@@ -139,6 +143,7 @@ impl TransferUpdate {
     }
 }
 
+/// Owns the D-Bus session and transfer paths needed to monitor/cancel an outgoing push.
 pub struct ActiveTransfer {
     connection: zbus::Connection,
     session_path: OwnedObjectPath,
@@ -209,6 +214,7 @@ fn incoming_event(
     }
 }
 
+/// Tracks incoming authorizations and transfers, with bounded approval deadlines.
 pub struct IncomingBroker {
     backend: Arc<dyn BluetoothBackend>,
     events: broadcast::Sender<ObexEvent>,
@@ -425,6 +431,7 @@ fn rejected(error: anyhow::Error) -> ObexAgentError {
     ObexAgentError::Rejected(format!("{error:#}"))
 }
 #[derive(Clone)]
+/// BlueZ OBEX Agent1 implementation delegating authorization to the incoming broker.
 pub struct ObexAgent {
     broker: Arc<IncomingBroker>,
 }
@@ -437,6 +444,7 @@ impl ObexAgent {
 
 #[derive(Debug, DBusError)]
 #[zbus(prefix = "org.bluez.obex.Error")]
+/// D-Bus errors distinguishing user rejection from cancelled authorization.
 pub enum ObexAgentError {
     Rejected(String),
     Canceled(String),
@@ -463,6 +471,8 @@ impl ObexAgent {
     }
 }
 
+/// Register the already-exported incoming agent with obexd.
+/// Call only when incoming transfers have been explicitly enabled by the operator.
 pub async fn register_agent(
     connection: &zbus::Connection,
     broker: &Arc<IncomingBroker>,
@@ -480,6 +490,7 @@ pub async fn register_agent(
     Ok(())
 }
 
+/// Monitor obexd ownership and restore an explicitly enabled agent after restarts.
 pub fn monitor_agent_owner(connection: zbus::Connection, broker: Arc<IncomingBroker>) {
     crate::task::spawn("obex-agent-owner", async move {
         loop {
@@ -534,6 +545,7 @@ async fn watch_agent_owner(
     }
 }
 
+/// Activate/ping obexd and report transfer support; may activate the session service.
 pub async fn probe(incoming_authorization: bool) -> Result<ObexCapabilities> {
     let connection = zbus::Connection::session()
         .await
@@ -558,6 +570,8 @@ pub async fn probe(incoming_authorization: bool) -> Result<ObexCapabilities> {
     })
 }
 
+/// Validate a selected regular file and start an OBEX push between transport addresses.
+/// Returns ownership of the active transfer for progress monitoring and cancellation.
 pub async fn start_file(
     source: &str,
     destination: &str,

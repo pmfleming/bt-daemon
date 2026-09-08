@@ -3,10 +3,12 @@ use sha2::{Digest, Sha256};
 
 use super::AudioProfile;
 
+/// Derive a stable profile identifier scoped to an opaque Bluetooth device key.
 pub fn profile_key(device_key: &str, profile_name: &str) -> String {
     opaque_audio_key("profile", device_key, profile_name)
 }
 
+/// Derive a stable sink/source identifier scoped to an opaque Bluetooth device key.
 pub fn endpoint_key(device_key: &str, kind: &str) -> String {
     opaque_audio_key("endpoint", device_key, kind)
 }

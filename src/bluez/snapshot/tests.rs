@@ -247,4 +247,21 @@ fn cached_device_views_remove_live_state_and_authenticated_controls() {
     assert!(view.capabilities.can_connect && !view.capabilities.can_disconnect);
     assert!(!view.capabilities.can_set_multipoint && !view.capabilities.can_set_noise_control);
     assert!(cached.device.state.connected);
+    let snapshot = crate::model::Snapshot {
+        adapters: vec![crate::model::Adapter {
+            key: "adapter-test".into(),
+            powered: true,
+            ..Default::default()
+        }],
+        devices: vec![cached.device.clone(), view],
+        ..Default::default()
+    };
+    let management = crate::management::ManagementStore::in_memory();
+    management.remember_snapshot(&snapshot);
+    let runtime = management.runtime();
+    assert_eq!(runtime.adapter_power().get("adapter-test"), Some(&true));
+    assert_eq!(runtime.connected_device_keys(), ["device-test"]);
+    management.remember_snapshot(&crate::model::Snapshot::default());
+    assert!(management.runtime().adapter_power().is_empty());
+    assert!(management.runtime().connected_device_keys().is_empty());
 }

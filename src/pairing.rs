@@ -24,6 +24,8 @@ use crate::{backend::Params, identity::DeviceIdentityRegistry};
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize)]
+/// Recoverable pairing interaction correlated by request ID and opaque device key.
+/// Terminal events clear prompt secrets and no longer require a response.
 pub struct PairingEvent {
     pub event: String,
     pub request_id: String,
@@ -137,6 +139,7 @@ impl Drop for RequestGuard {
     }
 }
 
+/// Coordinates BlueZ agent prompts, bounded response deadlines and cancellation.
 pub struct PairingBroker {
     sequence: AtomicU64,
     // Synchronous so a dropped callback can remove its prompt in Drop without a race.

@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::management::{DevicePolicy, ManagementPolicy};
+use crate::management::{DevicePolicy, ManagementPolicy, RuntimeState};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+/// A point-in-time bt-api view; cached presentation data is distinguished from live state.
 pub struct Snapshot {
     pub radio: RadioState,
     pub management: ManagementPolicy,
@@ -12,7 +13,26 @@ pub struct Snapshot {
     pub devices: Vec<Device>,
 }
 
+impl From<&Snapshot> for RuntimeState {
+    fn from(snapshot: &Snapshot) -> Self {
+        Self::observed(
+            snapshot
+                .adapters
+                .iter()
+                .map(|adapter| (adapter.key.clone(), adapter.powered))
+                .collect(),
+            snapshot
+                .devices
+                .iter()
+                .filter(|device| device.state.connected)
+                .map(|device| device.key.clone())
+                .collect(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+/// Adapter power combined with Linux soft/hard rfkill state.
 pub struct RadioState {
     pub available: bool,
     pub operational: bool,
@@ -24,6 +44,7 @@ pub struct RadioState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+/// BlueZ adapter properties addressed by a stable opaque key.
 pub struct Adapter {
     pub key: String,
     pub name: String,
@@ -40,6 +61,8 @@ pub struct Adapter {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// A device's identity, connection state, presentation, policy and permitted actions.
+/// The component structures are flattened when serialized for bt-api v1.
 pub struct Device {
     pub key: String,
     pub adapter_key: String,
@@ -56,6 +79,7 @@ pub struct Device {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// Display and transport identity; clients should address operations using `Device::key`.
 pub struct DeviceIdentity {
     pub name: String,
     pub alias: String,
@@ -68,6 +92,7 @@ pub struct DeviceIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// Observed BlueZ connection and security properties; absent optional values are unknown.
 pub struct DeviceState {
     pub paired: bool,
     pub bonded: Option<bool>,
@@ -79,6 +104,7 @@ pub struct DeviceState {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// Advertised service UUIDs and labels, with an explicit service-resolution flag.
 pub struct DeviceServices {
     pub services_resolved: bool,
     pub uuids: Vec<String>,
@@ -86,6 +112,7 @@ pub struct DeviceServices {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// UI metadata with freshness flags so remembered batteries and RSSI are not presented as live.
 pub struct DevicePresentation {
     pub battery: Vec<Battery>,
     pub battery_live: bool,
@@ -103,12 +130,14 @@ pub struct DevicePresentation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// An advertised UUID and its human-readable Bluetooth service label.
 pub struct Service {
     pub uuid: String,
     pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+/// A component battery reading, including provenance and optional charging information.
 pub struct Battery {
     pub id: String,
     pub label: String,
@@ -193,6 +222,7 @@ const TYPE_RULES: &[(&[&str], &str)] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// Observed Fast Pair capabilities and the prerequisites for authenticated controls.
 pub struct FastPairFeatures {
     pub model_id: Option<String>,
     pub ble_address: Option<String>,
@@ -208,6 +238,7 @@ pub struct FastPairFeatures {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// The most recent provider-reported audio switch and its observation time.
 pub struct FastPairSwitchEvent {
     pub reason: String,
     pub target: String,
@@ -216,6 +247,7 @@ pub struct FastPairSwitchEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Multipoint support, configurability and current state reported by Audio Switch.
 pub struct FastPairMultipoint {
     pub version: u16,
     pub supported: bool,
@@ -225,6 +257,7 @@ pub struct FastPairMultipoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Provider-advertised ANC modes; supported and settable modes may differ.
 pub struct FastPairNoiseControl {
     pub version: u8,
     pub available_modes: Vec<String>,
@@ -233,6 +266,8 @@ pub struct FastPairNoiseControl {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// Actions currently offered to clients, with reasons for unavailable operations.
+/// These are UI hints: backends revalidate state before performing an action.
 pub struct DeviceCapabilities {
     pub can_pair: bool,
     pub can_connect: bool,
