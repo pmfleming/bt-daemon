@@ -468,6 +468,7 @@ pub struct FastPairBatteryProvider {
     session: Session,
     identities: Arc<DeviceIdentityRegistry>,
     account_keys: AccountKeyStore,
+    management: Arc<crate::management::ManagementStore>,
     catalog: metadata::Catalog,
     paired_at: RwLock<HashMap<String, Instant>>,
     reports: RwLock<HashMap<Address, BatteryReport>>,
@@ -904,6 +905,7 @@ impl FastPairBatteryProvider {
     pub async fn start(
         session: Session,
         identities: Arc<DeviceIdentityRegistry>,
+        management: Arc<crate::management::ManagementStore>,
         changes: broadcast::Sender<()>,
     ) -> Result<Arc<Self>> {
         let uuids = FastPairUuids::parse().context("parse fixed Fast Pair UUIDs")?;
@@ -932,6 +934,7 @@ impl FastPairBatteryProvider {
             session,
             identities,
             account_keys,
+            management,
             catalog,
             paired_at: RwLock::new(HashMap::new()),
             reports: RwLock::new(HashMap::new()),
@@ -986,13 +989,13 @@ impl FastPairBatteryProvider {
                     .and_then(|data| metadata::advertised_model_id(data))
             });
         }
-        if reported.is_none() && runtime.model_id.is_none() {
-            return None;
-        }
         let device_key = self
             .identities
             .device_key(device.adapter_name(), device.address());
         let account_key_available = self.account_keys.get(&device_key).is_some();
+        if reported.is_none() && runtime.model_id.is_none() && !account_key_available {
+            return None;
+        }
         let model = runtime
             .model_id
             .as_ref()
@@ -1006,7 +1009,8 @@ impl FastPairBatteryProvider {
         Some(FastPairFeatures {
             authenticated_controls: connected
                 && runtime.session_nonce.is_some()
-                && account_key_available,
+                && account_key_available
+                && self.controls_enabled(&device_key),
             ..capabilities::describe(runtime, account_key_available, model, recent)
         })
     }
@@ -1053,7 +1057,7 @@ impl FastPairBatteryProvider {
         let key = self
             .identities
             .device_key(device.adapter_name(), device.address());
-        if self.account_keys.get(&key).is_some() {
+        if !self.controls_enabled(&key) || self.account_keys.get(&key).is_some() {
             return Ok(());
         }
         let uuids = device.uuids().await?.unwrap_or_default();
@@ -1222,6 +1226,12 @@ impl FastPairBatteryProvider {
         .context("timed out waiting for Fast Pair retroactive-pairing metadata")
     }
 
+    fn controls_enabled(&self, device_key: &str) -> bool {
+        self.management
+            .device_policy(device_key)
+            .fast_pair_controls_enabled
+    }
+
     async fn send_authenticated(
         &self,
         device: &Device,
@@ -1244,6 +1254,10 @@ impl FastPairBatteryProvider {
             .and_then(|state| state.session_nonce)
             .context("Fast Pair session nonce is unavailable")?;
         let device_key = self.identities.device_key(device.adapter_name(), address);
+        ensure!(
+            self.controls_enabled(&device_key),
+            "Fast Pair controls are disabled for this device"
+        );
         let account_key = self.account_keys.get(&device_key).context(
             "Fast Pair account key is unavailable; pair or provision this device through bt-daemon",
         )?;

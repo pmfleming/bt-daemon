@@ -54,6 +54,7 @@ pub struct DevicePolicy {
     pub trust_after_pair: bool,
     pub power_on_connect: bool,
     pub wait_for_services: bool,
+    pub fast_pair_controls_enabled: bool,
     pub audio_route_on_connect: String,
     pub preferred_audio_profile_key: Option<String>,
 }
@@ -69,12 +70,14 @@ struct DevicePolicyOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wait_for_services: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    fast_pair_controls_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     audio_route_on_connect: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preferred_audio_profile_key: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DevicePolicyFile {
     #[serde(default = "default_device_policy_version")]
     version: u8,
@@ -224,12 +227,14 @@ impl ManagementStore {
             .cloned()
             .unwrap_or_default();
         updated.apply(object)?;
+        let mut next = policies.clone();
         if updated.is_empty() {
-            policies.devices.remove(device_key);
+            next.devices.remove(device_key);
         } else {
-            policies.devices.insert(device_key.to_string(), updated);
+            next.devices.insert(device_key.to_string(), updated);
         }
-        self.persist_device_policies(&policies)?;
+        self.persist_device_policies(&next)?;
+        *policies = next;
         drop(policies);
         Ok(self.device_policy(device_key))
     }
@@ -326,6 +331,7 @@ impl DevicePolicyOverrides {
             trust_after_pair: self.trust_after_pair.unwrap_or(global.trust_after_pair),
             power_on_connect: self.power_on_connect.unwrap_or(true),
             wait_for_services: self.wait_for_services.unwrap_or(true),
+            fast_pair_controls_enabled: self.fast_pair_controls_enabled.unwrap_or(true),
             audio_route_on_connect: self
                 .audio_route_on_connect
                 .clone()
@@ -340,6 +346,10 @@ impl DevicePolicyOverrides {
             ("trust_after_pair", &mut self.trust_after_pair),
             ("power_on_connect", &mut self.power_on_connect),
             ("wait_for_services", &mut self.wait_for_services),
+            (
+                "fast_pair_controls_enabled",
+                &mut self.fast_pair_controls_enabled,
+            ),
         ] {
             update_optional_bool(object, name, target)?;
         }
@@ -369,6 +379,7 @@ impl DevicePolicyOverrides {
             && self.trust_after_pair.is_none()
             && self.power_on_connect.is_none()
             && self.wait_for_services.is_none()
+            && self.fast_pair_controls_enabled.is_none()
             && self.audio_route_on_connect.is_none()
             && self.preferred_audio_profile_key.is_none()
     }
@@ -424,6 +435,7 @@ fn validate_device_setting_names(object: &serde_json::Map<String, Value>) -> Res
         "trust_after_pair",
         "power_on_connect",
         "wait_for_services",
+        "fast_pair_controls_enabled",
         "audio_route_on_connect",
         "preferred_audio_profile_key",
     ];
@@ -514,6 +526,56 @@ mod tests {
         assert_eq!(policy.launch_state, "disable");
         assert!(!policy.trust_after_pair);
         assert_eq!(store.policy().preferred_adapter_key, "adapter-opaque");
+    }
+
+    #[test]
+    fn fast_pair_controls_can_be_disabled_persisted_reenabled_and_reset() {
+        let directory = std::env::temp_dir().join(format!("bt-policy-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("device-policy.json");
+        let store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
+        assert!(store.device_policy("buds").fast_pair_controls_enabled);
+        store
+            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": false}))
+            .unwrap();
+        assert!(!store.device_policy("buds").fast_pair_controls_enabled);
+        assert!(store.device_policy("other").fast_pair_controls_enabled);
+        drop(store);
+        let store = ManagementStore::load(None, None, Some(path)).unwrap();
+        assert!(!store.device_policy("buds").fast_pair_controls_enabled);
+        assert!(
+            store
+                .update_device_policy("buds", &json!({"fast_pair_controls_enabled": "yes"}))
+                .is_err()
+        );
+        assert!(!store.device_policy("buds").fast_pair_controls_enabled);
+        store
+            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": true}))
+            .unwrap();
+        assert!(store.device_policy("buds").fast_pair_controls_enabled);
+        store
+            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": false}))
+            .unwrap();
+        store
+            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": null}))
+            .unwrap();
+        assert!(store.device_policy("buds").fast_pair_controls_enabled);
+        assert!(!store.device_policy_lock().devices.contains_key("buds"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_device_policy_save_keeps_the_previous_state() {
+        let path = std::env::temp_dir().join(format!("bt-policy-blocker-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "not a directory").unwrap();
+        let mut store = ManagementStore::in_memory();
+        store.device_policy_path = Some(path.join("device-policy.json"));
+        assert!(
+            store
+                .update_device_policy("buds", &json!({"fast_pair_controls_enabled": false}))
+                .is_err()
+        );
+        assert!(store.device_policy("buds").fast_pair_controls_enabled);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

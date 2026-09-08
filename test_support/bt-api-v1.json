@@ -366,6 +366,7 @@
         "name": "bluetooth.device.policy.update",
         "params_example": {
           "audio_route_on_connect": "keep",
+          "fast_pair_controls_enabled": true,
           "key": "device-opaque",
           "power_on_connect": true,
           "preferred_audio_profile_key": null,
@@ -384,6 +385,12 @@
               ],
               "minLength": 1,
               "type": "string"
+            },
+            "fast_pair_controls_enabled": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "key": {
               "minLength": 1,
@@ -1032,6 +1039,7 @@
             "present": false,
             "policy": {
               "audio_route_on_connect": "keep",
+              "fast_pair_controls_enabled": true,
               "power_on_connect": true,
               "preferred_audio_profile_key": null,
               "reconnect_on_resume": true,

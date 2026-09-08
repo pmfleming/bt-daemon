@@ -36,7 +36,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = method_registry! {
     "bluetooth.scan", r#"{"adapter_key":"adapter-opaque","enabled":true,"timeout_ms":15000}"#, "scan", Some(stream::SCAN);
     "bluetooth.adapter.operation", r#"{"key":"adapter-opaque","operation":"set-discoverable","discoverable":true}"#, "snapshot", Some(stream::CHANGED);
     "bluetooth.management.update", r#"{"launch_state":"remember","reconnect_on_resume":true,"trust_after_pair":true,"preferred_adapter_key":"adapter-opaque","show_blocked_devices":false,"show_recent_devices":false}"#, "snapshot", Some(stream::CHANGED);
-    "bluetooth.device.policy.update", r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#, "snapshot", Some(stream::CHANGED);
+    "bluetooth.device.policy.update", r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"fast_pair_controls_enabled":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#, "snapshot", Some(stream::CHANGED);
     "bluetooth.obex.snapshot", "{}", "obex", None;
     "bluetooth.obex.send", r#"{"device_key":"device-opaque","path":"/selected/file"}"#, "transfer", Some(stream::OBEX);
     "bluetooth.obex.respond", r#"{"request_id":"obex-incoming-1","accept":true}"#, "authorization", Some(stream::OBEX);
@@ -176,6 +176,9 @@ fn apply_constraints(method: &str, property: &str, schema: &mut Value) {
     };
     if let Some(values) = enum_values {
         schema["enum"] = json!(values);
+    }
+    if method == "bluetooth.device.policy.update" && property == "fast_pair_controls_enabled" {
+        schema["type"] = json!(["boolean", "null"]);
     }
     if method == "bluetooth.scan" && property == "timeout_ms" {
         schema["minimum"] = json!(1_000);

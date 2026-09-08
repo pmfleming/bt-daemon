@@ -96,6 +96,7 @@ impl BluezBackend {
         let fast_pair = match FastPairBatteryProvider::start(
             session.clone(),
             Arc::clone(&identities),
+            Arc::clone(&management),
             changes.clone(),
         )
         .await
@@ -540,8 +541,11 @@ impl BluetoothBackend for BluezBackend {
     }
 
     async fn update_device_policy(&self, device_key: &str, params: &Value) -> Result<Snapshot> {
+        let gate = crate::task::device_gate(device_key);
+        let _exclusive = gate.lock().await;
         self.find_device(device_key).await?;
         self.management.update_device_policy(device_key, params)?;
+        let _ = self.changes.send(());
         self.snapshot().await
     }
 
@@ -584,6 +588,7 @@ impl BluetoothBackend for BluezBackend {
         let _exclusive = gate.lock().await;
         let (adapter, device) = self.find_device(device_key).await?;
         let policy = self.management.device_policy(device_key);
+        validate_fast_pair_control_policy(operation, &policy)?;
         let plan = operations::Plan::new(operation, params, &policy)?;
         operations::DeviceEffects {
             backend: self,
@@ -596,6 +601,15 @@ impl BluetoothBackend for BluezBackend {
         }
         .execute(plan)
         .await?;
+        if operation == DeviceOperation::ProvisionFastPair && !policy.fast_pair_controls_enabled {
+            self.management.update_device_policy(
+                device_key,
+                &serde_json::json!({
+                    "fast_pair_controls_enabled": true
+                }),
+            )?;
+            let _ = self.changes.send(());
+        }
         if operation == DeviceOperation::Remove {
             self.device_cache.lock().await.remove(device_key);
             self.identities.forget_presentation(device_key);
@@ -605,6 +619,21 @@ impl BluetoothBackend for BluezBackend {
         self.management.remember_snapshot(&snapshot);
         Ok(snapshot)
     }
+}
+
+fn validate_fast_pair_control_policy(
+    operation: DeviceOperation,
+    policy: &DevicePolicy,
+) -> Result<()> {
+    if !policy.fast_pair_controls_enabled
+        && matches!(
+            operation,
+            DeviceOperation::SetMultipoint | DeviceOperation::SetNoiseControl
+        )
+    {
+        bail!("Fast Pair controls are disabled for this device");
+    }
+    Ok(())
 }
 
 async fn find_adapter_address(
@@ -1185,6 +1214,51 @@ mod tests {
     use crate::backend::{BackendError, BackendErrorKind};
 
     use super::{bluez_result, validate_obex_send_state};
+
+    #[test]
+    fn disabled_fast_pair_policy_rejects_controls_but_preserves_bluetooth_operations() {
+        use crate::{backend::DeviceOperation, management::ManagementStore};
+        let store = ManagementStore::in_memory();
+        let policy = store
+            .update_device_policy(
+                "buds",
+                &serde_json::json!({
+                    "fast_pair_controls_enabled": false
+                }),
+            )
+            .unwrap();
+        for operation in [
+            DeviceOperation::SetNoiseControl,
+            DeviceOperation::SetMultipoint,
+        ] {
+            assert!(super::validate_fast_pair_control_policy(operation, &policy).is_err());
+        }
+        for operation in [
+            DeviceOperation::Connect,
+            DeviceOperation::Disconnect,
+            DeviceOperation::Pair,
+            DeviceOperation::ProvisionFastPair,
+            DeviceOperation::Remove,
+        ] {
+            assert!(super::validate_fast_pair_control_policy(operation, &policy).is_ok());
+        }
+        let policy = store
+            .update_device_policy(
+                "buds",
+                &serde_json::json!({
+                    "fast_pair_controls_enabled": true
+                }),
+            )
+            .unwrap();
+        assert!(
+            super::validate_fast_pair_control_policy(DeviceOperation::SetNoiseControl, &policy)
+                .is_ok()
+        );
+        assert!(
+            super::validate_fast_pair_control_policy(DeviceOperation::SetMultipoint, &policy)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn obex_policy_is_enforced() {
