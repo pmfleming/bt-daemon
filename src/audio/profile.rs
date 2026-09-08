@@ -24,6 +24,9 @@ pub(super) fn parse_profile(pod: &pw::spa::pod::Pod) -> Option<AudioProfile> {
     else {
         return None;
     };
+    if object.type_ != pw::spa::sys::SPA_TYPE_OBJECT_ParamProfile {
+        return None;
+    }
     let mut values = ProfileValues::default();
     for property in object.properties {
         values.apply(property.key, property.value);
@@ -44,22 +47,18 @@ impl ProfileValues {
     fn apply(&mut self, key: u32, value: pw::spa::pod::Value) {
         use pw::spa::pod::Value;
 
-        match value {
-            Value::Int(value) if key == pw::spa::sys::SPA_PARAM_PROFILE_index => {
-                self.index = u32::try_from(value).ok();
+        match (key, value) {
+            (pw::spa::sys::SPA_PARAM_PROFILE_index, Value::Int(value)) => {
+                self.index = u32::try_from(value).ok()
             }
-            Value::String(value) if key == pw::spa::sys::SPA_PARAM_PROFILE_name => {
-                self.name = Some(value);
+            (pw::spa::sys::SPA_PARAM_PROFILE_name, Value::String(value)) => self.name = Some(value),
+            (pw::spa::sys::SPA_PARAM_PROFILE_description, Value::String(value)) => {
+                self.description = Some(value)
             }
-            Value::String(value) if key == pw::spa::sys::SPA_PARAM_PROFILE_description => {
-                self.description = Some(value);
+            (pw::spa::sys::SPA_PARAM_PROFILE_available, Value::Id(value)) => {
+                self.available = value.0 != pw::spa::sys::SPA_PARAM_AVAILABILITY_no
             }
-            Value::Id(value) if key == pw::spa::sys::SPA_PARAM_PROFILE_available => {
-                self.available = value.0 != pw::spa::sys::SPA_PARAM_AVAILABILITY_no;
-            }
-            Value::Int(value) if key == pw::spa::sys::SPA_PARAM_PROFILE_priority => {
-                self.priority = value;
-            }
+            (pw::spa::sys::SPA_PARAM_PROFILE_priority, Value::Int(value)) => self.priority = value,
             _ => {}
         }
     }
@@ -90,6 +89,9 @@ pub(super) fn profile_mode(name: &str) -> &'static str {
         "other"
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn profile_codec(description: &str) -> Option<String> {
     let marker = "codec ";

@@ -86,7 +86,7 @@ pub(super) fn advertised_model_id(data: &[u8]) -> Option<[u8; 3]> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Catalog, advertised_model_id};
     #[test]
     fn catalog_checks_public_key_and_model_identity() {
         // SEC1 P-256 generator coordinates, for parser tests only (not production metadata).

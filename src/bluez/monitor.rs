@@ -121,77 +121,120 @@ pub(super) async fn run(backend: &BluezBackend) -> Result<()> {
             event = watches.streams.next() => event.context("BlueZ event streams ended")?,
             _ = expiration => { let _ = backend.changes.send(()); continue; }
         };
-        match event {
-            Event::Session(SessionEvent::AdapterAdded(name)) => {
-                watches.adapter(backend, &name).await?
-            }
-            Event::Session(SessionEvent::AdapterRemoved(name)) => watches.remove_adapter(&name),
-            Event::Adapter(name, AdapterEvent::DeviceAdded(address)) => {
-                // This is a real InterfacesAdded event, not BlueR's synthetic
-                // enumeration of cached devices at discovery start.
-                if let Ok(adapter) = backend.session.adapter(&name)
-                    && adapter.is_discovering().await.unwrap_or(false)
-                {
-                    let rssi = match adapter.device(address) {
-                        Ok(device) => device.rssi().await.ok().flatten(),
-                        Err(_) => None,
-                    };
-                    backend
-                        .observations
-                        .lock()
-                        .await
-                        .record(&name, address, rssi);
-                }
-                if let Err(error) = watches.device(backend, &name, address).await {
-                    tracing::debug!(%error, "new device disappeared before monitoring");
-                }
-            }
-            Event::Adapter(name, AdapterEvent::DeviceRemoved(address)) => {
-                watches.remove(&format!("{name}/{address}"))
-            }
-            Event::Device(adapter, address, DeviceEvent::PropertyChanged(property)) => {
-                // Preserve useful connection chronology without dumping arbitrary
-                // device properties (names/manufacturer data may be sensitive).
-                match property {
-                    DeviceProperty::Rssi(rssi) => {
-                        backend
-                            .observations
-                            .lock()
-                            .await
-                            .record(&adapter, address, Some(rssi))
-                    }
-                    DeviceProperty::Paired(paired) => {
-                        if let Some(provider) = &backend.fast_pair {
-                            provider.note_pairing(&adapter, address, paired).await;
-                        }
-                    }
-                    DeviceProperty::Connected(connected) => {
-                        if let Some(provider) = &backend.fast_pair {
-                            provider.note_connection_change(address).await;
-                        }
-                        tracing::info!(%adapter, %address, connected, "BlueZ device connection changed")
-                    }
-                    DeviceProperty::ServicesResolved(resolved) => {
-                        tracing::debug!(%adapter, %address, resolved, "BlueZ device services changed")
-                    }
-                    _ => {}
-                }
-            }
-            Event::Ended(key) => {
-                watches.remove(&key);
-                // An unexpected stream ending must be recovered, unlike ordinary
-                // property events. Rebuilding here is exceptional, not per-event.
-                anyhow::bail!("BlueZ subscription ended: {key}");
-            }
-            _ => {}
-        }
+        handle_event(backend, &mut watches, event).await?;
         let _ = backend.changes.send(());
+    }
+}
+
+async fn handle_event(backend: &BluezBackend, watches: &mut Watches, event: Event) -> Result<()> {
+    match event {
+        Event::Session(SessionEvent::AdapterAdded(name)) => watches.adapter(backend, &name).await?,
+        Event::Session(SessionEvent::AdapterRemoved(name)) => watches.remove_adapter(&name),
+        Event::Adapter(name, AdapterEvent::DeviceAdded(address)) => {
+            record_discovered_device(backend, &name, address).await;
+            if let Err(error) = watches.device(backend, &name, address).await {
+                tracing::debug!(%error, "new device disappeared before monitoring");
+            }
+        }
+        Event::Adapter(name, AdapterEvent::DeviceRemoved(address)) => {
+            watches.remove(&format!("{name}/{address}"));
+        }
+        Event::Device(adapter, address, DeviceEvent::PropertyChanged(property)) => {
+            handle_property(backend, &adapter, address, property).await;
+        }
+        Event::Ended(key) => {
+            watches.remove(&key);
+            // Recover an unexpectedly ended subscription, not every property change.
+            anyhow::bail!("BlueZ subscription ended: {key}");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn record_discovered_device(backend: &BluezBackend, name: &str, address: Address) {
+    // InterfacesAdded is a real observation; discovery-start enumeration is not.
+    let Ok(adapter) = backend.session.adapter(name) else {
+        return;
+    };
+    if !adapter.is_discovering().await.unwrap_or(false) {
+        return;
+    }
+    let rssi = match adapter.device(address) {
+        Ok(device) => device.rssi().await.ok().flatten(),
+        Err(_) => None,
+    };
+    backend
+        .observations
+        .lock()
+        .await
+        .record(name, address, rssi);
+}
+
+async fn handle_property(
+    backend: &BluezBackend,
+    adapter: &str,
+    address: Address,
+    property: DeviceProperty,
+) {
+    // Do not log arbitrary names/manufacturer data from device properties.
+    match property {
+        DeviceProperty::Rssi(rssi) => {
+            backend
+                .observations
+                .lock()
+                .await
+                .record(adapter, address, Some(rssi))
+        }
+        DeviceProperty::Paired(paired) => {
+            if let Some(provider) = &backend.fast_pair {
+                provider.note_pairing(adapter, address, paired).await;
+            }
+        }
+        DeviceProperty::Connected(connected) => {
+            if let Some(provider) = &backend.fast_pair {
+                provider.note_connection_change(address).await;
+            }
+            tracing::info!(%adapter, %address, connected, "BlueZ device connection changed");
+        }
+        DeviceProperty::ServicesResolved(resolved) => {
+            tracing::debug!(%adapter, %address, resolved, "BlueZ device services changed");
+        }
+        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Event, Watches};
+    use futures::StreamExt;
+    #[tokio::test]
+    async fn duplicate_watch_does_not_replace_a_live_subscription() {
+        let mut watches = Watches::default();
+        watches.insert("hci0".into(), futures::stream::pending().boxed());
+        watches.insert("hci0".into(), futures::stream::empty().boxed());
+        assert_eq!(watches.handles.len(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), watches.streams.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ended_and_removed_streams_release_their_slots() {
+        let mut watches = Watches::default();
+        watches.insert("hci0".into(), futures::stream::empty().boxed());
+        assert!(matches!(watches.streams.next().await, Some(Event::Ended(key)) if key == "hci0"));
+        watches.remove("hci0");
+        watches.remove("missing");
+        assert!(watches.handles.is_empty());
+        assert!(watches.streams.next().await.is_none());
+        watches.insert("hci0".into(), futures::stream::pending().boxed());
+        watches.remove("hci0");
+        assert!(watches.streams.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn removing_one_adapter_preserves_unrelated_subscriptions() {
         let mut watches = Watches::default();

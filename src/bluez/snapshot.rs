@@ -514,23 +514,19 @@ fn fast_pair_capabilities(
     has_fast_pair: bool,
     features: Option<&crate::model::FastPairFeatures>,
 ) -> (bool, bool, bool) {
-    let authenticated = paired
-        && connected
-        && has_fast_pair
-        && features.is_some_and(|features| features.authenticated_controls);
-    let provision = paired
-        && connected
-        && has_fast_pair
-        && features.is_some_and(|features| features.provisioning_available);
-    let multipoint = authenticated
+    let Some(features) = features.filter(|_| paired && connected && has_fast_pair) else {
+        return (false, false, false);
+    };
+    let multipoint = features.authenticated_controls
         && features
-            .and_then(|features| features.multipoint)
+            .multipoint
             .is_some_and(|multipoint| multipoint.supported && multipoint.configurable);
-    let noise_control = authenticated
+    let noise_control = features.authenticated_controls
         && features
-            .and_then(|features| features.noise_control.as_ref())
+            .noise_control
+            .as_ref()
             .is_some_and(|noise| noise.version == 2 && !noise.settable_modes.is_empty());
-    (provision, multipoint, noise_control)
+    (features.provisioning_available, multipoint, noise_control)
 }
 
 fn unsupported_reasons(
@@ -580,29 +576,37 @@ fn service_label(uuid: &str) -> &'static str {
     if uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID) {
         return "Fast Pair Service";
     }
-    match uuid
-        .get(4..8)
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "1105" => "Object Push",
-        "1108" => "Headset",
-        "110a" => "Audio Source",
-        "110b" => "Audio Sink",
-        "110c" => "A/V Remote Control Target",
-        "110d" => "Advanced Audio Distribution",
-        "110e" => "A/V Remote Control",
-        "1115" => "Personal Area Network",
-        "1116" => "Network Access Point",
-        "1117" => "Group Network",
-        "111e" => "Handsfree",
-        "1124" => "Human Interface Device",
-        "1200" => "Device Information",
-        "180f" => "Battery Service",
-        _ => "Bluetooth service",
-    }
+    // Only Bluetooth-base UUIDs carry assigned 16-bit service identifiers.
+    // A vendor UUID with the same four characters must not be mislabeled.
+    let normalized = uuid.to_ascii_lowercase();
+    let assigned = normalized
+        .strip_prefix("0000")
+        .and_then(|uuid| uuid.strip_suffix("-0000-1000-8000-00805f9b34fb"));
+    SERVICE_LABELS
+        .iter()
+        .find(|(id, _)| Some(*id) == assigned)
+        .map_or("Bluetooth service", |(_, label)| *label)
 }
+
+const SERVICE_LABELS: &[(&str, &str)] = &[
+    ("1105", "Object Push"),
+    ("1108", "Headset"),
+    ("110a", "Audio Source"),
+    ("110b", "Audio Sink"),
+    ("110c", "A/V Remote Control Target"),
+    ("110d", "Advanced Audio Distribution"),
+    ("110e", "A/V Remote Control"),
+    ("1115", "Personal Area Network"),
+    ("1116", "Network Access Point"),
+    ("1117", "Group Network"),
+    ("111e", "Handsfree"),
+    ("1124", "Human Interface Device"),
+    ("1200", "Device Information"),
+    ("180f", "Battery Service"),
+];
+
+#[cfg(test)]
+mod tests;
 
 async fn bonded_property(
     connection: &zbus::Connection,

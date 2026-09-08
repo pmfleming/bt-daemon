@@ -62,7 +62,9 @@ impl Observations {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Observations;
+    use bluer::Address;
+    use std::time::{Duration, Instant};
     #[test]
     fn reading_snapshots_does_not_refresh_last_seen_or_stopped_scan_signal() {
         let mut observations = Observations::default();

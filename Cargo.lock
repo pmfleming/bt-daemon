@@ -338,6 +338,7 @@ dependencies = [
  "sha2",
  "shelllist-daemon-core",
  "shelllist-daemon-tokio",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

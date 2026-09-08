@@ -56,7 +56,8 @@ impl RetryPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::RetryPolicy;
+    use bluer::Address;
     #[test]
     fn unavailable_stays_suppressed_until_a_new_physical_connection() {
         let mut retry = RetryPolicy::default();

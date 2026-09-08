@@ -90,7 +90,9 @@ impl Drop for Reservation<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::PendingCommands;
+    use bluer::Address;
+    use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn aborting_a_wait_releases_the_command_slot() {
