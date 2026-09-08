@@ -32,6 +32,8 @@ fn identical_snapshots_do_not_wake_subscribers() {
     assert!(!receiver.has_changed().unwrap());
 }
 
+mod routing;
+
 type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
 
 struct TestBackend {

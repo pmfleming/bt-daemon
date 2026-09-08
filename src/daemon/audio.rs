@@ -144,53 +144,57 @@ pub(super) async fn snapshot(pairing: Arc<PairingBroker>) -> Value {
     };
     let devices = devices
         .into_iter()
-        .filter_map(|device| {
-            let address = device_address(&device)?;
-            if device.adapter.is_empty() {
-                return None;
-            }
-            let device_key = pairing.device_key(&device.adapter, address);
-            let active_profile_key = device
-                .active_profile
-                .and_then(|active| {
-                    device
-                        .profiles
-                        .iter()
-                        .find(|profile| profile.index == active)
-                })
-                .map(|profile| audio::profile_key(&device_key, &profile.name));
-            let profiles = device
-                .profiles
-                .into_iter()
-                .map(|profile| {
-                    json!({
-                        "key": audio::profile_key(&device_key, &profile.name),
-                        "label": profile.description,
-                        "mode": profile.mode,
-                        "codec": profile.codec,
-                        "available": profile.available,
-                        "priority": profile.priority,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let endpoint = |kind: &str, value: Option<audio::AudioEndpoint>| {
-                value.map(|endpoint| {
-                    json!({
-                        "key": audio::endpoint_key(&device_key, kind),
-                        "ready": !matches!(endpoint.state.as_str(), "creating" | "error"),
-                        "state": endpoint.state,
-                        "is_default": endpoint.is_default,
-                    })
-                })
-            };
-            Some(json!({
-                "device_key": device_key,
-                "active_profile_key": active_profile_key,
-                "profiles": profiles,
-                "sink": endpoint("sink", device.sink),
-                "source": endpoint("source", device.source),
-            }))
-        })
+        .filter_map(|device| device_snapshot(&pairing, device))
         .collect::<Vec<_>>();
     api::success(json!({ "audio_devices": devices }))
 }
+
+fn device_snapshot(pairing: &PairingBroker, device: audio::AudioDevice) -> Option<Value> {
+    let address = device_address(&device)?;
+    if device.adapter.is_empty() {
+        return None;
+    }
+    let device_key = pairing.device_key(&device.adapter, address);
+    let active_profile_key = device
+        .active_profile
+        .and_then(|active| {
+            device
+                .profiles
+                .iter()
+                .find(|profile| profile.index == active)
+        })
+        .map(|profile| audio::profile_key(&device_key, &profile.name));
+    let profiles = device
+        .profiles
+        .into_iter()
+        .map(|profile| {
+            json!({
+                "key": audio::profile_key(&device_key, &profile.name),
+                "label": profile.description, "mode": profile.mode, "codec": profile.codec,
+                "available": profile.available, "priority": profile.priority,
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "device_key": device_key, "active_profile_key": active_profile_key, "profiles": profiles,
+        "sink": endpoint_snapshot(&device_key, "sink", device.sink),
+        "source": endpoint_snapshot(&device_key, "source", device.source),
+    }))
+}
+
+fn endpoint_snapshot(
+    device_key: &str,
+    kind: &str,
+    endpoint: Option<audio::AudioEndpoint>,
+) -> Option<Value> {
+    endpoint.map(|endpoint| {
+        json!({
+            "key": audio::endpoint_key(device_key, kind),
+            "ready": !matches!(endpoint.state.as_str(), "creating" | "error"),
+            "state": endpoint.state, "is_default": endpoint.is_default,
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests;

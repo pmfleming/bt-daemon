@@ -186,34 +186,70 @@ async fn forward_events<T>(
 }
 
 async fn forward_snapshots(
-    mut receiver: watch::Receiver<SharedSnapshot>,
+    receiver: watch::Receiver<SharedSnapshot>,
     emitter: SignalEmitter<'static>,
     subscription_id: String,
 ) {
-    let initial = receiver.borrow().clone();
-    emit_snapshot(&emitter, &initial, &subscription_id, "subscribed").await;
-    while receiver.changed().await.is_ok() {
-        let snapshot = receiver.borrow().clone();
-        emit_snapshot(&emitter, &snapshot, &subscription_id, "changed").await;
-    }
+    forward_watch(receiver, |snapshot, event| {
+        let emitter = emitter.clone();
+        let id = subscription_id.clone();
+        async move { emit_snapshot(&emitter, &snapshot, &id, event).await }
+    })
+    .await;
 }
 
 async fn forward_audio(
-    mut receiver: watch::Receiver<serde_json::Value>,
+    receiver: watch::Receiver<serde_json::Value>,
     emitter: SignalEmitter<'static>,
     subscription_id: String,
 ) {
-    let initial = receiver.borrow().clone();
-    emit_audio(&emitter, &initial, &subscription_id, "subscribed").await;
+    forward_watch(receiver, |snapshot, event| {
+        let emitter = emitter.clone();
+        let id = subscription_id.clone();
+        async move { emit_audio(&emitter, &snapshot, &id, event).await }
+    })
+    .await;
+}
+
+async fn forward_watch<T: Clone, F: Future<Output = ()>>(
+    mut receiver: watch::Receiver<T>,
+    mut emit: impl FnMut(T, &'static str) -> F,
+) {
+    // Mark exactly the cloned value as observed and release the watch lock before
+    // awaiting I/O. Otherwise an update can be delivered twice across the borrow.
+    let initial = receiver.borrow_and_update().clone();
+    emit(initial, "subscribed").await;
     while receiver.changed().await.is_ok() {
-        let snapshot = receiver.borrow().clone();
-        emit_audio(&emitter, &snapshot, &subscription_id, "changed").await;
+        let snapshot = receiver.borrow_and_update().clone();
+        emit(snapshot, "changed").await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::RequestedStreams;
+
+    #[tokio::test]
+    async fn watched_values_are_emitted_once_and_forwarder_stops_when_closed() {
+        let (updates, receiver) = tokio::sync::watch::channel(0);
+        updates.send_replace(1);
+        let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(super::forward_watch(receiver, move |value, event| {
+            events.send((value, event)).unwrap();
+            std::future::ready(())
+        }));
+        assert_eq!(observed.recv().await, Some((1, "subscribed")));
+        assert!(observed.try_recv().is_err());
+        updates.send_replace(2);
+        assert_eq!(observed.recv().await, Some((2, "changed")));
+        assert!(observed.try_recv().is_err());
+        drop(updates);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.recv().await, None);
+    }
 
     #[test]
     fn requested_streams_are_validated_and_deduplicated() {

@@ -444,46 +444,28 @@ pairing_callbacks! {
     callback_service(AuthorizeService) -> bluer::agent::AuthorizeServiceFn |broker, request|
         broker.request_value("service-authorization", request.adapter, request.device,
             None, Some(request.service.to_string()), PendingResponse::Unit).await;
+    callback_display_pin(DisplayPinCode) -> bluer::agent::DisplayPinCodeFn |broker, request|
+        begin_display(broker, "display-pin", request.adapter, request.device,
+            (request.pincode, None), request.cancel);
+    callback_display_passkey(DisplayPasskey) -> bluer::agent::DisplayPasskeyFn |broker, request|
+        begin_display(broker, "display-passkey", request.adapter, request.device,
+            (format!("{:06}", request.passkey), Some(request.entered)), request.cancel);
 }
 
-fn callback_display_pin(broker: Arc<PairingBroker>) -> bluer::agent::DisplayPinCodeFn {
-    Box::new(move |request: DisplayPinCode| {
-        let broker = Arc::clone(&broker);
-        Box::pin(async move {
-            let adapter = request.adapter;
-            let device = request.device;
-            let id = broker.display("display-pin", &adapter, device, request.pincode, None);
-            let watcher = Arc::clone(&broker);
-            crate::task::spawn("pairing-display-pin", async move {
-                let _ = request.cancel.await;
-                watcher.cancelled(id, "display-pin", &adapter, device, "cancelled");
-            });
-            Ok(())
-        })
-    })
-}
-
-fn callback_display_passkey(broker: Arc<PairingBroker>) -> bluer::agent::DisplayPasskeyFn {
-    Box::new(move |request: DisplayPasskey| {
-        let broker = Arc::clone(&broker);
-        Box::pin(async move {
-            let adapter = request.adapter;
-            let device = request.device;
-            let id = broker.display(
-                "display-passkey",
-                &adapter,
-                device,
-                format!("{:06}", request.passkey),
-                Some(request.entered),
-            );
-            let watcher = Arc::clone(&broker);
-            crate::task::spawn("pairing-display-passkey", async move {
-                let _ = request.cancel.await;
-                watcher.cancelled(id, "display-passkey", &adapter, device, "cancelled");
-            });
-            Ok(())
-        })
-    })
+fn begin_display(
+    broker: Arc<PairingBroker>,
+    kind: &'static str,
+    adapter: String,
+    device: Address,
+    value: (String, Option<u16>),
+    cancel: oneshot::Receiver<()>,
+) -> ReqResult<()> {
+    let id = broker.display(kind, &adapter, device, value.0, value.1);
+    crate::task::spawn("pairing-display", async move {
+        let _ = cancel.await;
+        broker.cancelled(id, kind, &adapter, device, "cancelled");
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -519,6 +501,38 @@ mod tests {
                 .await
         });
         (events, request)
+    }
+
+    #[tokio::test]
+    async fn display_interactions_clear_sensitive_values_on_cancellation() {
+        for (kind, entered) in [("display-pin", None), ("display-passkey", Some(2))] {
+            let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
+            let mut events = broker.subscribe();
+            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+            super::begin_display(
+                Arc::clone(&broker),
+                kind,
+                "hci0".into(),
+                bluer::Address::default(),
+                ("000123".into(), entered),
+                cancelled,
+            )
+            .unwrap();
+            let display = events.recv().await.unwrap();
+            assert_eq!(display.kind, kind);
+            assert_eq!(display.value.as_deref(), Some("000123"));
+            assert_eq!(display.entered, entered);
+            assert!(!display.response_required);
+            cancel.send(()).unwrap();
+            let terminal = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.event, "cancelled");
+            assert_eq!(terminal.request_id, display.request_id);
+            assert!(terminal.value.is_none() && terminal.entered.is_none());
+            assert!(broker.pending_events().is_empty());
+        }
     }
 
     #[test]
