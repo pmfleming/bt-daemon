@@ -42,6 +42,7 @@ pub struct BluetoothDaemon {
     pairing: Arc<PairingBroker>,
     subscriptions: Arc<OwnedTaskRegistry>,
     scan_owner_watches: Arc<Mutex<HashSet<String>>>,
+    tasks: Arc<shelllist_daemon_tokio::TaskGroup>,
     operations: OperationCoordinator,
     scans: ScanCoordinator,
     snapshots: watch::Sender<SharedSnapshot>,
@@ -116,8 +117,11 @@ impl BluetoothDaemon {
         drop(watches);
         let scans = self.scans.clone();
         let watches = Arc::clone(&self.scan_owner_watches);
-        crate::task::spawn("scan-owner-watch", async move {
-            let _ = shelllist_daemon_tokio::wait_for_owner_name_loss(&connection, &owner).await;
+        let monitor = self.subscriptions.owner_monitor(&connection);
+        self.tasks.spawn("scan-owner-watch", async move {
+            if let Err(error) = monitor.wait(&owner).await {
+                tracing::warn!(%owner, %error, "scan owner monitoring failed; releasing scans");
+            }
             tracing::info!(%owner, "D-Bus owner disappeared; releasing its Bluetooth scans");
             scans.stop_owner(&owner).await;
             watches.lock().await.remove(&owner);
@@ -261,14 +265,17 @@ async fn emit_stream<T: Serialize>(
     event: &str,
     data: &T,
 ) {
-    let value = shelllist_daemon_core::event_envelope(
+    let result = shelllist_daemon_tokio::emit_json_event(
+        emitter,
+        INTERFACE,
         shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
         stream,
         event,
         shelllist_daemon_core::Correlation::Subscription(subscription_id),
         json!({ "data": data }),
-    );
-    if let Err(error) = BluetoothDaemon::event(emitter, stream, &value.to_string()).await {
+    )
+    .await;
+    if let Err(error) = result {
         tracing::warn!(%error, %stream, %subscription_id, "could not emit subscription event");
     }
 }
@@ -319,6 +326,8 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         "snapshot-loading",
         "Bluetooth audio snapshot is loading".to_string(),
     ));
+    let subscriptions = Arc::new(OwnedTaskRegistry::default());
+    let tasks = Arc::new(shelllist_daemon_tokio::TaskGroup::default());
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
@@ -328,8 +337,9 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
             BluetoothDaemon {
                 backend: Arc::clone(&backend),
                 pairing: Arc::clone(&pairing),
-                subscriptions: Arc::new(OwnedTaskRegistry::default()),
+                subscriptions: Arc::clone(&subscriptions),
                 scan_owner_watches: Arc::new(Mutex::new(HashSet::new())),
+                tasks: Arc::clone(&tasks),
                 operations,
                 scans,
                 snapshots: snapshots.clone(),
@@ -352,7 +362,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     // are populated in the background.
     let snapshot_backend = Arc::clone(&backend);
     let snapshot_updates = snapshots.clone();
-    tokio::spawn(async move {
+    tasks.spawn("bluetooth-snapshots", async move {
         snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
         while receive_refresh(&mut changes, std::time::Duration::from_millis(80)).await {
             send_changed(&snapshot_updates, load_snapshot(&snapshot_backend).await);
@@ -360,7 +370,7 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     });
     let audio_updates = audio_snapshots.clone();
     let audio_pairing = Arc::clone(&pairing);
-    tokio::spawn(async move {
+    tasks.spawn("bluetooth-audio-snapshots", async move {
         audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
         while receive_refresh(&mut audio_changes, std::time::Duration::from_millis(150)).await {
             send_changed(
@@ -375,6 +385,8 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         "bt-daemon started"
     );
     let result = shelllist_daemon_tokio::wait_for_shutdown().await;
+    subscriptions.shutdown().await;
+    tasks.shutdown().await;
     drop(connection);
     result
 }

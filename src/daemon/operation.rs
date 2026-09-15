@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -8,6 +8,7 @@ use std::{
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use shelllist_daemon_core::{OperationLimits, OwnedOperations, RecentResults};
 use tokio::{
     sync::{Mutex, broadcast, oneshot},
     task::JoinHandle,
@@ -84,13 +85,22 @@ impl OperationEvent {
 struct OperationTask {
     handle: JoinHandle<()>,
     event: OperationEvent,
-    owner: Option<String>,
 }
 
-#[derive(Default)]
 struct OperationState {
-    tasks: HashMap<String, OperationTask>,
+    tasks: OwnedOperations<OperationTask>,
     active_devices: HashMap<String, String>,
+}
+impl Default for OperationState {
+    fn default() -> Self {
+        Self {
+            tasks: OwnedOperations::new(OperationLimits {
+                total: 256,
+                per_owner: 64,
+            }),
+            active_devices: HashMap::new(),
+        }
+    }
 }
 
 pub(super) struct OperationCoordinator {
@@ -98,7 +108,7 @@ pub(super) struct OperationCoordinator {
     sequence: AtomicU64,
     state: Arc<Mutex<OperationState>>,
     events: broadcast::Sender<OperationEvent>,
-    recent: Arc<Mutex<VecDeque<OperationEvent>>>,
+    recent: Arc<Mutex<RecentResults<OperationEvent>>>,
 }
 
 impl OperationCoordinator {
@@ -109,7 +119,7 @@ impl OperationCoordinator {
             sequence: AtomicU64::new(1),
             state: Arc::new(Mutex::new(OperationState::default())),
             events,
-            recent: Arc::new(Mutex::new(VecDeque::new())),
+            recent: Arc::new(Mutex::new(RecentResults::new(64, None))),
         }
     }
 
@@ -123,10 +133,16 @@ impl OperationCoordinator {
             .lock()
             .await
             .tasks
-            .values()
-            .map(|task| task.event.clone())
+            .iter()
+            .map(|(_, task)| task.value.event.clone())
             .collect::<Vec<_>>();
-        let recent = self.recent.lock().await.iter().cloned().collect::<Vec<_>>();
+        let recent = self
+            .recent
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         json!({ "active": active, "recent": recent })
     }
 
@@ -142,6 +158,9 @@ impl OperationCoordinator {
         };
 
         let mut state = self.state.lock().await;
+        if let Err(error) = state.tasks.admit(owner.as_deref()) {
+            return api::error("operation-unavailable", error.to_string());
+        }
         if let Some(request_id) = state.active_devices.get(&device_key) {
             tracing::warn!(%device_key, %request_id, "Bluetooth device operation rejected because the device is busy");
             return api::error(
@@ -172,14 +191,18 @@ impl OperationCoordinator {
                 .run(task_event, operation, params, start_receiver)
                 .await;
         });
-        state.tasks.insert(
+        let abort = handle.abort_handle();
+        if let Err(error) = state.tasks.insert(
             request_id.clone(),
+            owner,
             OperationTask {
                 handle,
                 event: queued.clone(),
-                owner,
             },
-        );
+        ) {
+            abort.abort();
+            return api::error("operation-unavailable", error.to_string());
+        }
         state.active_devices.insert(device_key, request_id);
         drop(state);
         let _ = start_sender.send(());
@@ -189,14 +212,10 @@ impl OperationCoordinator {
     pub(super) async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> bool {
         let task = {
             let mut state = self.state.lock().await;
-            if state
+            let task = state
                 .tasks
-                .get(request_id)
-                .is_none_or(|task| task.owner.as_deref() != owner)
-            {
-                return false;
-            }
-            let task = state.tasks.remove(request_id);
+                .claim_owned(request_id, owner)
+                .map(|entry| entry.value);
             if let Some(task) = &task
                 && state
                     .active_devices
@@ -220,7 +239,7 @@ impl OperationCoordinator {
 
     #[cfg(test)]
     pub(super) async fn is_empty(&self) -> bool {
-        self.state.lock().await.tasks.is_empty()
+        self.state.lock().await.tasks.iter().next().is_none()
     }
 }
 
@@ -237,7 +256,7 @@ struct OperationExecution {
     backend: Arc<dyn BluetoothBackend>,
     state: Arc<Mutex<OperationState>>,
     events: broadcast::Sender<OperationEvent>,
-    recent: Arc<Mutex<VecDeque<OperationEvent>>>,
+    recent: Arc<Mutex<RecentResults<OperationEvent>>>,
 }
 
 impl OperationExecution {
@@ -252,7 +271,9 @@ impl OperationExecution {
             return;
         }
         tracing::info!(request_id = %event.request_id, device_key = %event.device_key, %operation, "Bluetooth device operation started");
-        self.publish_started(&event).await;
+        if !self.publish_started(&event).await {
+            return;
+        }
         let progress = self.progress_reporter(&event);
         let result = crate::task::catch(
             "Bluetooth backend device operation",
@@ -262,17 +283,21 @@ impl OperationExecution {
         .await;
         log_operation_result(&event.request_id, &result);
         let terminal = event.clone().finished(result);
-        self.remove_active(&event).await;
-        retain_terminal(&self.recent, terminal.clone()).await;
-        let _ = self.events.send(terminal);
+        if self.remove_active(&event).await {
+            retain_terminal(&self.recent, terminal.clone()).await;
+            let _ = self.events.send(terminal);
+        }
     }
 
-    async fn publish_started(&self, event: &OperationEvent) {
+    async fn publish_started(&self, event: &OperationEvent) -> bool {
         let started = event.with_state("started", "running");
-        if let Some(task) = self.state.lock().await.tasks.get_mut(&event.request_id) {
-            task.event = started.clone();
-        }
+        let mut state = self.state.lock().await;
+        let Some(task) = state.tasks.get_mut(&event.request_id) else {
+            return false;
+        };
+        task.event = started.clone();
         let _ = self.events.send(started);
+        true
     }
 
     fn progress_reporter(&self, event: &OperationEvent) -> Arc<dyn Fn(&'static str) + Send + Sync> {
@@ -285,17 +310,20 @@ impl OperationExecution {
                 && let Some(task) = state.tasks.get_mut(&event.request_id)
             {
                 task.event = update.clone();
+                let _ = events.send(update);
             }
-            let _ = events.send(update);
         })
     }
 
-    async fn remove_active(&self, event: &OperationEvent) {
+    async fn remove_active(&self, event: &OperationEvent) -> bool {
         let mut state = self.state.lock().await;
-        state.tasks.remove(&event.request_id);
+        if state.tasks.claim(&event.request_id).is_none() {
+            return false;
+        }
         if state.active_devices.get(&event.device_key) == Some(&event.request_id) {
             state.active_devices.remove(&event.device_key);
         }
+        true
     }
 }
 
@@ -308,10 +336,10 @@ fn log_operation_result(request_id: &str, result: &anyhow::Result<crate::model::
     }
 }
 
-async fn retain_terminal(recent: &Mutex<VecDeque<OperationEvent>>, event: OperationEvent) {
-    let mut recent = recent.lock().await;
-    recent.push_back(event);
-    while recent.len() > 64 {
-        recent.pop_front();
-    }
+async fn retain_terminal(recent: &Mutex<RecentResults<OperationEvent>>, event: OperationEvent) {
+    // The existing requests snapshot is an aggregate API, not owner-private history.
+    recent
+        .lock()
+        .await
+        .record(event.request_id.clone(), None, event);
 }

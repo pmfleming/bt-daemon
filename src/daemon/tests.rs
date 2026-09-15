@@ -160,6 +160,7 @@ fn daemon(
             pairing: PairingBroker::new(DeviceIdentityRegistry::in_memory()),
             subscriptions: Arc::new(shelllist_daemon_tokio::OwnedTaskRegistry::default()),
             scan_owner_watches: Arc::new(Mutex::new(Default::default())),
+            tasks: Arc::new(shelllist_daemon_tokio::TaskGroup::default()),
             operations,
             scans,
             snapshots,
@@ -247,6 +248,44 @@ async fn active_operation_can_be_cancelled() {
         cancelled = events.recv().await.unwrap();
     }
     assert_eq!(cancelled.request_id, request_id);
+}
+
+#[tokio::test]
+async fn cancellation_and_completion_publish_one_terminal_result() {
+    for complete_first in [false, true] {
+        let (daemon, mut events, _) = daemon(true);
+        let response = start_operation(&daemon, "connect").await;
+        let id = response["data"]["operation"]["request_id"]
+            .as_str()
+            .unwrap();
+        if complete_first {
+            tokio::task::yield_now().await;
+        }
+        daemon.operations.cancel_owned(id, None).await;
+        let terminal = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event.event.as_str(), "completed" | "failed" | "cancelled") {
+                break event;
+            }
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            events.try_recv().is_err(),
+            "no progress or duplicate terminal event after {}",
+            terminal.event
+        );
+        assert!(!daemon.operations.cancel_owned(id, None).await);
+        assert_eq!(
+            daemon.operations.snapshot().await["recent"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
 
 #[tokio::test]

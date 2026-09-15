@@ -1,9 +1,10 @@
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 use serde::Serialize;
 use serde_json::json;
+use shelllist_daemon_tokio::{BroadcastEvent, WatchPhase, forward_broadcast, forward_watch};
 use tokio::{
-    sync::{broadcast, oneshot, watch},
+    sync::{broadcast, watch},
     task::JoinSet,
 };
 use zbus::{names::UniqueName, object_server::SignalEmitter};
@@ -78,13 +79,7 @@ pub(super) async fn start(
     let obex_events = daemon.obex.subscribe();
 
     tracing::info!(%subscription_id, %owner, ?streams, "subscription started");
-    let task_owner = owner.clone();
-    let subscriptions = Arc::clone(&daemon.subscriptions);
-    let (start_sender, start_receiver) = oneshot::channel();
-    let task = crate::task::spawn("subscription", async move {
-        if start_receiver.await.is_err() {
-            return;
-        }
+    let events = async move {
         let mut forwarders = JoinSet::new();
         spawn_if(
             &mut forwarders,
@@ -117,21 +112,20 @@ pub(super) async fn start(
         forward!(requested.operations, operation_events, OPERATION_STREAM);
         forward!(requested.scans, scan_events, SCAN_STREAM);
         forward!(requested.obex, obex_events, OBEX_STREAM);
-        forwarders.spawn(async move {
-            let _ = shelllist_daemon_tokio::wait_for_owner_loss(&connection, owner).await;
-        });
         if let Some(Err(error)) = forwarders.join_next().await {
             tracing::error!(%subscription_id, %error, "subscription forwarder task failed");
         }
         forwarders.abort_all();
-        subscriptions.remove(&subscription_id).await;
         tracing::info!(%subscription_id, "subscription ended");
-    });
-    daemon
-        .subscriptions
-        .insert(id.clone(), Some(task_owner.to_string()), task)
-        .await;
-    let _ = start_sender.send(());
+    };
+    if let Err(error) = daemon.subscriptions.spawn_for_owner(
+        id.clone(),
+        Some(owner.to_string()),
+        &connection,
+        events,
+    ) {
+        return api::error("subscription-unavailable", error.to_string()).to_string();
+    }
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
 }
 
@@ -146,7 +140,7 @@ fn spawn_if(
 }
 
 async fn forward_events<T>(
-    mut receiver: broadcast::Receiver<T>,
+    receiver: broadcast::Receiver<T>,
     emitter: SignalEmitter<'static>,
     stream: &'static str,
     subscription_id: String,
@@ -154,35 +148,34 @@ async fn forward_events<T>(
 ) where
     T: Clone + Send + Serialize + 'static,
 {
-    loop {
-        match receiver.recv().await {
-            Ok(event) => {
+    let emitter = &emitter;
+    let subscription_id = subscription_id.as_str();
+    forward_broadcast(receiver, move |update| async move {
+        match update {
+            BroadcastEvent::Item(event) => {
                 emit_stream(
-                    &emitter,
+                    emitter,
                     stream,
-                    &subscription_id,
+                    subscription_id,
                     event_name(&event),
                     &event,
                 )
                 .await;
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            BroadcastEvent::Lagged(skipped) => {
                 tracing::warn!(%subscription_id, %stream, skipped, "subscription events were dropped");
                 emit_stream(
-                    &emitter,
+                    emitter,
                     stream,
-                    &subscription_id,
+                    subscription_id,
                     "lagged",
                     &json!({ "skipped": skipped }),
                 )
                 .await;
             }
-            Err(broadcast::error::RecvError::Closed) => {
-                tracing::warn!(%subscription_id, %stream, "subscription event source closed");
-                break;
-            }
         }
-    }
+    }).await;
+    tracing::warn!(%subscription_id, %stream, "subscription event source closed");
 }
 
 async fn forward_snapshots(
@@ -193,7 +186,7 @@ async fn forward_snapshots(
     forward_watch(receiver, |snapshot, event| {
         let emitter = emitter.clone();
         let id = subscription_id.clone();
-        async move { emit_snapshot(&emitter, &snapshot, &id, event).await }
+        async move { emit_snapshot(&emitter, &snapshot, &id, watch_event(event)).await }
     })
     .await;
 }
@@ -206,22 +199,15 @@ async fn forward_audio(
     forward_watch(receiver, |snapshot, event| {
         let emitter = emitter.clone();
         let id = subscription_id.clone();
-        async move { emit_audio(&emitter, &snapshot, &id, event).await }
+        async move { emit_audio(&emitter, &snapshot, &id, watch_event(event)).await }
     })
     .await;
 }
 
-async fn forward_watch<T: Clone, F: Future<Output = ()>>(
-    mut receiver: watch::Receiver<T>,
-    mut emit: impl FnMut(T, &'static str) -> F,
-) {
-    // Mark exactly the cloned value as observed and release the watch lock before
-    // awaiting I/O. Otherwise an update can be delivered twice across the borrow.
-    let initial = receiver.borrow_and_update().clone();
-    emit(initial, "subscribed").await;
-    while receiver.changed().await.is_ok() {
-        let snapshot = receiver.borrow_and_update().clone();
-        emit(snapshot, "changed").await;
+fn watch_event(phase: WatchPhase) -> &'static str {
+    match phase {
+        WatchPhase::Initial => "subscribed",
+        WatchPhase::Changed => "changed",
     }
 }
 
@@ -238,10 +224,10 @@ mod tests {
             events.send((value, event)).unwrap();
             std::future::ready(())
         }));
-        assert_eq!(observed.recv().await, Some((1, "subscribed")));
+        assert_eq!(observed.recv().await, Some((1, super::WatchPhase::Initial)));
         assert!(observed.try_recv().is_err());
         updates.send_replace(2);
-        assert_eq!(observed.recv().await, Some((2, "changed")));
+        assert_eq!(observed.recv().await, Some((2, super::WatchPhase::Changed)));
         assert!(observed.try_recv().is_err());
         drop(updates);
         tokio::time::timeout(std::time::Duration::from_secs(1), task)
