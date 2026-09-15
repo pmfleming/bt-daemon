@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -271,19 +271,16 @@ impl ScanCoordinator {
             };
             let selected = selected_ids
                 .iter()
-                .cloned()
-                .collect::<std::collections::HashSet<_>>();
-            let active_adapters = tasks
-                .iter()
-                .filter(|(id, _)| !selected.contains(*id))
-                .flat_map(|(_, task)| task.event.adapter_keys.iter().cloned())
-                .collect::<std::collections::HashSet<_>>();
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let active_adapters = retained_adapters(&tasks, |id| selected.contains(id));
             let adapters = selected_ids
                 .iter()
                 .filter_map(|id| tasks.get(id))
-                .flat_map(|task| task.event.adapter_keys.iter().cloned())
-                .filter(|adapter| !active_adapters.contains(adapter))
-                .collect::<std::collections::HashSet<_>>()
+                .flat_map(|task| &task.event.adapter_keys)
+                .filter(|adapter| !active_adapters.contains(adapter.as_str()))
+                .cloned()
+                .collect::<HashSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
             (selected_ids, adapters)
@@ -337,19 +334,28 @@ async fn removable_adapters(
 ) -> Option<Vec<String>> {
     let active = tasks.lock().await;
     let finished = active.get(request_id)?;
+    let retained = retained_adapters(&active, |id| id == request_id);
     Some(
         finished
             .event
             .adapter_keys
             .iter()
-            .filter(|adapter| {
-                !active
-                    .iter()
-                    .any(|(id, task)| id != request_id && task.event.adapter_keys.contains(adapter))
-            })
+            .filter(|adapter| !retained.contains(adapter.as_str()))
             .cloned()
             .collect(),
     )
+}
+
+// Borrow keys while holding the task lock; clone only adapters actually stopped.
+fn retained_adapters(
+    tasks: &HashMap<String, ScanTask>,
+    selected: impl Fn(&str) -> bool,
+) -> HashSet<&str> {
+    tasks
+        .iter()
+        .filter(|(id, _)| !selected(id))
+        .flat_map(|(_, task)| task.event.adapter_keys.iter().map(String::as_str))
+        .collect()
 }
 
 fn terminal_event(
