@@ -6,10 +6,14 @@ The project uses BlueZ (`bluetoothd`) as its system backend. It uses the officia
 
 ## Nix development environment
 
+Keep `daemon-framework` beside this checkout. Cargo and the Nix helper use that
+same current framework, including tracked dirty edits. Never vendor or
+revision-pin it; persistent locks select third-party dependencies only.
+
 ```sh
 direnv allow
 # or without direnv:
-nix develop
+python3 ../daemon-framework/tools/local-build.py develop .
 ```
 
 The shell provides Rust, Cargo, Clippy, rustfmt, rust-analyzer, BlueZ tools, D-Bus development headers, `busctl`, `wpctl`, LLVM coverage tools, and `just`.
@@ -18,7 +22,7 @@ Run the development checks:
 
 ```sh
 just check
-nix flake check
+python3 ../daemon-framework/tools/local-build.py check .
 ```
 
 Verify access to BlueZ and print the current adapter/device snapshot, or run the read-only live acceptance smoke test:
@@ -33,8 +37,8 @@ The tracked interactive hardware matrix and rollout gates are in [`docs/hardware
 Build or run through Nix:
 
 ```sh
-nix build
-nix run -- probe-bluez
+python3 ../daemon-framework/tools/local-build.py build .
+python3 ../daemon-framework/tools/local-build.py run . -- probe-bluez
 ```
 
 ## Current status

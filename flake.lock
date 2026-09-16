@@ -1,26 +1,5 @@
 {
   "nodes": {
-    "daemonFramework": {
-      "inputs": {
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1789488442,
-        "narHash": "sha256-7qRB8gZa+j4a5U06nj4guQCp+gpIwv7VchrbeFPjnBM=",
-        "ref": "main",
-        "rev": "47d5a6505a8fbaebb48469d8e689e2743980e416",
-        "revCount": 35,
-        "type": "git",
-        "url": "file:../daemon-framework"
-      },
-      "original": {
-        "ref": "main",
-        "type": "git",
-        "url": "file:../daemon-framework"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1784280462,
@@ -39,7 +18,6 @@
     },
     "root": {
       "inputs": {
-        "daemonFramework": "daemonFramework",
         "nixpkgs": "nixpkgs"
       }
     }

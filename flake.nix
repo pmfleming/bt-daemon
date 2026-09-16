@@ -2,8 +2,10 @@
   description = "Bluetooth policy and API daemon for Shelllist";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  # Co-development: one live sibling framework; no per-daemon revision pins.
+  # Use ../daemon-framework/tools/local-build.py for Nix builds/checks.
   inputs.daemonFramework = {
-    url = "git+file:../daemon-framework?ref=main";
+    url = "git+file:../daemon-framework";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 
