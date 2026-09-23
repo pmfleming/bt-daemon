@@ -1010,17 +1010,20 @@ mod tests {
     use super::{reserve_incoming_destination_in, safe_file_name, validate_outgoing_path};
 
     #[test]
-    fn incoming_names_are_confined_to_the_download_directory() {
-        assert_eq!(safe_file_name("../../secret.txt"), "secret.txt");
-        assert_eq!(safe_file_name(".."), "bluetooth-transfer");
-        assert_eq!(safe_file_name("bad\nname.txt"), "badname.txt");
-    }
-
-    #[test]
-    fn incoming_names_do_not_overwrite_existing_files() {
+    fn incoming_files_are_confined_and_never_overwrite_existing_files() {
         let directory = std::env::temp_dir().join(format!("bt-obex-in-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("example.txt"), b"existing").unwrap();
+        for (name, safe) in [
+            ("../../secret.txt", "secret.txt"),
+            ("..", "bluetooth-transfer"),
+            ("bad\nname.txt", "badname.txt"),
+        ] {
+            let reserved =
+                reserve_incoming_destination_in(&directory, &safe_file_name(name)).unwrap();
+            assert_eq!(reserved, directory.join(safe));
+            assert!(reserved.is_file());
+        }
         assert_eq!(
             reserve_incoming_destination_in(&directory, "example.txt").unwrap(),
             directory.join("example (1).txt")
@@ -1028,6 +1031,10 @@ mod tests {
         assert_eq!(
             reserve_incoming_destination_in(&directory, "example.txt").unwrap(),
             directory.join("example (2).txt")
+        );
+        assert_eq!(
+            fs::read(directory.join("example.txt")).unwrap(),
+            b"existing"
         );
         fs::remove_dir_all(directory).unwrap();
     }

@@ -1,22 +1,37 @@
 use super::{
-    ConnectionState, Frame, LinkState, MessageStreamTransport, read_transport, write_transport,
+    ConnectionState, Frame, LinkState, MAX_FRAME_PAYLOAD, MessageStreamTransport, read_transport,
+    write_transport,
 };
 use bluer::Address;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[test]
-fn connected_transition_is_idempotent_and_preserves_connection_age() {
-    let address = Address::default();
+fn connection_lifecycle_preserves_transport_suppression_and_releases_writers() {
+    let peer = Address::default();
     let mut state = ConnectionState::default();
-    state.retry.failed(address);
-    assert!(!state.retry.ready(address));
-    assert!(state.mark_connected(address));
-    let since = state.connected_since[&address];
-    assert!(state.retry.ready(address));
-    assert_eq!(state.links[&address], LinkState::Connected);
-    assert!(!state.mark_connected(address));
-    assert_eq!(state.connected_since[&address], since);
+    state.retry.psm_unavailable(peer);
+    assert!(!state.begin(peer, MessageStreamTransport::L2cap));
+    assert!(state.begin(peer, MessageStreamTransport::Rfcomm));
+    assert!(!state.begin(peer, MessageStreamTransport::Rfcomm));
+    state.retry.failed(peer);
+    assert!(state.mark_connected(peer));
+    assert!(state.retry.ready(peer));
+    let since = state.connected_since[&peer];
+    assert!(!state.mark_connected(peer));
+    assert_eq!(state.connected_since[&peer], since);
+    assert!(!state.begin(peer, MessageStreamTransport::Rfcomm));
+    let (writer, mut receiver) = mpsc::channel(1);
+    state.writers.insert(peer, writer);
+    state.ended(peer);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+    assert!(!state.begin(peer, MessageStreamTransport::Rfcomm));
+    assert!(!state.retry.l2cap_allowed(peer));
+    state.retry.reset_session(peer);
+    assert!(state.begin(peer, MessageStreamTransport::L2cap));
 }
 
 #[test]
@@ -24,7 +39,7 @@ fn failed_connect_only_changes_the_matching_connecting_peer() {
     let pending = Address::default();
     let established = "AA:BB:CC:DD:EE:FF".parse().unwrap();
     let mut state = ConnectionState::default();
-    state.links.insert(pending, LinkState::Connecting);
+    state.begin(pending, MessageStreamTransport::Rfcomm);
     state.mark_connected(established);
     state.connection_failed(pending);
     assert!(!state.links.contains_key(&pending));
@@ -51,49 +66,19 @@ async fn only_a_stable_stream_resets_session_suppression_at_disconnect() {
     }
 }
 
-#[test]
-fn beginning_and_ending_connections_owns_links_writers_and_retry_state() {
-    let peer = Address::default();
-    let other = "11:22:33:44:55:66".parse().unwrap();
-    let mut state = ConnectionState::default();
-    assert!(state.begin(peer, MessageStreamTransport::Rfcomm));
-    assert!(!state.begin(peer, MessageStreamTransport::L2cap));
-    assert!(state.mark_connected(peer));
-    assert!(!state.begin(peer, MessageStreamTransport::Rfcomm));
-    state.mark_connected(other);
-    let (writer, mut receiver) = mpsc::channel(1);
-    state.writers.insert(peer, writer);
-    state.ended(peer);
-    assert!(receiver.try_recv().is_err());
-    assert!(!state.writers.contains_key(&peer));
-    assert!(!state.connected_since.contains_key(&peer));
-    assert!(!state.links.contains_key(&peer));
-    assert!(!state.begin(peer, MessageStreamTransport::Rfcomm));
-    assert_eq!(state.links[&other], LinkState::Connected);
-}
-
-#[test]
-fn l2cap_suppression_does_not_reserve_a_link_or_block_rfcomm() {
-    let peer = Address::default();
-    let mut state = ConnectionState::default();
-    state.retry.psm_unavailable(peer);
-    assert!(!state.begin(peer, MessageStreamTransport::L2cap));
-    assert!(!state.links.contains_key(&peer));
-    assert!(state.begin(peer, MessageStreamTransport::Rfcomm));
-}
-
 #[tokio::test]
-async fn framed_transport_roundtrips_under_backpressure_and_stops_on_eof() {
+async fn framed_transport_handles_backpressure_eof_and_propagates_failures() {
     let (writer, reader) = tokio::io::duplex(8);
     let (writes, writes_rx) = mpsc::channel(2);
-    writes
-        .send(Frame::encoded(3, 1, &[1, 2, 3]).unwrap())
-        .await
-        .unwrap();
-    writes
-        .send(Frame::encoded(8, 0x13, &[2, 0x28, 0x28, 0x20]).unwrap())
-        .await
-        .unwrap();
+    for (group, code, payload) in [
+        (3, 1, &[1, 2, 3][..]),
+        (8, 0x13, &[2, 0x28, 0x28, 0x20][..]),
+    ] {
+        writes
+            .send(Frame::encoded(group, code, payload).unwrap())
+            .await
+            .unwrap();
+    }
     drop(writes);
     let (frames, mut frames_rx) = mpsc::channel(1);
     let result = tokio::time::timeout(Duration::from_secs(1), async {
@@ -117,10 +102,7 @@ async fn framed_transport_roundtrips_under_backpressure_and_stops_on_eof() {
     assert_eq!(result.2[0].payload, [1, 2, 3]);
     assert_eq!(result.2[1].code, 0x13);
     assert_eq!(result.2[1].payload, [2, 0x28, 0x28, 0x20]);
-}
 
-#[tokio::test]
-async fn transport_and_decoder_errors_are_propagated() {
     let (writer, reader) = tokio::io::duplex(8);
     drop(reader);
     let (writes, writes_rx) = mpsc::channel(1);
@@ -128,10 +110,13 @@ async fn transport_and_decoder_errors_are_propagated() {
     drop(writes);
     assert!(write_transport(writer, writes_rx).await.is_err());
     let (frames, _frames_rx) = mpsc::channel(1);
+    let [high, low] = ((MAX_FRAME_PAYLOAD + 1) as u16).to_be_bytes();
     assert!(
-        read_transport(&[3, 1, 0xff, 0xff][..], frames)
+        read_transport(&[3, 1, high, low][..], frames)
             .await
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("too large")
     );
     let (frames, frames_rx) = mpsc::channel(1);
     drop(frames_rx);

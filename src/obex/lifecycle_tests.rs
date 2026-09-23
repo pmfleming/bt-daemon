@@ -52,7 +52,7 @@ fn pending(broker: &IncomingBroker, id: &str) -> oneshot::Receiver<Authorization
 }
 
 #[tokio::test]
-async fn cancellation_is_request_scoped_and_late_authorization_is_rejected() {
+async fn authorization_cancellation_is_scoped_until_agent_loss_and_rejects_late_answers() {
     let (broker, _) = broker();
     let cancelled = pending(&broker, "cancel");
     let accepted = pending(&broker, "accept");
@@ -68,6 +68,17 @@ async fn cancellation_is_request_scoped_and_late_authorization_is_rejected() {
         accepted.await.unwrap(),
         AuthorizationDecision::Accept
     ));
+    let first = pending(&broker, "first");
+    let second = pending(&broker, "second");
+    broker.cancel_authorizations().await;
+    for decision in [first, second] {
+        assert!(matches!(
+            decision.await.unwrap(),
+            AuthorizationDecision::Cancel
+        ));
+    }
+    assert!(broker.respond("first", true).await.is_err());
+    assert!(broker.respond("second", true).await.is_err());
 }
 
 #[tokio::test]
@@ -92,23 +103,6 @@ async fn active_transfer_cancel_does_not_cancel_another_transfer() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     assert!(!broker.cancel_transfer("missing").await);
-}
-
-#[tokio::test]
-async fn obex_agent_loss_cancels_all_waiting_authorizations() {
-    let (broker, _) = broker();
-    let first = pending(&broker, "first");
-    let second = pending(&broker, "second");
-    broker.cancel_authorizations().await;
-    assert!(matches!(
-        first.await.unwrap(),
-        AuthorizationDecision::Cancel
-    ));
-    assert!(matches!(
-        second.await.unwrap(),
-        AuthorizationDecision::Cancel
-    ));
-    assert!(broker.pending.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

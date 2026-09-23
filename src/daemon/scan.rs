@@ -312,11 +312,6 @@ impl ScanCoordinator {
         }
         api::success(json!({ "stopped": request_id, "snapshot": last_snapshot }))
     }
-
-    #[cfg(test)]
-    pub(super) async fn is_empty(&self) -> bool {
-        self.tasks.lock().await.is_empty()
-    }
 }
 
 async fn removable_adapters(

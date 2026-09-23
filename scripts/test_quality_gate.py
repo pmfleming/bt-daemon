@@ -1,4 +1,3 @@
-import copy
 import json
 from pathlib import Path
 import tempfile
@@ -30,18 +29,17 @@ class QualityGateTests(unittest.TestCase):
             with self.subTest(value=value):
                 failures = evaluate({**self.metrics, "line_coverage_percent": value}, self.config)
                 self.assertEqual(len(failures), 1)
+        report = compare({"branch_coverage_percent": None}, {"branch_coverage_percent": None})
+        self.assertEqual(report["branch_coverage_percent"]["direction"], "unavailable")
+        self.assertIsNone(report["branch_coverage_percent"]["current"])
 
-    def test_empty_or_unknown_configuration_is_not_a_disabled_gate(self):
-        for config in [None, [], {}, {"schema_version": True, "metrics": {}}, {"schema_version": 1, "metrics": {}},
-                       {"schema_version": 1, "metrics": {"typo": {"min": 0}}}]:
+    def test_invalid_configuration_never_disables_the_gate(self):
+        configs = [None, [], {}, {"schema_version": True, "metrics": {}}, {"schema_version": 1, "metrics": {}},
+                   {"schema_version": 1, "metrics": {"typo": {"min": 0}}}]
+        configs.extend({"schema_version": 1, "metrics": {"line_coverage_percent": bounds}}
+                       for bounds in [{}, {"minimum": 5}, {"min": True}, {"max": float("nan")}, {"min": 100, "max": 50}])
+        for config in configs:
             with self.subTest(config=config), self.assertRaises(ValueError):
-                evaluate(self.metrics, config)
-
-    def test_invalid_bounds_are_configuration_errors(self):
-        for bounds in [{}, {"minimum": 5}, {"min": True}, {"max": float("nan")}, {"min": 100, "max": 50}]:
-            config = copy.deepcopy(self.config)
-            config["metrics"]["line_coverage_percent"] = bounds
-            with self.subTest(bounds=bounds), self.assertRaises(ValueError):
                 evaluate(self.metrics, config)
 
     def test_incomplete_missing_and_malformed_artifacts_fail_closed(self):
@@ -56,11 +54,6 @@ class QualityGateTests(unittest.TestCase):
             api.write_text("{malformed")
             with self.assertRaises(json.JSONDecodeError):
                 measurements(path)
-
-    def test_comparison_keeps_unavailable_branch_coverage_unknown(self):
-        report = compare({"branch_coverage_percent": None}, {"branch_coverage_percent": None})
-        self.assertEqual(report["branch_coverage_percent"]["direction"], "unavailable")
-        self.assertIsNone(report["branch_coverage_percent"]["current"])
 
 
 if __name__ == "__main__":

@@ -205,27 +205,22 @@ mod tests {
         assert!(!device.presentation.present);
         assert!(cache_entry(&device, 100).is_none());
         assert!(!device.capabilities.can_wake);
-    }
-
-    #[test]
-    fn captured_connection_and_block_state_determine_capabilities() {
-        for (connected, blocked, can_connect, can_disconnect) in [
-            (false, false, true, false),
-            (true, false, false, true),
-            (false, true, false, false),
-            (true, true, false, true),
+        for (rssi, expected) in [
+            (i16::MIN, 0),
+            (-100, 0),
+            (-70, 50),
+            (-40, 100),
+            (i16::MAX, 100),
         ] {
-            let mut input = reading();
-            input.state.connected = connected;
-            input.state.blocked = blocked;
-            input.state.paired = true;
-            input.bonded = Some(true);
-            let device = assemble(input, Signal::resolve(None, None, false));
-            assert_eq!(device.presentation.present, connected);
-            assert_eq!(device.capabilities.can_connect, can_connect);
-            assert_eq!(device.capabilities.can_disconnect, can_disconnect);
-            assert_eq!(device.capabilities.can_send_file, !blocked);
-            assert_eq!(device.state.bonded, Some(true));
+            let signal = Signal {
+                rssi: Some(rssi),
+                last_seen_ms: None,
+                live: false,
+            };
+            assert_eq!(
+                assemble(reading(), signal).presentation.signal_strength,
+                Some(expected)
+            );
         }
     }
 
@@ -250,8 +245,12 @@ mod tests {
         assert!(cache_entry(&stale, 1000).is_none());
         let mut connected = reading();
         connected.state.connected = true;
+        connected.bonded = Some(true);
         let current = assemble(connected, Signal::resolve(None, Some(&cached), false));
         assert_eq!(cache_entry(&current, 1000).unwrap().observed_at_ms, 1000);
+        assert!(current.presentation.present && current.capabilities.can_disconnect);
+        assert!(!current.capabilities.can_connect);
+        assert_eq!(current.state.bonded, Some(true));
     }
 
     #[test]

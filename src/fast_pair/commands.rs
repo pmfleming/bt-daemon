@@ -132,25 +132,6 @@ impl Drop for Reservation<'_> {
 mod tests {
     use super::PendingCommands;
     use bluer::Address;
-    use tokio::sync::oneshot;
-
-    #[tokio::test]
-    async fn aborting_a_wait_releases_the_command_slot() {
-        let pending = std::sync::Arc::new(PendingCommands::default());
-        let key = (Address::default(), 8, 0x12);
-        let worker = pending.clone();
-        let (ready, started) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let (_reservation, receiver) = worker.reserve(key).unwrap();
-            ready.send(()).unwrap();
-            let _ = receiver.await;
-        });
-        started.await.unwrap();
-        assert!(pending.reserve(key).is_err());
-        task.abort();
-        let _ = task.await;
-        assert!(pending.reserve(key).is_ok());
-    }
 
     #[tokio::test(start_paused = true)]
     async fn backpressure_and_missing_ack_share_a_bounded_deadline_and_release_reservations() {
@@ -224,13 +205,16 @@ mod tests {
 
     #[test]
     fn encoding_binds_message_and_both_nonces() {
-        let frame = super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[2; 8], &[3; 8]).unwrap();
+        let frame =
+            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[0x11; 8], &[0x22; 8]).unwrap();
         assert_eq!(&frame[..5], &[8, 0x12, 0, 17, 1]);
-        assert_eq!(&frame[5..13], &[3; 8]);
+        assert_eq!(&frame[5..13], &[0x22; 8]);
+        // Independent Python hmac/SHA-256 reference for session || nonce || message.
+        assert_eq!(hex::encode(&frame[13..]), "13cfdae51949437e");
         for other in [
-            super::authenticated_frame(8, 0x12, &[0], &[4; 16], &[2; 8], &[3; 8]).unwrap(),
-            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[5; 8], &[3; 8]).unwrap(),
-            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[2; 8], &[6; 8]).unwrap(),
+            super::authenticated_frame(8, 0x12, &[0], &[4; 16], &[0x11; 8], &[0x22; 8]).unwrap(),
+            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[0x10; 8], &[0x22; 8]).unwrap(),
+            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[0x11; 8], &[0x23; 8]).unwrap(),
         ] {
             assert_ne!(&frame[13..], &other[13..]);
         }

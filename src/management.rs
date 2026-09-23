@@ -479,41 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn fast_pair_controls_can_be_disabled_persisted_reenabled_and_reset() {
-        let directory = std::env::temp_dir().join(format!("bt-policy-{}", uuid::Uuid::new_v4()));
-        let path = directory.join("device-policy.json");
-        let store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
-        assert!(store.device_policy("buds").fast_pair_controls_enabled);
-        store
-            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": false}))
-            .unwrap();
-        assert!(!store.device_policy("buds").fast_pair_controls_enabled);
-        assert!(store.device_policy("other").fast_pair_controls_enabled);
-        drop(store);
-        let store = ManagementStore::load(None, None, Some(path)).unwrap();
-        assert!(!store.device_policy("buds").fast_pair_controls_enabled);
-        assert!(
-            store
-                .update_device_policy("buds", &json!({"fast_pair_controls_enabled": "yes"}))
-                .is_err()
-        );
-        assert!(!store.device_policy("buds").fast_pair_controls_enabled);
-        store
-            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": true}))
-            .unwrap();
-        assert!(store.device_policy("buds").fast_pair_controls_enabled);
-        store
-            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": false}))
-            .unwrap();
-        store
-            .update_device_policy("buds", &json!({"fast_pair_controls_enabled": null}))
-            .unwrap();
-        assert!(store.device_policy("buds").fast_pair_controls_enabled);
-        assert!(!store.device_policy_lock().devices.contains_key("buds"));
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn failed_device_policy_save_keeps_the_previous_state() {
         let path = std::env::temp_dir().join(format!("bt-policy-blocker-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, "not a directory").unwrap();
@@ -529,8 +494,10 @@ mod tests {
     }
 
     #[test]
-    fn device_policy_overrides_and_clears_global_defaults() {
-        let store = ManagementStore::in_memory();
+    fn device_policy_overrides_persist_validate_and_reset_without_affecting_other_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device-policy.json");
+        let mut store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
         let defaults = store.device_policy("peer");
         for (name, value, invalid) in [
             ("reconnect_on_resume", json!(false), json!("yes")),
@@ -545,6 +512,9 @@ mod tests {
                 .update_device_policy("peer", &json!({name: value}))
                 .unwrap();
             assert_eq!(serde_json::to_value(&policy).unwrap()[name], value);
+            store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
+            assert_eq!(store.device_policy("peer"), policy);
+            assert_eq!(store.device_policy("other"), defaults);
             assert!(
                 store
                     .update_device_policy("peer", &json!({name: invalid}))
@@ -568,5 +538,7 @@ mod tests {
         );
         assert_eq!(store.device_policy("peer"), defaults);
         assert!(!store.device_policy_lock().devices.contains_key("peer"));
+        let restored = ManagementStore::load(None, None, Some(path)).unwrap();
+        assert_eq!(restored.device_policy("peer"), defaults);
     }
 }

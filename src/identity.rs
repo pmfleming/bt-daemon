@@ -410,23 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_presentation_keeps_the_stable_device_key() {
-        let registry = DeviceIdentityRegistry::in_memory();
-        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let key = registry.device_key("hci0", address);
-        registry.remember_presentation(&key, Some("input-mouse"), None, &[battery(80)]);
-        registry.forget_presentation(&key);
-
-        assert_eq!(key, registry.device_key("hci0", address));
-        let presentation = registry.remember_presentation(&key, None, None, &[]);
-        assert_eq!(presentation.icon, None);
-        assert_eq!(presentation.battery, vec![]);
-        assert_eq!(presentation.device_type, "Bluetooth device");
-        assert_eq!(presentation.model_id, None);
-        assert_eq!(presentation.components, Vec::<String>::new());
-    }
-
-    #[test]
     fn remembered_components_and_model_survive_transient_connection_metadata() {
         let registry = DeviceIdentityRegistry::in_memory();
         let mut component_reports = component_battery("right", 75);

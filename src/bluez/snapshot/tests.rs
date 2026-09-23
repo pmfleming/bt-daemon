@@ -1,6 +1,6 @@
 use super::{
     SERVICE_LABELS, cache_entry_is_fresh, cached_device_view, device_capabilities,
-    fast_pair_capabilities, presentation, service_label, should_include_device, signal_strength,
+    fast_pair_capabilities, presentation, service_label,
 };
 use crate::bluez::{CachedDevice, DISCOVERED_DEVICE_CACHE_TTL};
 use crate::fast_pair::{FAST_PAIR_SERVICE_UUID, MESSAGE_STREAM_UUID};
@@ -62,34 +62,7 @@ fn assigned_service_labels_require_the_bluetooth_base_uuid() {
 }
 
 #[test]
-fn visibility_cache_and_signal_boundaries_are_explicit() {
-    for paired in [false, true] {
-        for present in [false, true] {
-            for cached in [false, true] {
-                assert_eq!(
-                    should_include_device(paired, present, cached),
-                    paired || present || cached
-                );
-            }
-        }
-    }
-    let ttl = DISCOVERED_DEVICE_CACHE_TTL.as_millis() as u64;
-    assert!(cache_entry_is_fresh(100, 100 + ttl));
-    assert!(!cache_entry_is_fresh(100, 101 + ttl));
-    assert!(cache_entry_is_fresh(100, 99));
-    for (rssi, expected) in [
-        (i16::MIN, 0),
-        (-100, 0),
-        (-70, 50),
-        (-40, 100),
-        (i16::MAX, 100),
-    ] {
-        assert_eq!(signal_strength(rssi), expected);
-    }
-}
-
-#[test]
-fn fast_pair_controls_require_live_authenticated_supported_features() {
+fn device_capabilities_enforce_connection_authentication_and_block_policy() {
     let mut features = features();
     for (paired, connected, advertised) in [
         (false, true, true),
@@ -122,11 +95,7 @@ fn fast_pair_controls_require_live_authenticated_supported_features() {
         fast_pair_capabilities(true, true, true, Some(&features)),
         (false, false, false)
     );
-}
-
-#[test]
-fn blocked_devices_cannot_connect_pair_send_or_use_fast_pair_controls() {
-    let features = features();
+    let features = self::features();
     for paired in [false, true] {
         for connected in [false, true] {
             let blocked = device_capabilities(paired, connected, true, None, true, Some(&features));
@@ -177,6 +146,10 @@ fn presentation_restores_paired_history_but_not_live_or_unpaired_batteries() {
         !connected_without_battery.battery_live && !connected_without_battery.battery_last_known
     );
     let unpaired = presentation(&identities, &key, false, false, None, None, vec![]);
+    assert_eq!(
+        key,
+        identities.device_key("hci0", bluer::Address::default())
+    );
     assert_eq!(unpaired.device_type, "Bluetooth device");
     assert!(unpaired.battery.is_empty() && unpaired.model_id.is_none());
     let repaired = presentation(&identities, &key, true, false, None, None, vec![]);
@@ -184,7 +157,11 @@ fn presentation_restores_paired_history_but_not_live_or_unpaired_batteries() {
 }
 
 #[test]
-fn cached_device_views_remove_live_state_and_authenticated_controls() {
+fn cached_device_views_expire_and_never_claim_live_state() {
+    let ttl = DISCOVERED_DEVICE_CACHE_TTL.as_millis() as u64;
+    assert!(cache_entry_is_fresh(100, 100 + ttl));
+    assert!(!cache_entry_is_fresh(100, 101 + ttl));
+    assert!(cache_entry_is_fresh(100, 99));
     let device = Device {
         key: "device-test".into(),
         adapter_key: "adapter-test".into(),

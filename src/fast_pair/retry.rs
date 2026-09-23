@@ -60,7 +60,7 @@ mod tests {
     use super::RetryPolicy;
     use bluer::Address;
     #[tokio::test(start_paused = true)]
-    async fn retry_deadlines_are_bounded_and_testable_without_sleeping() {
+    async fn retries_are_bounded_and_psm_suppression_requires_a_new_session() {
         let peer = Address::default();
         let mut retry = RetryPolicy::default();
         for _ in 0..12 {
@@ -74,35 +74,18 @@ mod tests {
             assert!(retry.ready(peer));
         }
         retry.reset_session(peer);
-        assert!(retry.ready(peer));
-    }
-
-    #[test]
-    fn unavailable_stays_suppressed_until_a_new_physical_connection() {
-        let mut retry = RetryPolicy::default();
-        let address = Address::default();
-        retry.psm_unavailable(address);
-        retry.connected(address);
-        assert!(!retry.l2cap_allowed(address));
-        retry.reset_session(address);
-        assert!(retry.l2cap_allowed(address));
-    }
-    #[test]
-    fn unknown_psm_has_a_bounded_budget_and_failures_back_off() {
-        let mut retry = RetryPolicy::default();
-        let address = Address::default();
         for _ in 0..2 {
-            retry.psm_unknown(address);
-            assert!(retry.l2cap_allowed(address));
+            retry.psm_unknown(peer);
+            assert!(retry.l2cap_allowed(peer));
         }
-        retry.psm_unknown(address);
-        assert!(!retry.l2cap_allowed(address));
-        retry.failed(address);
-        let first = retry.after[&address];
-        retry.failed(address);
-        assert!(retry.after[&address] > first);
-        assert!(!retry.ready(address));
-        retry.reset_session(address);
-        assert!(retry.ready(address));
+        retry.psm_unknown(peer);
+        assert!(!retry.l2cap_allowed(peer));
+        retry.failed(peer);
+        assert!(!retry.ready(peer));
+        retry.connected(peer);
+        assert!(retry.ready(peer));
+        assert!(!retry.l2cap_allowed(peer));
+        retry.reset_session(peer);
+        assert!(retry.ready(peer) && retry.l2cap_allowed(peer));
     }
 }

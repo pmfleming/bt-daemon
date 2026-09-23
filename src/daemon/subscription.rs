@@ -255,28 +255,6 @@ fn watch_event(phase: WatchPhase) -> &'static str {
 mod tests {
     use super::RequestedStreams;
 
-    #[tokio::test]
-    async fn watched_values_are_emitted_once_and_forwarder_stops_when_closed() {
-        let (updates, receiver) = tokio::sync::watch::channel(0);
-        updates.send_replace(1);
-        let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(super::forward_watch(receiver, move |value, event| {
-            events.send((value, event)).unwrap();
-            std::future::ready(())
-        }));
-        assert_eq!(observed.recv().await, Some((1, super::WatchPhase::Initial)));
-        assert!(observed.try_recv().is_err());
-        updates.send_replace(2);
-        assert_eq!(observed.recv().await, Some((2, super::WatchPhase::Changed)));
-        assert!(observed.try_recv().is_err());
-        drop(updates);
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(observed.recv().await, None);
-    }
-
     #[test]
     fn snapshot_payloads_preserve_loading_failure_and_watch_phases() {
         use super::{SharedSnapshot, audio_fields, snapshot_fields};

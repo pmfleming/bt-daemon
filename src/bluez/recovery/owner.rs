@@ -49,80 +49,67 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn owner_loss_cancels_a_retrying_candidate_and_only_latest_owner_is_installed() {
-        let (events, stream) = mpsc::unbounded();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let changes = log.clone();
-        let worker = tokio::spawn(drive(stream, move |owner| {
-            let log = changes.clone();
-            async move {
-                if owner.is_empty() {
-                    log.lock().unwrap().push("unavailable".into());
-                    return;
+    async fn owner_changes_and_stream_loss_discard_stale_candidates() {
+        for stream_error in [false, true] {
+            let (events, stream) = mpsc::unbounded();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let changes = log.clone();
+            let worker = tokio::spawn(drive(stream, move |owner| {
+                let log = changes.clone();
+                async move {
+                    if owner.is_empty() {
+                        log.lock().unwrap().push("unavailable".into());
+                        return;
+                    }
+                    let _candidate = Candidate(log.clone(), owner.clone());
+                    log.lock().unwrap().push(format!("start:{owner}"));
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    log.lock().unwrap().push(format!("install:{owner}"));
                 }
-                let _candidate = Candidate(log.clone(), owner.clone());
-                log.lock().unwrap().push(format!("start:{owner}"));
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                log.lock().unwrap().push(format!("install:{owner}"));
+            }));
+            let emit = |name: &str, old: &str, new: &str| {
+                events
+                    .unbounded_send(Ok((name.into(), old.into(), new.into())))
+                    .unwrap()
+            };
+            emit("org.bluez", "", "old");
+            tokio::task::yield_now().await;
+            emit("unrelated", "", "ignored");
+            emit("org.bluez", "old", "old");
+            tokio::task::yield_now().await;
+            assert_eq!(*log.lock().unwrap(), ["start:old"]);
+            emit("org.bluez", "old", "");
+            tokio::task::yield_now().await;
+            assert_eq!(
+                *log.lock().unwrap(),
+                ["start:old", "drop:old", "unavailable"]
+            );
+            emit("org.bluez", "", "new");
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                *log.lock().unwrap(),
+                [
+                    "start:old",
+                    "drop:old",
+                    "unavailable",
+                    "start:new",
+                    "install:new",
+                    "drop:new"
+                ]
+            );
+            emit("org.bluez", "new", "inflight");
+            tokio::task::yield_now().await;
+            if stream_error {
+                events
+                    .unbounded_send(Err(anyhow::anyhow!("bus lost")))
+                    .unwrap();
             }
-        }));
-        let emit = |name: &str, old: &str, new: &str| {
-            events
-                .unbounded_send(Ok((name.into(), old.into(), new.into())))
-                .unwrap()
-        };
-        emit("org.bluez", "", "old");
-        tokio::task::yield_now().await;
-        emit("unrelated", "", "ignored");
-        emit("org.bluez", "old", "old");
-        tokio::task::yield_now().await;
-        assert_eq!(*log.lock().unwrap(), ["start:old"]);
-        emit("org.bluez", "old", "");
-        tokio::task::yield_now().await;
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["start:old", "drop:old", "unavailable"]
-        );
-        emit("org.bluez", "", "new");
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            *log.lock().unwrap(),
-            [
-                "start:old",
-                "drop:old",
-                "unavailable",
-                "start:new",
-                "install:new",
-                "drop:new"
-            ]
-        );
-        drop(events);
-        assert!(worker.await.unwrap().is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stream_failure_drops_inflight_replacement() {
-        let (events, stream) = mpsc::unbounded();
-        let marker = Arc::new(());
-        let held = marker.clone();
-        let worker = tokio::spawn(drive(stream, move |_| {
-            let guard = held.clone();
-            async move {
-                let _guard = guard;
-                std::future::pending::<()>().await;
-            }
-        }));
-        events
-            .unbounded_send(Ok(("org.bluez".into(), "".into(), "owner".into())))
-            .unwrap();
-        tokio::task::yield_now().await;
-        assert_eq!(Arc::strong_count(&marker), 3);
-        events
-            .unbounded_send(Err(anyhow::anyhow!("bus lost")))
-            .unwrap();
-        assert_eq!(worker.await.unwrap().unwrap_err().to_string(), "bus lost");
-        assert_eq!(Arc::strong_count(&marker), 1);
+            drop(events);
+            assert!(worker.await.unwrap().is_err());
+            let log = log.lock().unwrap();
+            assert_eq!(&log[6..], ["start:inflight", "drop:inflight"]);
+        }
     }
 }

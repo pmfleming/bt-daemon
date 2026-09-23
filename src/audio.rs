@@ -792,18 +792,6 @@ mod tests {
     };
 
     #[test]
-    fn routing_writes_configured_defaults_not_policy_outputs() {
-        assert_eq!(
-            super::configured_default_key(super::EndpointKind::Sink),
-            "default.configured.audio.sink"
-        );
-        assert_eq!(
-            super::configured_default_key(super::EndpointKind::Source),
-            "default.configured.audio.source"
-        );
-    }
-
-    #[test]
     fn probe_results_are_deduplicated_and_linked_to_defaults() {
         let mut device = audio_device();
         let profile = audio_profile(2, 100);

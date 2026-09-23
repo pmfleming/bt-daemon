@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_effects_follow_operation_policy() {
+    async fn effects_follow_policy_and_stop_at_the_first_failure() {
         for (op, expected) in [
             (DeviceOperation::Pair, vec!["power", "operation", "audio"]),
             (
@@ -253,19 +253,10 @@ mod tests {
             (DeviceOperation::Disconnect, vec!["operation"]),
             (DeviceOperation::SetTrusted, vec!["operation"]),
         ] {
-            let fake = Fake::default();
-            execute(&fake, plan(op)).await.unwrap();
-            assert_eq!(*fake.calls.lock().unwrap(), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn failure_preserves_classification_and_never_runs_later_effects() {
-        for op in [DeviceOperation::Connect, DeviceOperation::Remove] {
             let successful = Fake::default();
             execute(&successful, plan(op)).await.unwrap();
-            let calls = successful.calls.into_inner().unwrap();
-            for (i, stage) in calls.iter().enumerate() {
+            assert_eq!(*successful.calls.lock().unwrap(), expected);
+            for (i, stage) in expected.iter().enumerate() {
                 let fake = Fake {
                     fail: Some(stage),
                     ..Fake::default()
@@ -275,7 +266,7 @@ mod tests {
                     error.downcast_ref::<BackendError>().unwrap().kind,
                     BackendErrorKind::DeviceUnavailable
                 );
-                assert_eq!(*fake.calls.lock().unwrap(), calls[..=i]);
+                assert_eq!(*fake.calls.lock().unwrap(), expected[..=i]);
             }
         }
     }
@@ -299,8 +290,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn preferred_profiles_and_route_switches_only_apply_to_connecting_operations() {
+    #[tokio::test]
+    async fn connection_policy_honors_audio_preferences_and_power_overrides() {
+        let policy = ManagementStore::in_memory().device_policy("peer");
+        let fake = Fake::default();
+        execute(
+            &fake,
+            Plan::new(
+                DeviceOperation::Connect,
+                &json!({"power_on":false}),
+                &policy,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*fake.calls.lock().unwrap(), ["check-power", "operation"]);
+        assert!(Plan::new(DeviceOperation::Pair, &json!({"power_on":"yes"}), &policy).is_err());
         for route in ["keep", "switch"] {
             for profile in [None, Some("opaque-profile")] {
                 let store = ManagementStore::in_memory();
@@ -327,24 +333,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn explicit_power_override_and_audio_defaults_are_respected() {
-        let policy = ManagementStore::in_memory().device_policy("peer");
-        let fake = Fake::default();
-        execute(
-            &fake,
-            Plan::new(
-                DeviceOperation::Connect,
-                &json!({"power_on":false}),
-                &policy,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(*fake.calls.lock().unwrap(), ["check-power", "operation"]);
-        assert!(Plan::new(DeviceOperation::Pair, &json!({"power_on":"yes"}), &policy).is_err());
     }
 }

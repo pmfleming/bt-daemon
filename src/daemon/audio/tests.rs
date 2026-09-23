@@ -1,4 +1,4 @@
-use super::{device_snapshot, endpoint_snapshot, select_default, select_profile};
+use super::{device_snapshot, select_default, select_profile};
 use crate::{
     audio::{self, AudioDevice, AudioEndpoint, AudioProfile},
     identity::DeviceIdentityRegistry,
@@ -31,7 +31,7 @@ fn device() -> AudioDevice {
 }
 
 #[test]
-fn snapshot_uses_opaque_device_profile_and_endpoint_keys() {
+fn snapshots_expose_only_resolvable_opaque_devices_and_endpoint_readiness() {
     let identities = DeviceIdentityRegistry::in_memory();
     let input = device();
     let key = identities.device_key(&input.adapter, input.address.parse().unwrap());
@@ -49,11 +49,7 @@ fn snapshot_uses_opaque_device_profile_and_endpoint_keys() {
     assert!(value["source"].is_null());
     assert!(!value.to_string().contains("AA:BB:CC:DD:EE:FF"));
     assert!(!value.to_string().contains("private-pipewire-node"));
-}
 
-#[test]
-fn snapshots_reject_unresolvable_devices_and_tolerate_unknown_profiles() {
-    let pairing = PairingBroker::new(DeviceIdentityRegistry::in_memory());
     let mut input = device();
     input.address = "not-an-address".into();
     assert!(device_snapshot(&pairing, input).is_none());
@@ -63,24 +59,17 @@ fn snapshots_reject_unresolvable_devices_and_tolerate_unknown_profiles() {
     let mut input = device();
     input.active_profile = Some(999);
     assert!(device_snapshot(&pairing, input).unwrap()["active_profile_key"].is_null());
-}
 
-#[test]
-fn endpoint_readiness_distinguishes_initializing_failed_and_ready_states() {
-    assert!(endpoint_snapshot("key", "sink", None).is_none());
     for (state, expected) in [
         ("creating", false),
         ("error", false),
         ("suspended", true),
         ("running", true),
     ] {
-        let endpoint = AudioEndpoint {
-            name: "node".into(),
-            state: state.into(),
-            is_default: false,
-        };
+        let mut input = device();
+        input.sink.as_mut().unwrap().state = state.into();
         assert_eq!(
-            endpoint_snapshot("key", "sink", Some(endpoint)).unwrap()["ready"],
+            device_snapshot(&pairing, input).unwrap()["sink"]["ready"],
             expected
         );
     }

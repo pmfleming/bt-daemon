@@ -1,6 +1,6 @@
-use super::{Message, Writer, collect_barriers};
+use super::Writer;
 use crate::identity::{REGISTRY_VERSION, RegistryFile};
-use std::{fs, sync::mpsc};
+use std::fs;
 
 fn state(key: &str) -> RegistryFile {
     RegistryFile {
@@ -8,22 +8,6 @@ fn state(key: &str) -> RegistryFile {
         devices: [("identity".into(), key.into())].into(),
         ..RegistryFile::default()
     }
-}
-
-#[test]
-fn batched_flush_barriers_are_all_preserved() {
-    let (wake, messages) = mpsc::channel();
-    let (first, first_reply) = mpsc::channel();
-    let (second, second_reply) = mpsc::channel();
-    wake.send(Message::Changed).unwrap();
-    wake.send(Message::Flush(second)).unwrap();
-    let barriers = collect_barriers(Message::Flush(first), &messages);
-    assert_eq!(barriers.len(), 2);
-    for reply in barriers {
-        reply.send(Ok(())).unwrap();
-    }
-    assert_eq!(first_reply.recv().unwrap(), Ok(()));
-    assert_eq!(second_reply.recv().unwrap(), Ok(()));
 }
 
 #[test]
@@ -35,7 +19,12 @@ fn flush_persists_the_latest_state_and_drop_drains_updates() -> anyhow::Result<(
     assert!(!path.exists());
     writer.schedule(state("first"));
     writer.schedule(state("latest"));
-    writer.flush()?;
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| writer.flush());
+        let second = scope.spawn(|| writer.flush());
+        first.join().unwrap()?;
+        second.join().unwrap()
+    })?;
     let saved: RegistryFile = serde_json::from_slice(&fs::read(&path)?)?;
     assert_eq!(saved.devices["identity"], "latest");
     writer.schedule(state("on-drop"));

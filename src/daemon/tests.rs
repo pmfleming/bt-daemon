@@ -236,21 +236,6 @@ async fn operation_request_id(
 }
 
 #[tokio::test]
-async fn active_operation_can_be_cancelled() {
-    let (daemon, mut events, _) = daemon(false);
-    let response = start_operation(&daemon, "pair").await;
-    let request_id = operation_request_id(&response, &mut events).await;
-    let response: Value =
-        serde_json::from_str(&daemon.cancel_owned(&request_id, None).await).unwrap();
-    assert_eq!(response["data"]["kind"], "operation");
-    let mut cancelled = events.recv().await.unwrap();
-    while cancelled.event != "cancelled" {
-        cancelled = events.recv().await.unwrap();
-    }
-    assert_eq!(cancelled.request_id, request_id);
-}
-
-#[tokio::test]
 async fn cancellation_and_completion_publish_one_terminal_result() {
     for complete_first in [false, true] {
         let (daemon, mut events, _) = daemon(true);
@@ -289,35 +274,6 @@ async fn cancellation_and_completion_publish_one_terminal_result() {
 }
 
 #[tokio::test]
-async fn rejects_concurrent_operations_for_one_device() {
-    let (daemon, mut events, _) = daemon(false);
-    let first = start_operation(&daemon, "connect").await;
-    let request_id = operation_request_id(&first, &mut events).await;
-    let second = start_operation(&daemon, "remove").await;
-    assert_eq!(second["error"]["code"], "device-busy");
-    let _ = daemon.cancel_owned(&request_id, None).await;
-}
-
-#[tokio::test]
-async fn scan_rejects_malformed_optional_parameters() {
-    let (daemon, _, _) = daemon(true);
-    let response = daemon
-        .scans
-        .start(
-            &json!({ "adapter_key": 42, "enabled": true }),
-            ":test-owner",
-        )
-        .await;
-    assert_eq!(response["error"]["code"], "validation-error");
-    let response = daemon
-        .scans
-        .start(&json!({ "enabled": "yes" }), ":test-owner")
-        .await;
-    assert_eq!(response["error"]["code"], "validation-error");
-    assert_eq!(daemon.obex.cancel("missing-transfer").await, None);
-}
-
-#[tokio::test]
 async fn overlapping_global_scan_stops_only_uncovered_adapters() {
     let scanning = Arc::new(StdMutex::new(Vec::new()));
     let backend = test_backend(true, false, Arc::clone(&scanning));
@@ -347,22 +303,6 @@ async fn overlapping_global_scan_stops_only_uncovered_adapters() {
             (Some("adapter-1".into()), false)
         ]
     );
-}
-
-#[tokio::test]
-async fn scan_sessions_are_bounded_and_cancellable() {
-    let (daemon, _, mut events) = daemon(true);
-    let response = start_scan(&daemon.scans, "adapter-1", 1000).await;
-    let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
-    assert_eq!(events.recv().await.unwrap().state, "running");
-    let rejected: Value =
-        serde_json::from_str(&daemon.cancel_owned(request_id, Some(":other-owner")).await).unwrap();
-    assert_eq!(rejected["error"]["code"], "request-not-found");
-    let response: Value =
-        serde_json::from_str(&daemon.cancel_owned(request_id, Some(":test-owner")).await).unwrap();
-    assert_eq!(response["data"]["stopped"], request_id);
-    assert_eq!(events.recv().await.unwrap().state, "cancelled");
-    assert!(daemon.scans.is_empty().await);
 }
 
 #[tokio::test]

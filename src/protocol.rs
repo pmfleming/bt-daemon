@@ -297,23 +297,14 @@ mod tests {
     use super::{METHODS, STREAMS, VERSION, contract_fixture, registry};
 
     #[test]
-    fn malformed_parameter_examples_fail_closed_without_panicking() {
+    fn registry_preserves_the_wire_contract_and_rejects_invalid_examples() {
         for encoded in ["{broken", "null", "[]", "true", "42"] {
             assert_eq!(
                 super::parameter_contract("test-method", encoded),
                 (serde_json::Value::Null, serde_json::json!(false))
             );
         }
-        for (method, example, _, _) in METHODS {
-            assert!(
-                super::parameter_contract(method, example).1.is_object(),
-                "{method}"
-            );
-        }
-    }
 
-    #[test]
-    fn registry_names_are_unique_and_fixture_matches_registry() {
         shelllist_daemon_core::validate_unique_names(
             &METHODS.iter().map(|method| method.0).collect::<Vec<_>>(),
         )

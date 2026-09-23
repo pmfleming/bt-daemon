@@ -1580,9 +1580,8 @@ impl FastPairBatteryProvider {
 mod tests {
     use super::{
         BATTERY_UPDATED_CODE, BatteryReport, DEVICE_INFORMATION_GROUP, FrameDecoder,
-        MAX_FRAME_PAYLOAD, MessageStreamTransport, PsmAvailability, anc_mode_flag, crypt_block,
-        decode_anc_state, decode_component, decode_message_stream_psm, derive_aes_key, message_mac,
-        select_transport,
+        MessageStreamTransport, PsmAvailability, anc_mode_flag, crypt_block, decode_anc_state,
+        decode_component, decode_message_stream_psm, derive_aes_key, select_transport,
     };
 
     #[test]
@@ -1638,16 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_unbounded_payloads() {
-        let length = (MAX_FRAME_PAYLOAD + 1) as u16;
-        let error = FrameDecoder::default()
-            .push(&[0x03, 0x03, (length >> 8) as u8, length as u8])
-            .unwrap_err();
-        assert!(error.to_string().contains("too large"));
-    }
-
-    #[test]
-    fn battery_values_mask_charging_and_decode_unknown_states() {
+    fn battery_reports_preserve_component_values_and_reject_invalid_payloads() {
         let reports = BatteryReport::from_payload(&[0xe4, 0x32, 0xff])
             .unwrap()
             .model_batteries();
@@ -1658,10 +1648,6 @@ mod tests {
         assert_eq!(decode_component(0x7f).unwrap(), None);
         assert_eq!(decode_component(0xff).unwrap(), None);
         assert!(decode_component(0x7e).is_err());
-    }
-
-    #[test]
-    fn component_reports_preserve_known_values_without_inferring_unknown_components() {
         for (payload, expected) in [
             (
                 [0x64, 0x64, 0x4e],
@@ -1707,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn ecdh_key_derivation_matches_the_google_fast_pair_test_vector() {
+    fn provisioning_crypto_matches_google_fast_pair_test_vectors() {
         let shared =
             hex::decode("9dade4f86ac3488bbac2ac34b5fe68a0ee5a6706f543d9061ad57889498ae6ba")
                 .unwrap();
@@ -1715,10 +1701,6 @@ mod tests {
             hex::encode(derive_aes_key(&shared)),
             "b07f1f17c236cbd33523c515f350ae57"
         );
-    }
-
-    #[test]
-    fn aes_matches_the_google_fast_pair_test_vector() {
         let key = hex::decode("a0baf0bb951ff7b6cf5e3f4561c3321d").unwrap();
         let mut key_bytes = [0_u8; 16];
         key_bytes.copy_from_slice(&key);
@@ -1729,18 +1711,5 @@ mod tests {
         assert_eq!(hex::encode(block), "ac9a16f0953a3f223dd10cf536e09e9c");
         crypt_block(&key_bytes, &mut block, false);
         assert_eq!(block.as_slice(), input);
-    }
-
-    #[test]
-    fn authenticated_messages_bind_both_nonces_and_payload() {
-        let key = [0x04; 16];
-        let session = [0x11; 8];
-        let nonce = [0x22; 8];
-        let mac = message_mac(&key, &session, &nonce, &[1]);
-        // Independent Python hmac/SHA-256 reference for K, session || nonce || message.
-        assert_eq!(hex::encode(mac), "13cfdae51949437e");
-        assert_ne!(mac, message_mac(&key, &session, &nonce, &[0]));
-        assert_ne!(mac, message_mac(&key, &[0x10; 8], &nonce, &[1]));
-        assert_ne!(mac, message_mac(&key, &session, &[0x23; 8], &[1]));
     }
 }

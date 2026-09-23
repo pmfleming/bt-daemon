@@ -207,42 +207,35 @@ async fn handle_property(
 #[cfg(test)]
 mod tests {
     use super::{Event, Watches};
-    use futures::StreamExt;
-    #[tokio::test]
-    async fn duplicate_watch_does_not_replace_a_live_subscription() {
-        let mut watches = Watches::default();
-        watches.insert("hci0".into(), futures::stream::pending().boxed());
-        watches.insert("hci0".into(), futures::stream::empty().boxed());
-        assert_eq!(watches.handles.len(), 1);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), watches.streams.next())
-                .await
-                .is_err()
-        );
-    }
+    use futures::{FutureExt, StreamExt, channel::mpsc};
 
-    #[tokio::test]
-    async fn ended_and_removed_streams_release_their_slots() {
+    #[test]
+    fn watches_preserve_live_peers_and_allow_replacement_after_removal() {
         let mut watches = Watches::default();
-        watches.insert("hci0".into(), futures::stream::empty().boxed());
-        assert!(matches!(watches.streams.next().await, Some(Event::Ended(key)) if key == "hci0"));
-        watches.remove("hci0");
-        watches.remove("missing");
-        assert!(watches.handles.is_empty());
-        assert!(watches.streams.next().await.is_none());
-        watches.insert("hci0".into(), futures::stream::pending().boxed());
-        watches.remove("hci0");
-        assert!(watches.streams.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn removing_one_adapter_preserves_unrelated_subscriptions() {
-        let mut watches = Watches::default();
-        for key in ["hci0", "hci0/device", "hci1", "hci1/device"] {
+        let (events, stream) = mpsc::unbounded();
+        watches.insert("hci1/device".into(), stream.boxed());
+        watches.insert("hci1/device".into(), futures::stream::empty().boxed());
+        for key in ["hci0", "hci0/device"] {
             watches.insert(key.into(), futures::stream::pending().boxed());
         }
         watches.remove_adapter("hci0");
-        assert_eq!(watches.handles.len(), 2);
-        assert!(watches.handles.contains_key("hci1/device"));
+        events
+            .unbounded_send(Event::Adapter(
+                "hci1".into(),
+                bluer::AdapterEvent::DeviceAdded(bluer::Address::default()),
+            ))
+            .unwrap();
+        assert!(matches!(watches.streams.next().now_or_never(),
+            Some(Some(Event::Adapter(name, _))) if name == "hci1"));
+        drop(events);
+        assert!(matches!(watches.streams.next().now_or_never(),
+            Some(Some(Event::Ended(key))) if key == "hci1/device"));
+        watches.remove("hci1/device");
+        watches.remove("missing");
+        watches.insert("hci1/device".into(), futures::stream::empty().boxed());
+        assert!(matches!(watches.streams.next().now_or_never(),
+            Some(Some(Event::Ended(key))) if key == "hci1/device"));
+        watches.remove_adapter("hci1");
+        assert!(matches!(watches.streams.next().now_or_never(), Some(None)));
     }
 }

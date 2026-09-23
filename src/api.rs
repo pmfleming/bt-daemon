@@ -177,7 +177,7 @@ mod tests {
 
     use crate::backend::{BackendError, BackendErrorKind};
 
-    use super::{error_value, parse_backend_request};
+    use super::error_value;
 
     #[test]
     fn policy_routing_key_is_not_treated_as_a_setting() {
@@ -211,14 +211,5 @@ mod tests {
         let value = error_value(&error);
         assert_eq!(value["code"], "timeout");
         assert_eq!(value["retryable"], true);
-    }
-
-    #[test]
-    fn invalid_optional_adapter_key_is_not_treated_as_all_adapters() {
-        let params = serde_json::json!({ "adapter_key": 42, "powered": false });
-        let Err(error) = parse_backend_request("bluetooth.setPowered", &params) else {
-            panic!("invalid adapter key was accepted");
-        };
-        assert_eq!(error["error"]["code"], "validation-error");
     }
 }

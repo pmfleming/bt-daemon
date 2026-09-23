@@ -1,5 +1,5 @@
 use super::daemon;
-use crate::daemon::{SharedSnapshot, load_snapshot, receive_refresh, snapshot_response};
+use crate::daemon::{SharedSnapshot, load_snapshot, receive_refresh};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
@@ -29,6 +29,33 @@ async fn dispatch_routes_cached_snapshots_registry_and_request_recovery() {
         json!([])
     );
     assert_eq!(requests["data"]["requests"]["scans"]["active"], json!([]));
+    for (state, code) in [
+        (SharedSnapshot::Loading, "snapshot-loading"),
+        (
+            SharedSnapshot::Unavailable(Arc::new("offline".into())),
+            "bluez-unavailable",
+        ),
+    ] {
+        daemon.snapshots.send_replace(state);
+        let response = daemon
+            .dispatch_call("bluetooth.snapshot", json!({}), None, None)
+            .await;
+        assert_eq!(response["error"]["code"], code);
+    }
+    assert!(matches!(
+        load_snapshot(&daemon.backend).await,
+        SharedSnapshot::Available(_)
+    ));
+    let (sender, mut receiver) = broadcast::channel(1);
+    sender.send(()).unwrap();
+    sender.send(()).unwrap();
+    assert!(receive_refresh(&mut receiver, Duration::ZERO).await);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    drop(sender);
+    assert!(!receive_refresh(&mut receiver, Duration::ZERO).await);
 }
 
 #[tokio::test]
@@ -52,6 +79,19 @@ async fn dispatch_validates_hardware_commands_before_any_io() {
             response["error"]["code"], "validation-error",
             "{method}: {response}"
         );
+    }
+    for (method, params) in [
+        (
+            "bluetooth.setPowered",
+            json!({"adapter_key": 42, "powered": false}),
+        ),
+        (
+            "bluetooth.scan",
+            json!({"adapter_key": 42, "enabled": true}),
+        ),
+    ] {
+        let response = daemon.dispatch_call(method, params, None, None).await;
+        assert_eq!(response["error"]["code"], "validation-error");
     }
     let pairing = daemon
         .dispatch_call("bluetooth.pairing.respond", json!({}), None, None)
@@ -105,13 +145,25 @@ async fn routed_operations_preserve_caller_ownership() {
         )
         .await;
     let id = super::operation_request_id(&operation, &mut events).await;
+    let conflicting = super::start_operation(&daemon, "remove").await;
+    assert_eq!(conflicting["error"]["code"], "device-busy");
     let cancelled = assert_owned_cancellation(&daemon, &id).await;
     assert_eq!(cancelled["data"]["kind"], "operation");
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if event.event == "cancelled" {
+            assert_eq!(event.request_id, id);
+            break;
+        }
+    }
 }
 
 #[tokio::test]
 async fn routed_scans_preserve_caller_ownership_without_a_bus_connection() {
-    let (daemon, _, _) = daemon(true);
+    let (daemon, _, mut events) = daemon(true);
     let scan = daemon
         .dispatch_call(
             "bluetooth.scan",
@@ -121,7 +173,10 @@ async fn routed_scans_preserve_caller_ownership_without_a_bus_connection() {
         )
         .await;
     let id = scan["data"]["scan"]["request_id"].as_str().unwrap();
-    assert_owned_cancellation(&daemon, id).await;
+    assert_eq!(events.recv().await.unwrap().state, "running");
+    let cancelled = assert_owned_cancellation(&daemon, id).await;
+    assert_eq!(cancelled["data"]["stopped"], id);
+    assert_eq!(events.recv().await.unwrap().state, "cancelled");
     assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
 }
 
@@ -133,30 +188,4 @@ async fn assert_owned_cancellation(daemon: &crate::daemon::BluetoothDaemon, id: 
         serde_json::from_str(&daemon.cancel_owned(id, Some(":owner")).await).unwrap();
     assert_eq!(cancelled["ok"], true);
     cancelled
-}
-
-#[tokio::test]
-async fn snapshot_states_and_refresh_channel_lifecycle_are_explicit() {
-    assert_eq!(
-        snapshot_response(&SharedSnapshot::Loading)["error"]["code"],
-        "snapshot-loading"
-    );
-    let unavailable = snapshot_response(&SharedSnapshot::Unavailable(Arc::new("offline".into())));
-    assert_eq!(unavailable["error"]["code"], "bluez-unavailable");
-    assert_eq!(unavailable["error"]["message"], "offline");
-    let (daemon, _, _) = daemon(true);
-    assert!(matches!(
-        load_snapshot(&daemon.backend).await,
-        SharedSnapshot::Available(_)
-    ));
-    let (sender, mut receiver) = broadcast::channel(1);
-    sender.send(()).unwrap();
-    sender.send(()).unwrap();
-    assert!(receive_refresh(&mut receiver, Duration::ZERO).await);
-    assert!(matches!(
-        receiver.try_recv(),
-        Err(broadcast::error::TryRecvError::Empty)
-    ));
-    drop(sender);
-    assert!(!receive_refresh(&mut receiver, Duration::ZERO).await);
 }
