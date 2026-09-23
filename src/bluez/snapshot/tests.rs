@@ -160,21 +160,13 @@ fn presentation_restores_paired_history_but_not_live_or_unpaired_batteries() {
         &key,
         true,
         true,
-        Some("audio-headphones".into()),
+        Some("audio-headphones"),
         Some("aabbcc"),
         battery.clone(),
     );
     assert!(live.battery_live && !live.battery_last_known);
     assert_eq!(live.device_type, "Headphones");
-    let remembered = presentation(
-        &identities,
-        &key,
-        true,
-        false,
-        Some(" ".into()),
-        None,
-        vec![],
-    );
+    let remembered = presentation(&identities, &key, true, false, Some(" "), None, vec![]);
     assert_eq!(remembered.battery, battery);
     assert_eq!(remembered.icon.as_deref(), Some("audio-headphones"));
     assert_eq!(remembered.model_id.as_deref(), Some("aabbcc"));

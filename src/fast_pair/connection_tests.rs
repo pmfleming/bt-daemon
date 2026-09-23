@@ -1,4 +1,6 @@
-use super::{ConnectionState, Frame, LinkState, decode_chunks, read_transport, write_transport};
+use super::{
+    ConnectionState, Frame, LinkState, MessageStreamTransport, read_transport, write_transport,
+};
 use bluer::Address;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -54,10 +56,10 @@ fn beginning_and_ending_connections_owns_links_writers_and_retry_state() {
     let peer = Address::default();
     let other = "11:22:33:44:55:66".parse().unwrap();
     let mut state = ConnectionState::default();
-    assert!(state.begin(peer));
-    assert!(!state.begin(peer));
+    assert!(state.begin(peer, MessageStreamTransport::Rfcomm));
+    assert!(!state.begin(peer, MessageStreamTransport::L2cap));
     assert!(state.mark_connected(peer));
-    assert!(!state.begin(peer));
+    assert!(!state.begin(peer, MessageStreamTransport::Rfcomm));
     state.mark_connected(other);
     let (writer, mut receiver) = mpsc::channel(1);
     state.writers.insert(peer, writer);
@@ -66,8 +68,18 @@ fn beginning_and_ending_connections_owns_links_writers_and_retry_state() {
     assert!(!state.writers.contains_key(&peer));
     assert!(!state.connected_since.contains_key(&peer));
     assert!(!state.links.contains_key(&peer));
-    assert!(!state.begin(peer));
+    assert!(!state.begin(peer, MessageStreamTransport::Rfcomm));
     assert_eq!(state.links[&other], LinkState::Connected);
+}
+
+#[test]
+fn l2cap_suppression_does_not_reserve_a_link_or_block_rfcomm() {
+    let peer = Address::default();
+    let mut state = ConnectionState::default();
+    state.retry.psm_unavailable(peer);
+    assert!(!state.begin(peer, MessageStreamTransport::L2cap));
+    assert!(!state.links.contains_key(&peer));
+    assert!(state.begin(peer, MessageStreamTransport::Rfcomm));
 }
 
 #[tokio::test]
@@ -83,13 +95,11 @@ async fn framed_transport_roundtrips_under_backpressure_and_stops_on_eof() {
         .await
         .unwrap();
     drop(writes);
-    let (chunks, chunks_rx) = mpsc::channel(1);
     let (frames, mut frames_rx) = mpsc::channel(1);
     let result = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(
             write_transport(writer, writes_rx),
-            read_transport(reader, chunks),
-            decode_chunks(chunks_rx, frames),
+            read_transport(reader, frames),
             async {
                 let mut decoded = Vec::new();
                 while let Some(frame) = frames_rx.recv().await {
@@ -101,37 +111,30 @@ async fn framed_transport_roundtrips_under_backpressure_and_stops_on_eof() {
     })
     .await
     .unwrap();
-    assert!(result.0.is_ok() && result.1.is_ok() && result.2.is_ok());
-    assert_eq!(result.3.len(), 2);
-    assert_eq!(result.3[0].group, 3);
-    assert_eq!(result.3[0].payload, [1, 2, 3]);
-    assert_eq!(result.3[1].code, 0x13);
-    assert_eq!(result.3[1].payload, [2, 0x28, 0x28, 0x20]);
+    assert!(result.0.is_ok() && result.1.is_ok());
+    assert_eq!(result.2.len(), 2);
+    assert_eq!(result.2[0].group, 3);
+    assert_eq!(result.2[0].payload, [1, 2, 3]);
+    assert_eq!(result.2[1].code, 0x13);
+    assert_eq!(result.2[1].payload, [2, 0x28, 0x28, 0x20]);
 }
 
 #[tokio::test]
 async fn transport_and_decoder_errors_are_propagated() {
-    let (chunks, chunks_rx) = mpsc::channel(1);
-    drop(chunks_rx);
-    assert!(read_transport(&b"data"[..], chunks).await.is_err());
     let (writer, reader) = tokio::io::duplex(8);
     drop(reader);
     let (writes, writes_rx) = mpsc::channel(1);
     writes.send(vec![1]).await.unwrap();
     drop(writes);
     assert!(write_transport(writer, writes_rx).await.is_err());
-    let (chunks, chunks_rx) = mpsc::channel(1);
-    chunks.send(vec![3, 1, 0xff, 0xff]).await.unwrap();
-    drop(chunks);
     let (frames, _frames_rx) = mpsc::channel(1);
-    assert!(decode_chunks(chunks_rx, frames).await.is_err());
-    let (chunks, chunks_rx) = mpsc::channel(1);
-    chunks
-        .send(Frame::encoded(3, 1, &[1, 2, 3]).unwrap())
-        .await
-        .unwrap();
-    drop(chunks);
+    assert!(
+        read_transport(&[3, 1, 0xff, 0xff][..], frames)
+            .await
+            .is_err()
+    );
     let (frames, frames_rx) = mpsc::channel(1);
     drop(frames_rx);
-    assert!(decode_chunks(chunks_rx, frames).await.is_err());
+    let encoded = Frame::encoded(3, 1, &[1, 2, 3]).unwrap();
+    assert!(read_transport(encoded.as_slice(), frames).await.is_err());
 }

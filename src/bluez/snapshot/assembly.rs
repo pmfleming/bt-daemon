@@ -1,9 +1,8 @@
 //! Snapshot construction from captured evidence; no clocks, locks or hardware I/O.
 use super::{
-    BluezDeviceState, DeviceMetadata, ResolvedPresentation, device_capabilities, service_label,
-    signal_strength,
+    BluezDeviceState, DeviceMetadata, ResolvedPresentation, device_capabilities,
+    has_fast_pair_service, service_label, signal_strength,
 };
-use crate::fast_pair::{FAST_PAIR_SERVICE_UUID, MESSAGE_STREAM_UUID};
 use crate::{
     bluez::{CachedDevice, observations::Observation},
     management::DevicePolicy,
@@ -71,10 +70,7 @@ pub(super) fn build(
             label: service_label(uuid).into(),
         })
         .collect();
-    let has_fast_pair = metadata.uuids.iter().any(|uuid| {
-        uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
-            || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
-    });
+    let has_fast_pair = has_fast_pair_service(&metadata.uuids);
     let capabilities = device_capabilities(
         state.paired,
         state.connected,

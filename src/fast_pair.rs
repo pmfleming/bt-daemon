@@ -118,7 +118,7 @@ impl BatteryReport {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 struct RuntimeReport {
     session_nonce: Option<[u8; 8]>,
     model_id: Option<[u8; 3]>,
@@ -197,13 +197,9 @@ fn decode_address(payload: &[u8]) -> Result<Address> {
             payload.len()
         );
     }
-    payload
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
-        .parse()
-        .context("decode Fast Pair BLE address")
+    Ok(Address(
+        payload.try_into().context("decode Fast Pair BLE address")?,
+    ))
 }
 
 fn decode_component(value: u8) -> Result<Option<u8>> {
@@ -310,10 +306,6 @@ fn crypt_block(key: &[u8; 16], block: &mut [u8; 16], encrypt: bool) {
     }
 }
 
-fn address_bytes(address: Address) -> [u8; 6] {
-    address.0
-}
-
 fn parse_anti_spoofing_public_key(encoded: &str) -> Result<PublicKey> {
     let bytes = hex::decode(encoded).context("decode Fast Pair anti-spoofing public key")?;
     let encoded = match bytes.len() {
@@ -340,26 +332,26 @@ impl FrameDecoder {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<Frame>> {
         self.buffered.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        loop {
-            if self.buffered.len() < 4 {
-                break;
-            }
-            let payload_len = u16::from_be_bytes([self.buffered[2], self.buffered[3]]) as usize;
+        let mut consumed = 0;
+        while self.buffered.len() - consumed >= 4 {
+            let bytes = &self.buffered[consumed..];
+            let payload_len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
             if payload_len > MAX_FRAME_PAYLOAD {
                 self.buffered.clear();
                 bail!("Fast Pair frame payload is too large: {payload_len}");
             }
             let frame_len = 4 + payload_len;
-            if self.buffered.len() < frame_len {
+            if bytes.len() < frame_len {
                 break;
             }
-            let bytes: Vec<_> = self.buffered.drain(..frame_len).collect();
             frames.push(Frame {
                 group: bytes[0],
                 code: bytes[1],
-                payload: bytes[4..].to_vec(),
+                payload: bytes[4..frame_len].to_vec(),
             });
+            consumed += frame_len;
         }
+        self.buffered.drain(..consumed);
         Ok(frames)
     }
 }
@@ -399,8 +391,11 @@ struct ConnectionState {
 }
 
 impl ConnectionState {
-    fn begin(&mut self, address: Address) -> bool {
-        if self.links.contains_key(&address) || !self.retry.ready(address) {
+    fn begin(&mut self, address: Address, transport: MessageStreamTransport) -> bool {
+        if self.links.contains_key(&address)
+            || !self.retry.ready(address)
+            || (transport == MessageStreamTransport::L2cap && !self.retry.l2cap_allowed(address))
+        {
             return false;
         }
         self.links.insert(address, LinkState::Connecting);
@@ -490,7 +485,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, writer) = tokio::io::split(stream);
-    let (chunks_tx, chunks_rx) = mpsc::channel(16);
     let (frames_tx, frames_rx) = mpsc::channel(32);
     let (writes_tx, writes_rx) = mpsc::channel(16);
     provider.install_writer(address, writes_tx.clone()).await;
@@ -505,8 +499,7 @@ where
     }
     let reads = async {
         tokio::try_join!(
-            read_transport(reader, chunks_tx),
-            decode_chunks(chunks_rx, frames_tx),
+            read_transport(reader, frames_tx),
             apply_frames(Arc::clone(&provider), address, frames_rx),
         )?;
         Ok::<_, anyhow::Error>(())
@@ -535,11 +528,12 @@ where
     Ok(())
 }
 
-async fn read_transport<R>(mut stream: R, chunks: mpsc::Sender<Vec<u8>>) -> Result<()>
+async fn read_transport<R>(mut stream: R, frames: mpsc::Sender<Frame>) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut bytes = [0_u8; 512];
+    let mut decoder = FrameDecoder::default();
     loop {
         let count = stream
             .read(&mut bytes)
@@ -549,20 +543,7 @@ where
             return Ok(());
         }
         tracing::trace!(bytes = count, "read Fast Pair transport chunk");
-        chunks
-            .send(bytes[..count].to_vec())
-            .await
-            .context("forward Fast Pair transport chunk")?;
-    }
-}
-
-async fn decode_chunks(
-    mut chunks: mpsc::Receiver<Vec<u8>>,
-    frames: mpsc::Sender<Frame>,
-) -> Result<()> {
-    let mut decoder = FrameDecoder::default();
-    while let Some(chunk) = chunks.recv().await {
-        for frame in decoder.push(&chunk)? {
+        for frame in decoder.push(&bytes[..count])? {
             tracing::trace!(
                 group = frame.group,
                 code = frame.code,
@@ -575,7 +556,6 @@ async fn decode_chunks(
                 .context("forward decoded Fast Pair frame")?;
         }
     }
-    Ok(())
 }
 
 async fn apply_frames(
@@ -598,11 +578,11 @@ async fn apply_frame(
     address: Address,
     frame: Frame,
 ) -> Result<()> {
-    match frame.group {
-        DEVICE_INFORMATION_GROUP => {
+    match (frame.group, frame.code) {
+        (DEVICE_INFORMATION_GROUP, _) => {
             apply_device_information(provider, address, frame.code, &frame.payload).await
         }
-        AUDIO_SWITCH_GROUP if frame.code == GET_AUDIO_SWITCH_CAPABILITY_CODE => {
+        (AUDIO_SWITCH_GROUP, GET_AUDIO_SWITCH_CAPABILITY_CODE) => {
             let worker = Arc::clone(provider);
             provider.tasks.spawn("fast-pair-seeker-capability", async move {
                 if let Err(error) = worker.answer_audio_switch_query(address).await {
@@ -612,7 +592,7 @@ async fn apply_frame(
             });
             Ok(())
         }
-        AUDIO_SWITCH_GROUP if frame.code == 0x32 => {
+        (AUDIO_SWITCH_GROUP, 0x32) => {
             let mut event = audio_switch::decode_switch(&frame.payload)?;
             event.observed_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -620,11 +600,11 @@ async fn apply_frame(
                 .as_millis() as u64;
             tracing::info!(%address, reason = %event.reason, target = %event.target, "Fast Pair audio switched");
             provider
-                .update_runtime(address, |state| state.last_switch = Some(event))
+                .update_runtime(address, event, |state| &mut state.last_switch)
                 .await;
             Ok(())
         }
-        AUDIO_SWITCH_GROUP if frame.code == AUDIO_SWITCH_CAPABILITY_CODE => {
+        (AUDIO_SWITCH_GROUP, AUDIO_SWITCH_CAPABILITY_CODE) => {
             let capability = decode_audio_switch_capability(&frame.payload)?;
             // SASS Notify Capability is bidirectional and requires an ACK.
             // Provider-to-Seeker notifications do not carry a MAC.
@@ -639,18 +619,18 @@ async fn apply_frame(
                 )
                 .await?;
             provider
-                .update_runtime(address, |state| state.multipoint = Some(capability))
+                .update_runtime(address, capability, |state| &mut state.multipoint)
                 .await;
             Ok(())
         }
-        HEARABLE_CONTROLS_GROUP if frame.code == ANC_STATE_CODE => {
+        (HEARABLE_CONTROLS_GROUP, ANC_STATE_CODE) => {
             let noise_control = decode_anc_state(&frame.payload)?;
             provider
-                .update_runtime(address, |state| state.noise_control = Some(noise_control))
+                .update_runtime(address, noise_control, |state| &mut state.noise_control)
                 .await;
             Ok(())
         }
-        ACKNOWLEDGEMENT_GROUP => {
+        (ACKNOWLEDGEMENT_GROUP, _) => {
             apply_acknowledgement(provider, address, frame.code, &frame.payload).await;
             Ok(())
         }
@@ -676,19 +656,19 @@ async fn apply_device_information(
         SESSION_NONCE_CODE => {
             let nonce = decode_fixed(payload, "session nonce")?;
             provider
-                .update_runtime(address, |state| state.session_nonce = Some(nonce))
+                .update_runtime(address, nonce, |state| &mut state.session_nonce)
                 .await;
         }
         MODEL_ID_CODE => {
             let model_id = decode_fixed(payload, "model ID")?;
             provider
-                .update_runtime(address, |state| state.model_id = Some(model_id))
+                .update_runtime(address, model_id, |state| &mut state.model_id)
                 .await;
         }
         BLE_ADDRESS_CODE => {
             let ble_address = decode_address(payload)?;
             provider
-                .update_runtime(address, |state| state.ble_address = Some(ble_address))
+                .update_runtime(address, ble_address, |state| &mut state.ble_address)
                 .await;
         }
         _ => {}
@@ -830,8 +810,8 @@ fn provisioning_request(
     let mut request = [0_u8; 16];
     request[0] = 0x00;
     request[1] = 0x10;
-    request[2..8].copy_from_slice(&address_bytes(remote_address));
-    request[8..14].copy_from_slice(&address_bytes(local_address));
+    request[2..8].copy_from_slice(&remote_address.0);
+    request[8..14].copy_from_slice(&local_address.0);
     OsRng.fill_bytes(&mut request[14..]);
     crypt_block(&shared_key, &mut request, true);
     let mut write = request.to_vec();
@@ -881,7 +861,7 @@ async fn complete_key_pairing(
         "Fast Pair provider returned an invalid key-based pairing response"
     );
     ensure!(
-        response[1..7] == address_bytes(device_address),
+        response[1..7] == device_address.0,
         "Fast Pair provider response did not match the paired Bluetooth device"
     );
     Ok(())
@@ -982,7 +962,8 @@ impl FastPairBatteryProvider {
 
     pub async fn features(&self, device: &Device, connected: bool) -> Option<FastPairFeatures> {
         let reported = self.runtime.read().await.get(&device.address()).cloned();
-        let mut runtime = reported.clone().unwrap_or_default();
+        let has_report = reported.is_some();
+        let mut runtime = reported.unwrap_or_default();
         if runtime.model_id.is_none() {
             runtime.model_id = device.service_data().await.ok().flatten().and_then(|data| {
                 data.get(&self.uuids.service)
@@ -993,7 +974,7 @@ impl FastPairBatteryProvider {
             .identities
             .device_key(device.adapter_name(), device.address());
         let account_key_available = self.account_keys.get(&device_key).is_some();
-        if reported.is_none() && runtime.model_id.is_none() && !account_key_available {
+        if !has_report && runtime.model_id.is_none() && !account_key_available {
             return None;
         }
         let model = runtime
@@ -1214,10 +1195,14 @@ impl FastPairBatteryProvider {
     async fn wait_for_provisioning_metadata(&self, address: Address) -> Result<RuntimeReport> {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                if let Some(runtime) = self.runtime.read().await.get(&address).cloned()
-                    && runtime.model_id.is_some()
+                if let Some(runtime) = self
+                    .runtime
+                    .read()
+                    .await
+                    .get(&address)
+                    .filter(|runtime| runtime.model_id.is_some())
                 {
-                    return runtime;
+                    return runtime.clone();
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1394,79 +1379,56 @@ impl FastPairBatteryProvider {
         else {
             return Ok(());
         };
-        match select_transport(
+        if let Some(transport) = select_transport(
             self.rfcomm_available,
             uuids.contains(&self.uuids.message_stream),
             uuids.contains(&self.uuids.service),
         ) {
-            Some(MessageStreamTransport::Rfcomm) => self.ensure_rfcomm_connected(device).await,
-            Some(MessageStreamTransport::L2cap) => self.ensure_l2cap_connected(device).await,
-            None => {}
+            self.ensure_connected(device, transport).await;
         }
         Ok(())
     }
 
-    async fn ensure_rfcomm_connected(self: &Arc<Self>, device: Device) {
-        if !self.connections.lock().await.begin(device.address()) {
+    async fn ensure_connected(self: &Arc<Self>, device: Device, transport: MessageStreamTransport) {
+        let address = device.address();
+        if !self.connections.lock().await.begin(address, transport) {
             return;
         }
         let provider = Arc::clone(self);
-        let address = device.address();
-        self.tasks.spawn("fast-pair-rfcomm-connect", async move {
-            let result = crate::task::catch("Fast Pair RFCOMM connection", async {
-                tokio::time::timeout(
-                    CONNECT_TIMEOUT,
-                    device.connect_profile(&provider.uuids.message_stream),
-                )
-                .await
-                .context("Fast Pair profile connection timed out")?
-                .context("Fast Pair profile connection failed")
-            })
-            .await;
-            if let Err(error) = result {
-                tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "Fast Pair RFCOMM connection failed");
-                provider.connections.lock().await.connection_failed(address);
-            }
-        });
-    }
-
-    async fn ensure_l2cap_connected(self: &Arc<Self>, device: Device) {
-        if !self
-            .connections
-            .lock()
-            .await
-            .retry
-            .l2cap_allowed(device.address())
-        {
-            return;
-        }
-        if !self.connections.lock().await.begin(device.address()) {
-            return;
-        }
-        let provider = Arc::clone(self);
-        let address = device.address();
-        self.tasks.spawn("fast-pair-l2cap-connect", async move {
-            let result = crate::task::catch("Fast Pair BLE L2CAP connection", async {
-                tokio::time::timeout(CONNECT_TIMEOUT, provider.connect_l2cap(&device))
+        self.tasks.spawn("fast-pair-connect", async move {
+            let result = crate::task::catch("Fast Pair connection", async {
+                tokio::time::timeout(CONNECT_TIMEOUT, provider.connect_transport(&device, transport))
                     .await
-                    .context("Fast Pair BLE L2CAP connection timed out")?
-            })
-            .await;
+                    .context("Fast Pair connection timed out")?
+            }).await;
             match result {
-                Ok(stream) if {
-                    let mut state = provider.connections.lock().await;
-                    state.mark_connected(address)
-                } => {
-                    tracing::debug!(%address, transport = "BLE L2CAP", "Fast Pair Message Stream connected");
+                Ok(Some(stream)) if provider.connections.lock().await.mark_connected(address) => {
+                    tracing::debug!(%address, ?transport, "Fast Pair Message Stream connected");
                     Self::spawn_reader(Arc::clone(&provider), address, "BLE L2CAP", stream);
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "Fast Pair BLE L2CAP connection failed");
+                    tracing::warn!(%address, ?transport, error = %error, error_chain = %format!("{error:#}"), "Fast Pair connection failed");
                     provider.connections.lock().await.connection_failed(address);
                 }
             }
         });
+    }
+
+    async fn connect_transport(
+        &self,
+        device: &Device,
+        transport: MessageStreamTransport,
+    ) -> Result<Option<L2capStream>> {
+        match transport {
+            // RFCOMM's stream is delivered to the registered profile handler.
+            MessageStreamTransport::Rfcomm => device
+                .connect_profile(&self.uuids.message_stream)
+                .await
+                .context("Fast Pair profile connection failed")
+                .map(|()| None),
+            MessageStreamTransport::L2cap => self.connect_l2cap(device).await.map(Some),
+        }
     }
 
     async fn connect_l2cap(&self, device: &Device) -> Result<L2capStream> {
@@ -1566,17 +1528,21 @@ impl FastPairBatteryProvider {
             .context("Fast Pair Message Stream writer ended")
     }
 
-    async fn update_runtime(&self, address: Address, update: impl FnOnce(&mut RuntimeReport)) {
-        let changed = {
+    async fn update_runtime<T: PartialEq>(
+        &self,
+        address: Address,
+        value: T,
+        field: fn(&mut RuntimeReport) -> &mut Option<T>,
+    ) {
+        {
             let mut reports = self.runtime.write().await;
-            let report = reports.entry(address).or_default();
-            let previous = report.clone();
-            update(report);
-            *report != previous
-        };
-        if changed {
-            let _ = self.changes.send(());
+            let target = field(reports.entry(address).or_default());
+            if target.as_ref() == Some(&value) {
+                return;
+            }
+            *target = Some(value);
         }
+        let _ = self.changes.send(());
     }
 
     async fn update_report(&self, address: Address, report: BatteryReport) {

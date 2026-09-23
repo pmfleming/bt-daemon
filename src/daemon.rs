@@ -1,7 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
 use serde_json::{Value, json};
 use shelllist_daemon_tokio::OwnedTaskRegistry;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -51,10 +50,6 @@ pub struct BluetoothDaemon {
 }
 
 impl BluetoothDaemon {
-    fn next_id(&self, prefix: &str) -> String {
-        self.subscriptions.next_id(prefix)
-    }
-
     async fn dispatch_call(
         &self,
         method: &str,
@@ -66,17 +61,7 @@ impl BluetoothDaemon {
             "bluetooth.protocol.describe" => {
                 api::success(json!({ "registry": protocol::registry() }))
             }
-            "bluetooth.scan" => {
-                let owner = owner.unwrap_or("internal");
-                let response = self.scans.start(&params, owner).await;
-                if response["ok"].as_bool() == Some(true)
-                    && let Some(connection) = connection
-                {
-                    self.watch_scan_owner(connection.clone(), owner.to_string())
-                        .await;
-                }
-                response
-            }
+            "bluetooth.scan" => self.start_scan(&params, owner, connection).await,
             "bluetooth.obex.send" => {
                 self.obex
                     .outgoing
@@ -109,7 +94,23 @@ impl BluetoothDaemon {
         }
     }
 
-    async fn watch_scan_owner(&self, connection: zbus::Connection, owner: String) {
+    async fn start_scan(
+        &self,
+        params: &Value,
+        owner: Option<&str>,
+        connection: Option<&zbus::Connection>,
+    ) -> Value {
+        let owner = owner.unwrap_or("internal");
+        let response = self.scans.start(params, owner).await;
+        if response["ok"].as_bool() == Some(true)
+            && let Some(connection) = connection
+        {
+            self.watch_scan_owner(connection, owner.to_owned()).await;
+        }
+        response
+    }
+
+    async fn watch_scan_owner(&self, connection: &zbus::Connection, owner: String) {
         let mut watches = self.scan_owner_watches.lock().await;
         if !watches.insert(owner.clone()) {
             return;
@@ -117,7 +118,7 @@ impl BluetoothDaemon {
         drop(watches);
         let scans = self.scans.clone();
         let watches = Arc::clone(&self.scan_owner_watches);
-        let monitor = self.subscriptions.owner_monitor(&connection);
+        let monitor = self.subscriptions.owner_monitor(connection);
         self.tasks.spawn("scan-owner-watch", async move {
             if let Err(error) = monitor.wait(&owner).await {
                 tracing::warn!(%owner, %error, "scan owner monitoring failed; releasing scans");
@@ -219,95 +220,6 @@ impl BluetoothDaemon {
     #[zbus(signal)]
     async fn event(emitter: &SignalEmitter<'_>, stream: &str, event_json: &str)
     -> zbus::Result<()>;
-}
-
-async fn emit_snapshot(
-    emitter: &SignalEmitter<'_>,
-    snapshot: &SharedSnapshot,
-    subscription_id: &str,
-    event: &str,
-) {
-    let value = match snapshot {
-        SharedSnapshot::Loading => json!({
-            "protocol": api::PROTOCOL,
-            "version": api::VERSION,
-            "stream": CHANGED_STREAM,
-            "event": "loading",
-            "subscription_id": subscription_id,
-            "data": { "status": "loading" }
-        }),
-        SharedSnapshot::Available(snapshot) => json!({
-            "protocol": api::PROTOCOL,
-            "version": api::VERSION,
-            "stream": CHANGED_STREAM,
-            "event": event,
-            "subscription_id": subscription_id,
-            "data": { "snapshot": snapshot }
-        }),
-        SharedSnapshot::Unavailable(error) => json!({
-            "protocol": api::PROTOCOL,
-            "version": api::VERSION,
-            "stream": CHANGED_STREAM,
-            "event": "unavailable",
-            "subscription_id": subscription_id,
-            "error": { "code": "bluez-unavailable", "message": error }
-        }),
-    };
-    if let Err(error) = BluetoothDaemon::event(emitter, CHANGED_STREAM, &value.to_string()).await {
-        tracing::warn!(%error, %subscription_id, "could not emit Bluetooth subscription event");
-    }
-}
-
-async fn emit_stream<T: Serialize>(
-    emitter: &SignalEmitter<'_>,
-    stream: &str,
-    subscription_id: &str,
-    event: &str,
-    data: &T,
-) {
-    let result = shelllist_daemon_tokio::emit_json_event(
-        emitter,
-        INTERFACE,
-        shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
-        stream,
-        event,
-        shelllist_daemon_core::Correlation::Subscription(subscription_id),
-        json!({ "data": data }),
-    )
-    .await;
-    if let Err(error) = result {
-        tracing::warn!(%error, %stream, %subscription_id, "could not emit subscription event");
-    }
-}
-
-async fn emit_audio(
-    emitter: &SignalEmitter<'_>,
-    envelope: &Value,
-    subscription_id: &str,
-    event: &str,
-) {
-    let value = if envelope["ok"].as_bool().unwrap_or(false) {
-        json!({
-            "protocol": api::PROTOCOL,
-            "version": api::VERSION,
-            "stream": AUDIO_STREAM,
-            "event": event,
-            "subscription_id": subscription_id,
-            "data": { "audio_devices": envelope["data"]["audio_devices"].clone() }
-        })
-    } else {
-        json!({
-            "protocol": api::PROTOCOL,
-            "version": api::VERSION,
-            "stream": AUDIO_STREAM,
-            "event": "unavailable",
-            "subscription_id": subscription_id,
-            "error": envelope["error"].clone()
-        })
-    };
-    if let Err(error) = BluetoothDaemon::event(emitter, AUDIO_STREAM, &value.to_string()).await {
-        tracing::warn!(%error, %subscription_id, "could not emit Bluetooth audio event");
-    }
 }
 
 /// Export the session service and run until shutdown is requested.

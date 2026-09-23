@@ -204,7 +204,8 @@ impl ScanCoordinator {
         let events = self.events.clone();
         crate::task::spawn("scan-timeout", async move {
             tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-            let mut failure_emitted = false;
+            // Taking the adapter consumes the right to publish a terminal event.
+            let mut terminal_adapter = Some(task_adapter);
             loop {
                 let _transition = transition.lock().await;
                 let Some(adapters) = removable_adapters(&tasks, &task_id).await else {
@@ -215,28 +216,18 @@ impl ScanCoordinator {
                     stop_adapters(&backend, &adapters),
                 )
                 .await;
-                match result {
-                    Ok(snapshot) => {
-                        tasks.lock().await.remove(&task_id);
-                        if failure_emitted {
-                            tracing::info!(%task_id, "Bluetooth scan cleanup eventually succeeded");
-                        } else {
-                            let terminal = terminal_event(task_id, task_adapter, Ok(snapshot));
-                            let _ = events.send(terminal);
-                        }
-                        return;
-                    }
-                    Err(error) => {
-                        if !failure_emitted {
-                            let terminal =
-                                terminal_event(task_id.clone(), task_adapter.clone(), Err(error));
-                            let _ = events.send(terminal);
-                            failure_emitted = true;
-                        } else {
-                            tracing::warn!(%task_id, "Bluetooth scan cleanup is retrying");
-                        }
-                    }
+                let completed = result.is_ok();
+                if completed {
+                    tasks.lock().await.remove(&task_id);
+                    tracing::info!(%task_id, "Bluetooth scan cleanup succeeded");
                 }
+                if let Some(adapter) = terminal_adapter.take() {
+                    let _ = events.send(terminal_event(task_id.clone(), adapter, result));
+                }
+                if completed {
+                    return;
+                }
+                tracing::warn!(%task_id, "Bluetooth scan cleanup is retrying");
                 drop(_transition);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -401,22 +392,15 @@ async fn stop_adapters(
     backend: &Arc<dyn BluetoothBackend>,
     adapter_keys: &[String],
 ) -> anyhow::Result<crate::model::Snapshot> {
-    let mut snapshot = None;
-    let mut first_error = None;
+    let mut result = Ok(None);
     for adapter_key in adapter_keys {
-        match backend.set_scanning(Some(adapter_key), false).await {
-            Ok(current) => snapshot = Some(current),
-            Err(error) if first_error.is_none() => first_error = Some(error),
-            Err(_) => {}
-        }
+        // Attempt every adapter, preserving the first error or the last snapshot.
+        let current = backend.set_scanning(Some(adapter_key), false).await;
+        result = result.and(current.map(Some));
     }
-    if let Some(error) = first_error {
-        Err(error)
-    } else {
-        match snapshot {
-            Some(snapshot) => Ok(snapshot),
-            None => backend.snapshot().await,
-        }
+    match result? {
+        Some(snapshot) => Ok(snapshot),
+        None => backend.snapshot().await,
     }
 }
 

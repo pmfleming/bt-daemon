@@ -171,13 +171,11 @@ fn bind_monitor_object(
 /// Run the blocking PipeWire change monitor until its connection ends.
 /// Invoke on a dedicated thread; callbacks should return promptly.
 pub fn monitor(on_change: ChangeCallback) -> Result<()> {
-    initialize();
-    let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire monitor loop")?;
-    let context =
-        pw::context::ContextRc::new(&main_loop, None).context("create PipeWire monitor context")?;
-    let core = context
-        .connect_rc(None)
-        .context("connect PipeWire monitor")?;
+    let PipewireSession {
+        main_loop,
+        core,
+        registry,
+    } = pipewire_session()?;
     // A disconnected PipeWire core does not stop MainLoop by itself. Without
     // this listener the outer retry loop can never build a fresh connection.
     let failed = Rc::new(RefCell::new(None::<String>));
@@ -195,9 +193,6 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
             }
         })
         .register();
-    let registry = core
-        .get_registry_rc()
-        .context("open PipeWire monitor registry")?;
     let registry_weak = registry.downgrade();
     let objects = Rc::new(RefCell::new(Objects::default()));
     let objects_for_registry = Rc::clone(&objects);
@@ -249,15 +244,21 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
 /// Probe Bluetooth PipeWire objects using bounded synchronization round trips.
 /// This is blocking I/O and should not run on a Tokio worker thread.
 pub fn probe() -> Result<Vec<AudioDevice>> {
-    initialize();
-    probe_inner()
-}
-
-/// Activate a PipeWire profile for the Bluetooth address and confirm the result.
-/// Returns an error if the device/profile disappears or activation is not observed.
-pub fn set_profile(address: &str, index: u32) -> Result<()> {
-    initialize();
-    set_profile_inner(address, index)
+    let session = pipewire_session()?;
+    let registry_weak = session.registry.downgrade();
+    let state = ProbeState::default();
+    let state_for_registry = state.clone();
+    let _registry_listener = session
+        .registry
+        .add_listener_local()
+        .global(move |global| {
+            if let Some(registry) = registry_weak.upgrade() {
+                state_for_registry.bind_global(&registry, global);
+            }
+        })
+        .register();
+    session.settle()?;
+    Ok(state.finish())
 }
 
 /// Make this Bluetooth device's sink the PipeWire default; performs blocking I/O.
@@ -271,8 +272,7 @@ pub fn set_default_source(address: &str) -> Result<()> {
 }
 
 fn set_default_endpoint(address: &str, kind: EndpointKind) -> Result<()> {
-    initialize();
-    let devices = probe_inner()?;
+    let devices = probe()?;
     let device = devices
         .iter()
         .find(|device| device.address.eq_ignore_ascii_case(address))
@@ -321,16 +321,16 @@ fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
             }
         })
         .register();
-    pipewire_roundtrip(&session.main_loop, &session.core)?;
-    pipewire_roundtrip(&session.main_loop, &session.core)?;
+    session.settle()?;
     if !applied.get() {
         anyhow::bail!("PipeWire default metadata is unavailable");
     }
     Ok(())
 }
 
-fn set_profile_inner(address: &str, index: u32) -> Result<()> {
-    let requested_index = index;
+/// Activate a PipeWire profile for the Bluetooth address and confirm the result.
+/// Returns an error if the device/profile disappears or activation is not observed.
+pub fn set_profile(address: &str, index: u32) -> Result<()> {
     let bytes = profile_parameter(index)?;
     let session = pipewire_session()?;
     let registry = &session.registry;
@@ -356,7 +356,7 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
                 &registry,
                 global,
                 &bytes,
-                requested_index,
+                index,
                 Rc::clone(&confirmed_for_registry),
                 &objects_for_registry,
             ) {
@@ -364,8 +364,7 @@ fn set_profile_inner(address: &str, index: u32) -> Result<()> {
             }
         })
         .register();
-    pipewire_roundtrip(&session.main_loop, &session.core)?;
-    pipewire_roundtrip(&session.main_loop, &session.core)?;
+    session.settle()?;
     if !confirmed.get() {
         anyhow::bail!("PipeWire did not activate the requested Bluetooth audio profile");
     }
@@ -421,33 +420,22 @@ fn apply_profile(
     Ok(())
 }
 
-fn probe_inner() -> Result<Vec<AudioDevice>> {
-    let session = pipewire_session()?;
-    let registry = &session.registry;
-    let registry_weak = registry.downgrade();
-    let state = ProbeState::default();
-    let state_for_registry = state.clone();
-    let _registry_listener = registry
-        .add_listener_local()
-        .global(move |global| {
-            if let Some(registry) = registry_weak.upgrade() {
-                state_for_registry.bind_global(&registry, global);
-            }
-        })
-        .register();
-
-    pipewire_roundtrip(&session.main_loop, &session.core)?;
-    pipewire_roundtrip(&session.main_loop, &session.core)?;
-    Ok(state.finish())
-}
-
 struct PipewireSession {
     main_loop: pw::main_loop::MainLoopRc,
     core: pw::core::CoreRc,
     registry: pw::registry::RegistryRc,
 }
 
+impl PipewireSession {
+    fn settle(&self) -> Result<()> {
+        // First discover/bind globals, then receive their parameters or confirm writes.
+        pipewire_roundtrip(&self.main_loop, &self.core)?;
+        pipewire_roundtrip(&self.main_loop, &self.core)
+    }
+}
+
 fn pipewire_session() -> Result<PipewireSession> {
+    initialize();
     let main_loop = pw::main_loop::MainLoopRc::new(None).context("create PipeWire main loop")?;
     let context =
         pw::context::ContextRc::new(&main_loop, None).context("create PipeWire context")?;
@@ -649,8 +637,12 @@ impl ProbeState {
 
     fn finish(&self) -> Vec<AudioDevice> {
         finalize_devices(
-            self.devices.borrow().values().cloned().collect(),
-            &self.endpoints.borrow(),
+            self.devices
+                .borrow_mut()
+                .drain()
+                .map(|(_, device)| device)
+                .collect(),
+            &mut self.endpoints.borrow_mut(),
             &self.defaults.borrow(),
         )
     }
@@ -698,14 +690,16 @@ fn update_default(defaults: &mut Defaults, key: &str, value: String) {
 
 fn finalize_devices(
     mut devices: Vec<AudioDevice>,
-    endpoints: &HashMap<u32, DeviceEndpoints>,
+    endpoints: &mut HashMap<u32, DeviceEndpoints>,
     defaults: &Defaults,
 ) -> Vec<AudioDevice> {
     for device in &mut devices {
-        device.profiles.sort_by_key(|profile| -profile.priority);
-        if let Some(device_endpoints) = endpoints.get(&device.pipewire_id) {
-            device.sink = device_endpoints.sink.clone();
-            device.source = device_endpoints.source.clone();
+        device
+            .profiles
+            .sort_by_key(|profile| std::cmp::Reverse(profile.priority));
+        if let Some(device_endpoints) = endpoints.remove(&device.pipewire_id) {
+            device.sink = device_endpoints.sink;
+            device.source = device_endpoints.source;
         }
         if let Some(sink) = &mut device.sink {
             sink.is_default = sink.name == defaults.sink;
@@ -828,7 +822,10 @@ mod tests {
             pipewire::spa::param::ParamType::Profile,
             audio_profile(2, 0),
         );
-        let endpoints = HashMap::from([(
+        device
+            .profiles
+            .extend([audio_profile(1, i32::MIN), audio_profile(3, i32::MAX)]);
+        let mut endpoints = HashMap::from([(
             7,
             DeviceEndpoints {
                 sink: Some(AudioEndpoint {
@@ -841,13 +838,21 @@ mod tests {
         )]);
         let devices = finalize_devices(
             vec![device],
-            &endpoints,
+            &mut endpoints,
             &Defaults {
                 sink: "bluez_output.7".into(),
                 source: String::new(),
             },
         );
-        assert_eq!(devices[0].profiles.len(), 1);
+        assert_eq!(
+            devices[0]
+                .profiles
+                .iter()
+                .map(|profile| profile.index)
+                .collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        assert!(endpoints.is_empty());
         assert_eq!(devices[0].active_profile, Some(2));
         assert!(devices[0].sink.as_ref().unwrap().is_default);
     }

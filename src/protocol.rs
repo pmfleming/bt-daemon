@@ -100,39 +100,35 @@ fn required_capability(name: &str) -> Option<&'static str> {
     }
 }
 
-fn params_schema(name: &str, encoded: &str) -> Value {
-    let example = match serde_json::from_str::<Value>(encoded) {
-        Ok(example) if example.is_object() => example,
-        result => {
-            // A broken built-in fixture must not panic the running daemon or
-            // advertise an unconstrained schema. Boolean false rejects all values.
-            tracing::error!(
-                method = name,
-                ?result,
-                "invalid protocol example; advertising a rejecting parameter schema"
-            );
-            return Value::Bool(false);
-        }
+fn parameter_contract(name: &str, encoded: &str) -> (Value, Value) {
+    let Ok(Value::Object(object)) = serde_json::from_str(encoded) else {
+        // Invalid built-in examples must neither panic nor advertise an unconstrained schema.
+        tracing::error!(
+            method = name,
+            "invalid protocol example; advertising a rejecting parameter schema"
+        );
+        return (Value::Null, Value::Bool(false));
     };
     let mut properties = Map::new();
     let mut required = Vec::new();
-    if let Some(object) = example.as_object() {
-        for (key, value) in object {
-            let mut schema = inferred_schema(value);
-            apply_constraints(name, key, &mut schema);
-            properties.insert(key.clone(), schema);
-            if required_parameters(name).contains(&key.as_str()) {
-                required.push(Value::String(key.clone()));
-            }
+    for (key, value) in &object {
+        let mut schema = inferred_schema(value);
+        apply_constraints(name, key, &mut schema);
+        properties.insert(key.clone(), schema);
+        if required_parameters(name).contains(&key.as_str()) {
+            required.push(Value::String(key.clone()));
         }
     }
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": true,
-    })
+    (
+        Value::Object(object),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": true,
+        }),
+    )
 }
 
 fn required_parameters(name: &str) -> &'static [&'static str] {
@@ -248,16 +244,17 @@ fn error_registry() -> Value {
 
 /// Build the offline machine-readable method, parameter-schema and event registry.
 pub fn registry() -> Value {
+    let parameters = operation_parameters();
     json!({
         "protocol": NAME,
         "version": VERSION,
         "methods": METHODS.iter().map(|(name, params, response_key, stream)| {
-            let example = serde_json::from_str::<Value>(params).expect("valid protocol fixture");
+            let (example, schema) = parameter_contract(name, params);
             json!({
                 "name": name,
                 "description": method_description(name),
                 "params_example": example,
-                "params_schema": params_schema(name, params),
+                "params_schema": schema,
                 "response_key": response_key,
                 "stream": stream,
                 "cancellable": matches!(*name, "bluetooth.scan" | "bluetooth.device.operation" | "bluetooth.obex.send"),
@@ -271,11 +268,11 @@ pub fn registry() -> Value {
         "operations": {
             "adapter": {
                 "names": AdapterOperation::VALUES,
-                "parameters": operation_parameters()["adapter"].clone(),
+                "parameters": parameters["adapter"],
             },
             "device": {
                 "names": DeviceOperation::VALUES,
-                "parameters": operation_parameters()["device"].clone(),
+                "parameters": parameters["device"],
             },
         },
         "errors": error_registry(),
@@ -303,13 +300,13 @@ mod tests {
     fn malformed_parameter_examples_fail_closed_without_panicking() {
         for encoded in ["{broken", "null", "[]", "true", "42"] {
             assert_eq!(
-                super::params_schema("test-method", encoded),
-                serde_json::json!(false)
+                super::parameter_contract("test-method", encoded),
+                (serde_json::Value::Null, serde_json::json!(false))
             );
         }
         for (method, example, _, _) in METHODS {
             assert!(
-                super::params_schema(method, example).is_object(),
+                super::parameter_contract(method, example).1.is_object(),
                 "{method}"
             );
         }

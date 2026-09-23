@@ -59,7 +59,7 @@ pub struct DevicePolicy {
     pub preferred_audio_profile_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct DevicePolicyOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reconnect_on_resume: Option<bool>,
@@ -195,7 +195,6 @@ impl ManagementStore {
         let object = values
             .as_object()
             .context("management update must be an object")?;
-        validate_setting_names(object)?;
         let mut policy = self.policy_lock();
         let mut updated = policy.clone();
         updated.apply(object)?;
@@ -205,33 +204,24 @@ impl ManagementStore {
     }
 
     pub fn device_policy(&self, device_key: &str) -> DevicePolicy {
-        let global = self.policy();
-        let overrides = self
-            .device_policy_lock()
+        let global = self.policy_lock();
+        self.device_policy_lock()
             .devices
             .get(device_key)
-            .cloned()
-            .unwrap_or_default();
-        overrides.effective(&global)
+            .unwrap_or(&DevicePolicyOverrides::default())
+            .effective(&global)
     }
 
     pub fn update_device_policy(&self, device_key: &str, values: &Value) -> Result<DevicePolicy> {
         let object = values
             .as_object()
             .context("device policy update must be an object")?;
-        validate_device_setting_names(object)?;
         let mut policies = self.device_policy_lock();
-        let mut updated = policies
-            .devices
-            .get(device_key)
-            .cloned()
-            .unwrap_or_default();
-        updated.apply(object)?;
         let mut next = policies.clone();
-        if updated.is_empty() {
+        let updated = next.devices.entry(device_key.to_string()).or_default();
+        updated.apply(object)?;
+        if *updated == DevicePolicyOverrides::default() {
             next.devices.remove(device_key);
-        } else {
-            next.devices.insert(device_key.to_string(), updated);
         }
         self.persist_device_policies(&next)?;
         *policies = next;
@@ -299,24 +289,30 @@ impl ManagementStore {
 
 impl ManagementPolicy {
     fn apply(&mut self, object: &serde_json::Map<String, Value>) -> Result<()> {
-        if let Some(value) = object.get("launch_state") {
-            let value = value.as_str().context("launch_state must be a string")?;
-            validate_launch_state(value)?;
-            self.launch_state = value.into();
-        }
-        for (name, target) in [
-            ("reconnect_on_resume", &mut self.reconnect_on_resume),
-            ("trust_after_pair", &mut self.trust_after_pair),
-            ("show_blocked_devices", &mut self.show_blocked_devices),
-            ("show_recent_devices", &mut self.show_recent_devices),
-        ] {
-            update_bool(object, name, target)?;
-        }
-        if let Some(value) = object.get("preferred_adapter_key") {
-            self.preferred_adapter_key = value
-                .as_str()
-                .context("preferred_adapter_key must be a string")?
-                .into();
+        for (name, value) in object {
+            let target = match name.as_str() {
+                "launch_state" => {
+                    let value = value.as_str().context("launch_state must be a string")?;
+                    validate_launch_state(value)?;
+                    self.launch_state = value.into();
+                    continue;
+                }
+                "preferred_adapter_key" => {
+                    self.preferred_adapter_key = value
+                        .as_str()
+                        .context("preferred_adapter_key must be a string")?
+                        .into();
+                    continue;
+                }
+                "reconnect_on_resume" => &mut self.reconnect_on_resume,
+                "trust_after_pair" => &mut self.trust_after_pair,
+                "show_blocked_devices" => &mut self.show_blocked_devices,
+                "show_recent_devices" => &mut self.show_recent_devices,
+                _ => bail!("unsupported management setting '{name}'"),
+            };
+            *target = value
+                .as_bool()
+                .with_context(|| format!("{name} must be a boolean"))?;
         }
         Ok(())
     }
@@ -341,47 +337,46 @@ impl DevicePolicyOverrides {
     }
 
     fn apply(&mut self, object: &serde_json::Map<String, Value>) -> Result<()> {
-        for (name, target) in [
-            ("reconnect_on_resume", &mut self.reconnect_on_resume),
-            ("trust_after_pair", &mut self.trust_after_pair),
-            ("power_on_connect", &mut self.power_on_connect),
-            ("wait_for_services", &mut self.wait_for_services),
-            (
-                "fast_pair_controls_enabled",
-                &mut self.fast_pair_controls_enabled,
-            ),
-        ] {
-            update_optional_bool(object, name, target)?;
-        }
-        if let Some(value) = object.get("audio_route_on_connect") {
-            match value {
-                Value::Null => self.audio_route_on_connect = None,
-                Value::String(value) if ["keep", "switch"].contains(&value.as_str()) => {
-                    self.audio_route_on_connect = Some(value.clone());
+        for (name, value) in object {
+            let target = match name.as_str() {
+                "audio_route_on_connect" => {
+                    self.audio_route_on_connect = optional_value(
+                        value,
+                        name,
+                        |value| {
+                            value
+                                .as_str()
+                                .filter(|value| ["keep", "switch"].contains(value))
+                                .map(str::to_owned)
+                        },
+                        "keep, switch, or null",
+                    )?;
+                    continue;
                 }
-                _ => bail!("audio_route_on_connect must be keep, switch, or null"),
-            }
-        }
-        if let Some(value) = object.get("preferred_audio_profile_key") {
-            match value {
-                Value::Null => self.preferred_audio_profile_key = None,
-                Value::String(value) if !value.is_empty() => {
-                    self.preferred_audio_profile_key = Some(value.clone());
+                "preferred_audio_profile_key" => {
+                    self.preferred_audio_profile_key = optional_value(
+                        value,
+                        name,
+                        |value| {
+                            value
+                                .as_str()
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_owned)
+                        },
+                        "a non-empty string or null",
+                    )?;
+                    continue;
                 }
-                _ => bail!("preferred_audio_profile_key must be a non-empty string or null"),
-            }
+                "reconnect_on_resume" => &mut self.reconnect_on_resume,
+                "trust_after_pair" => &mut self.trust_after_pair,
+                "power_on_connect" => &mut self.power_on_connect,
+                "wait_for_services" => &mut self.wait_for_services,
+                "fast_pair_controls_enabled" => &mut self.fast_pair_controls_enabled,
+                _ => bail!("unsupported per-device management setting '{name}'"),
+            };
+            *target = optional_value(value, name, Value::as_bool, "a boolean or null")?;
         }
         Ok(())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.reconnect_on_resume.is_none()
-            && self.trust_after_pair.is_none()
-            && self.power_on_connect.is_none()
-            && self.wait_for_services.is_none()
-            && self.fast_pair_controls_enabled.is_none()
-            && self.audio_route_on_connect.is_none()
-            && self.preferred_audio_profile_key.is_none()
     }
 }
 
@@ -414,63 +409,18 @@ fn load_state<T: DeserializeOwned + Default>(
         .map(|value| value.flatten().unwrap_or_default())
 }
 
-fn validate_setting_names(object: &serde_json::Map<String, Value>) -> Result<()> {
-    const ALLOWED: &[&str] = &[
-        "launch_state",
-        "reconnect_on_resume",
-        "trust_after_pair",
-        "preferred_adapter_key",
-        "show_blocked_devices",
-        "show_recent_devices",
-    ];
-    if let Some(name) = object.keys().find(|name| !ALLOWED.contains(&name.as_str())) {
-        bail!("unsupported management setting '{name}'");
-    }
-    Ok(())
-}
-
-fn validate_device_setting_names(object: &serde_json::Map<String, Value>) -> Result<()> {
-    const ALLOWED: &[&str] = &[
-        "reconnect_on_resume",
-        "trust_after_pair",
-        "power_on_connect",
-        "wait_for_services",
-        "fast_pair_controls_enabled",
-        "audio_route_on_connect",
-        "preferred_audio_profile_key",
-    ];
-    if let Some(name) = object.keys().find(|name| !ALLOWED.contains(&name.as_str())) {
-        bail!("unsupported per-device management setting '{name}'");
-    }
-    Ok(())
-}
-
-fn update_optional_bool(
-    object: &serde_json::Map<String, Value>,
+fn optional_value<T>(
+    value: &Value,
     name: &str,
-    target: &mut Option<bool>,
-) -> Result<()> {
-    if let Some(value) = object.get(name) {
-        match value {
-            Value::Null => *target = None,
-            Value::Bool(value) => *target = Some(*value),
-            _ => bail!("{name} must be a boolean or null"),
-        }
+    parse: impl FnOnce(&Value) -> Option<T>,
+    expected: &str,
+) -> Result<Option<T>> {
+    match value {
+        Value::Null => Ok(None),
+        value => parse(value)
+            .map(Some)
+            .with_context(|| format!("{name} must be {expected}")),
     }
-    Ok(())
-}
-
-fn update_bool(
-    object: &serde_json::Map<String, Value>,
-    name: &str,
-    target: &mut bool,
-) -> Result<()> {
-    if let Some(value) = object.get(name) {
-        *target = value
-            .as_bool()
-            .with_context(|| format!("{name} must be a boolean"))?;
-    }
-    Ok(())
 }
 
 fn validate_launch_state(value: &str) -> Result<()> {
@@ -581,31 +531,42 @@ mod tests {
     #[test]
     fn device_policy_overrides_and_clears_global_defaults() {
         let store = ManagementStore::in_memory();
-        let policy = store
-            .update_device_policy(
-                "device-opaque",
-                &json!({
-                    "reconnect_on_resume": false,
-                    "power_on_connect": false,
-                    "audio_route_on_connect": "switch"
-                }),
-            )
-            .unwrap();
-        assert!(!policy.reconnect_on_resume);
-        assert!(!policy.power_on_connect);
-        assert_eq!(policy.audio_route_on_connect, "switch");
-        let reset = store
-            .update_device_policy(
-                "device-opaque",
-                &json!({
-                    "reconnect_on_resume": null,
-                    "power_on_connect": null,
-                    "audio_route_on_connect": null
-                }),
-            )
-            .unwrap();
-        assert!(reset.reconnect_on_resume);
-        assert!(reset.power_on_connect);
-        assert_eq!(reset.audio_route_on_connect, "keep");
+        let defaults = store.device_policy("peer");
+        for (name, value, invalid) in [
+            ("reconnect_on_resume", json!(false), json!("yes")),
+            ("trust_after_pair", json!(false), json!(0)),
+            ("power_on_connect", json!(false), json!([])),
+            ("wait_for_services", json!(false), json!({})),
+            ("fast_pair_controls_enabled", json!(false), json!(1)),
+            ("audio_route_on_connect", json!("switch"), json!("other")),
+            ("preferred_audio_profile_key", json!("profile"), json!("")),
+        ] {
+            let policy = store
+                .update_device_policy("peer", &json!({name: value}))
+                .unwrap();
+            assert_eq!(serde_json::to_value(&policy).unwrap()[name], value);
+            assert!(
+                store
+                    .update_device_policy("peer", &json!({name: invalid}))
+                    .is_err()
+            );
+            assert_eq!(store.device_policy("peer"), policy);
+            assert_eq!(
+                store
+                    .update_device_policy("peer", &json!({name: null}))
+                    .unwrap(),
+                defaults
+            );
+        }
+        assert!(
+            store
+                .update_device_policy(
+                    "peer",
+                    &json!({"audio_route_on_connect": "switch", "unknown": true})
+                )
+                .is_err()
+        );
+        assert_eq!(store.device_policy("peer"), defaults);
+        assert!(!store.device_policy_lock().devices.contains_key("peer"));
     }
 }

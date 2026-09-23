@@ -1,11 +1,16 @@
 //! Ordered device-operation effects, independently testable without D-Bus.
-use anyhow::Result;
+use std::{sync::Arc, time::Duration};
+
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{BluezAdapter, BluezBackend, BluezDevice};
-use crate::backend::{DeviceOperation, OperationProgress, Params};
 use crate::management::DevicePolicy;
+use crate::{
+    audio,
+    backend::{DeviceOperation, OperationProgress, Params},
+};
 
 pub(super) struct Plan {
     operation: DeviceOperation,
@@ -114,7 +119,66 @@ impl Effects for DeviceEffects<'_> {
     }
 
     async fn route_audio(&self) -> Result<()> {
-        super::apply_audio_policy(self.key, self.device.address(), self.policy, self.progress).await
+        (self.progress)("waiting-for-audio");
+        let request = Arc::new(AudioPolicyRequest {
+            device_key: self.key.to_string(),
+            address: self.device.address().to_string(),
+            preferred_profile_key: self.policy.preferred_audio_profile_key.clone(),
+            switch_output: self.policy.audio_route_on_connect == "switch",
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let attempt = Arc::clone(&request);
+            let result = tokio::task::spawn_blocking(move || attempt.apply())
+                .await
+                .context("Bluetooth audio policy task failed")?;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(%error, device_key = self.key, "Bluetooth audio policy is waiting for PipeWire");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(error) => return Err(error.context("apply Bluetooth per-device audio policy")),
+            }
+        }
+    }
+}
+
+struct AudioPolicyRequest {
+    device_key: String,
+    address: String,
+    preferred_profile_key: Option<String>,
+    switch_output: bool,
+}
+
+impl AudioPolicyRequest {
+    fn apply(&self) -> Result<()> {
+        let device = audio::probe()?
+            .into_iter()
+            .find(|device| device.address.eq_ignore_ascii_case(&self.address))
+            .context("Bluetooth audio card is not ready")?;
+        if let Some(profile) = self.preferred_profile(&device)? {
+            audio::set_profile(&self.address, profile)?;
+        }
+        if self.switch_output {
+            audio::set_default_sink(&self.address)?;
+        }
+        Ok(())
+    }
+
+    fn preferred_profile(&self, device: &audio::AudioDevice) -> Result<Option<u32>> {
+        let Some(profile_key) = &self.preferred_profile_key else {
+            return Ok(None);
+        };
+        let profile = device
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.available
+                    && audio::profile_key(&self.device_key, &profile.name) == *profile_key
+            })
+            .context("preferred Bluetooth audio profile is unavailable")?;
+        Ok((device.active_profile != Some(profile.index)).then_some(profile.index))
     }
 }
 

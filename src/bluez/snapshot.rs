@@ -6,7 +6,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
-    identity::DeviceIdentityRegistry,
+    identity::{DeviceIdentityRegistry, RememberedPresentationValues},
     model::{
         Adapter, Battery, Device, DeviceCapabilities, Snapshot, presentation_components,
         presentation_type,
@@ -231,19 +231,21 @@ async fn device_snapshot(
         backend.identities.device_key(adapter.name(), identity)
     };
     let now_ms = unix_time_ms();
-    let cached = backend
-        .device_cache
-        .lock()
-        .await
-        .get(&key)
-        .filter(|cached| cache_entry_is_fresh(cached.observed_at_ms, now_ms))
-        .cloned();
-    if !should_include_device(state.paired, present, cached.is_some()) {
+    let (cached, signal) = {
+        let cache = backend.device_cache.lock().await;
+        let cached = cache
+            .get(&key)
+            .filter(|cached| cache_entry_is_fresh(cached.observed_at_ms, now_ms));
+        (
+            cached.is_some(),
+            assembly::Signal::resolve(observation.as_ref(), cached, signal_live),
+        )
+    };
+    if !should_include_device(state.paired, present, cached) {
         tracing::trace!(device_key = %key, paired = state.paired, present, "device omitted from snapshot");
         return Ok(None);
     }
     let metadata = DeviceMetadata::read(device).await?;
-    let signal = assembly::Signal::resolve(observation.as_ref(), cached.as_ref(), signal_live);
     let observed_battery = device_batteries(
         device,
         identity,
@@ -260,7 +262,7 @@ async fn device_snapshot(
         &key,
         state.paired,
         state.connected,
-        metadata.icon.clone(),
+        metadata.icon.as_deref(),
         fast_pair_features
             .as_ref()
             .and_then(|features| features.model_id.as_deref()),
@@ -303,25 +305,23 @@ fn presentation(
     key: &str,
     paired: bool,
     connected: bool,
-    icon: Option<String>,
+    icon: Option<&str>,
     model_id: Option<&str>,
     battery: Vec<Battery>,
 ) -> ResolvedPresentation {
-    if !paired {
+    let remembered = if paired {
+        identities.remember_presentation(key, icon, model_id, &battery)
+    } else {
         identities.forget_presentation(key);
-        return ResolvedPresentation {
-            device_type: presentation_type(icon.as_deref(), &battery).into(),
+        RememberedPresentationValues {
+            device_type: presentation_type(icon, &battery).into(),
             components: presentation_components(&battery),
             model_id: model_id.map(Into::into),
-            icon,
-            battery_live: connected && !battery.is_empty(),
-            battery_last_known: !connected && !battery.is_empty(),
-            battery,
-        };
-    }
-    let remembered = identities.remember_presentation(key, icon.as_deref(), model_id, &battery);
-    let icon = icon.filter(|icon| !icon.trim().is_empty());
-    let restored_icon = icon.is_none() && remembered.icon.is_some();
+            icon: icon.map(Into::into),
+            battery: Vec::new(),
+        }
+    };
+    let restored_icon = icon.is_none_or(|icon| icon.trim().is_empty()) && remembered.icon.is_some();
     let restored_battery = !connected && battery.is_empty() && !remembered.battery.is_empty();
     tracing::trace!(
         device_key = key,
@@ -337,7 +337,7 @@ fn presentation(
         battery
     };
     ResolvedPresentation {
-        icon: icon.or(remembered.icon),
+        icon: remembered.icon,
         device_type: remembered.device_type,
         model_id: remembered.model_id,
         components: remembered.components,
@@ -356,10 +356,7 @@ fn cached_device_view(cached: &CachedDevice) -> Device {
         device.presentation.battery_live = false;
         device.presentation.battery_last_known = true;
     }
-    let has_fast_pair = device.services.uuids.iter().any(|uuid| {
-        uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
-            || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
-    });
+    let has_fast_pair = has_fast_pair_service(&device.services.uuids);
     device.capabilities = device_capabilities(
         device.state.paired,
         false,
@@ -439,6 +436,13 @@ fn device_capabilities(
             can_set_noise_control,
         ),
     }
+}
+
+fn has_fast_pair_service(uuids: &[String]) -> bool {
+    uuids.iter().any(|uuid| {
+        uuid.eq_ignore_ascii_case(FAST_PAIR_SERVICE_UUID)
+            || uuid.eq_ignore_ascii_case(MESSAGE_STREAM_UUID)
+    })
 }
 
 fn fast_pair_capabilities(
