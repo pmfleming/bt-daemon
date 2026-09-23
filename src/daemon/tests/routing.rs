@@ -1,5 +1,5 @@
 use super::daemon;
-use crate::daemon::{SharedSnapshot, load_snapshot, receive_refresh};
+use crate::daemon::{SharedSnapshot, load_snapshot, receive_refresh, send_changed};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
@@ -29,6 +29,7 @@ async fn dispatch_routes_cached_snapshots_registry_and_request_recovery() {
         json!([])
     );
     assert_eq!(requests["data"]["requests"]["scans"]["active"], json!([]));
+    let mut watched = daemon.snapshots.subscribe();
     for (state, code) in [
         (SharedSnapshot::Loading, "snapshot-loading"),
         (
@@ -36,7 +37,11 @@ async fn dispatch_routes_cached_snapshots_registry_and_request_recovery() {
             "bluez-unavailable",
         ),
     ] {
-        daemon.snapshots.send_replace(state);
+        send_changed(&daemon.snapshots, state.clone());
+        assert!(watched.has_changed().unwrap());
+        watched.borrow_and_update();
+        send_changed(&daemon.snapshots, state);
+        assert!(!watched.has_changed().unwrap());
         let response = daemon
             .dispatch_call("bluetooth.snapshot", json!({}), None, None)
             .await;
@@ -59,7 +64,7 @@ async fn dispatch_routes_cached_snapshots_registry_and_request_recovery() {
 }
 
 #[tokio::test]
-async fn dispatch_validates_hardware_commands_before_any_io() {
+async fn dispatch_validates_commands_and_routes_supported_backend_mutations() {
     let (daemon, _, _) = daemon(true);
     for method in [
         "bluetooth.scan",
@@ -101,11 +106,6 @@ async fn dispatch_validates_hardware_commands_before_any_io() {
         .dispatch_call("bluetooth.unknown", json!({}), None, None)
         .await;
     assert_eq!(unsupported["error"]["code"], "unsupported-method");
-}
-
-#[tokio::test]
-async fn dispatch_delegates_backend_mutations_to_the_injected_backend() {
-    let (daemon, _, _) = daemon(true);
     for (method, params) in [
         ("bluetooth.setPowered", json!({"powered": true})),
         (
@@ -128,14 +128,14 @@ async fn dispatch_delegates_backend_mutations_to_the_injected_backend() {
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            4
         );
     }
 }
 
 #[tokio::test]
-async fn routed_operations_preserve_caller_ownership() {
-    let (daemon, mut events, _) = daemon(false);
+async fn routed_operations_and_scans_keep_cancellation_scoped_to_the_caller_and_request() {
+    let (daemon, mut events, mut scan_events) = daemon(false);
     let operation = daemon
         .dispatch_call(
             "bluetooth.device.operation",
@@ -147,6 +147,28 @@ async fn routed_operations_preserve_caller_ownership() {
     let id = super::operation_request_id(&operation, &mut events).await;
     let conflicting = super::start_operation(&daemon, "remove").await;
     assert_eq!(conflicting["error"]["code"], "device-busy");
+    for key in ["adapter-off", "adapter-idle", "adapter-missing"] {
+        let response = daemon
+            .dispatch_call(
+                "bluetooth.scan",
+                json!({"adapter_key": key}),
+                Some(":owner"),
+                None,
+            )
+            .await;
+        assert_eq!(response["error"]["code"], "scan-start-failed");
+        assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
+    }
+    let scan = daemon
+        .dispatch_call(
+            "bluetooth.scan",
+            json!({"adapter_key": "adapter-1", "timeout_ms": 1000}),
+            Some(":owner"),
+            None,
+        )
+        .await;
+    let scan_id = scan["data"]["scan"]["request_id"].as_str().unwrap();
+    assert_eq!(scan_events.recv().await.unwrap().state, "running");
     let cancelled = assert_owned_cancellation(&daemon, &id).await;
     assert_eq!(cancelled["data"]["kind"], "operation");
     loop {
@@ -159,24 +181,16 @@ async fn routed_operations_preserve_caller_ownership() {
             break;
         }
     }
-}
-
-#[tokio::test]
-async fn routed_scans_preserve_caller_ownership_without_a_bus_connection() {
-    let (daemon, _, mut events) = daemon(true);
-    let scan = daemon
-        .dispatch_call(
-            "bluetooth.scan",
-            json!({"adapter_key": "adapter-1", "timeout_ms": 1000}),
-            Some(":owner"),
-            None,
-        )
-        .await;
-    let id = scan["data"]["scan"]["request_id"].as_str().unwrap();
-    assert_eq!(events.recv().await.unwrap().state, "running");
-    let cancelled = assert_owned_cancellation(&daemon, id).await;
-    assert_eq!(cancelled["data"]["stopped"], id);
-    assert_eq!(events.recv().await.unwrap().state, "cancelled");
+    assert_eq!(
+        daemon.scans.snapshot().await["active"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let cancelled = assert_owned_cancellation(&daemon, scan_id).await;
+    assert_eq!(cancelled["data"]["stopped"], scan_id);
+    assert_eq!(scan_events.recv().await.unwrap().state, "cancelled");
     assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
 }
 

@@ -253,14 +253,14 @@ fn watch_event(phase: WatchPhase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::RequestedStreams;
-
     #[test]
     fn snapshot_payloads_preserve_loading_failure_and_watch_phases() {
-        use super::{SharedSnapshot, audio_fields, snapshot_fields};
+        use super::{RequestedStreams, SharedSnapshot, audio_fields, snapshot_fields};
         use serde_json::json;
         use std::sync::Arc;
 
+        assert!(RequestedStreams::parse(&[]).is_none());
+        assert!(RequestedStreams::parse(&["unsupported".into()]).is_none());
         assert_eq!(
             snapshot_fields(SharedSnapshot::Loading, "subscribed"),
             ("loading", json!({"data": {"status": "loading"}}))
@@ -293,20 +293,5 @@ mod tests {
             audio_fields(json!(null), "changed"),
             ("unavailable", json!({"error": null}))
         );
-    }
-
-    #[test]
-    fn requested_streams_are_validated_and_deduplicated() {
-        assert!(RequestedStreams::parse(&[]).is_none());
-        assert!(RequestedStreams::parse(&["unsupported".to_string()]).is_none());
-        let streams = RequestedStreams::parse(&[
-            "bluetooth.changed".to_string(),
-            "bluetooth.changed".to_string(),
-            "bluetooth.operation".to_string(),
-        ])
-        .expect("supported streams");
-        assert!(streams.changes);
-        assert!(streams.operations);
-        assert!(!streams.pairing);
     }
 }

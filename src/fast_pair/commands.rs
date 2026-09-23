@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_execution_drops_its_reservation_even_during_send() {
+    async fn command_outcomes_release_only_the_matching_reservation() {
         use futures::FutureExt;
         let pending = PendingCommands::default();
         let key = (Address::default(), 8, 0x12);
@@ -165,13 +165,6 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
-        assert!(pending.reserve(key).is_ok());
-    }
-
-    #[tokio::test]
-    async fn execution_reports_ack_rejection_send_failure_and_disconnect() {
-        let pending = PendingCommands::default();
-        let key = (Address::default(), 8, 0x12);
         pending
             .execute(key, async {
                 pending.resolve(key, Ok(()));
@@ -200,7 +193,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(disconnected.to_string().contains("cancelled"));
-        assert!(pending.reserve(key).is_ok());
+        let (old, _) = pending.reserve(key).unwrap();
+        pending.resolve(key, Ok(()));
+        let (_new, receiver) = pending.reserve(key).unwrap();
+        drop(old);
+        assert!(pending.reserve(key).is_err());
+        pending.resolve(key, Ok(()));
+        assert!(receiver.await.unwrap().is_ok());
     }
 
     #[test]
@@ -218,18 +217,5 @@ mod tests {
         ] {
             assert_ne!(&frame[13..], &other[13..]);
         }
-    }
-
-    #[test]
-    fn old_guard_cannot_remove_a_new_command_after_ack() {
-        let pending = PendingCommands::default();
-        let key = (Address::default(), 7, 0x12);
-        let (old, _) = pending.reserve(key).unwrap();
-        pending.resolve(key, Ok(()));
-        let (_new, _) = pending.reserve(key).unwrap();
-        drop(old);
-        assert!(pending.reserve(key).is_err());
-        pending.disconnect(key.0);
-        assert!(pending.reserve(key).is_ok());
     }
 }

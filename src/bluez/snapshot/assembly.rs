@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_properties_remain_unknown_not_fabricated() {
+    fn snapshots_preserve_unknown_fields_and_distinguish_observed_cached_and_connected_state() {
         let device = assemble(reading(), Signal::resolve(None, None, false));
         assert_eq!(device.identity.name, "Buds");
         assert_eq!(device.key, "opaque-peer");
@@ -222,10 +222,16 @@ mod tests {
                 Some(expected)
             );
         }
-    }
-
-    #[test]
-    fn stale_signal_is_retained_without_becoming_live_or_refreshing_cache_age() {
+        let mut services = reading();
+        services.metadata.uuids = vec![
+            "00001105-0000-1000-8000-00805F9B34FB".into(),
+            "00001105-0000-1000-8000-ffffffffffff".into(),
+        ];
+        let services = assemble(services, Signal::resolve(None, None, false))
+            .services
+            .services;
+        assert_eq!(services[0].label, "Object Push");
+        assert_eq!(services[1].label, "Bluetooth service");
         let device = assemble(
             reading(),
             Signal {
@@ -251,34 +257,19 @@ mod tests {
         assert!(current.presentation.present && current.capabilities.can_disconnect);
         assert!(!current.capabilities.can_connect);
         assert_eq!(current.state.bonded, Some(true));
-    }
-
-    #[test]
-    fn explicit_observations_override_cached_signal_but_missing_rssi_can_fall_back() {
-        let cached = cache_entry(
-            &assemble(
-                reading(),
-                Signal {
-                    rssi: Some(-90),
-                    last_seen_ms: Some(1),
-                    live: true,
-                },
-            ),
-            1,
-        )
-        .unwrap();
         let mut observations = Observations::default();
         let peer = bluer::Address::default();
         observations.record("hci0", peer, Some(-40));
         let seen = observations.get("hci0", peer).unwrap();
-        let signal = Signal::resolve(Some(&seen), Some(&cached), true);
-        assert_eq!(signal.rssi, Some(-40));
-        assert_eq!(signal.last_seen_ms, Some(seen.last_seen_ms));
+        let fresh = assemble(reading(), Signal::resolve(Some(&seen), Some(&cached), true));
+        assert_eq!(fresh.presentation.rssi, Some(-40));
+        assert_eq!(fresh.presentation.last_seen_ms, Some(seen.last_seen_ms));
+        assert!(fresh.presentation.present && fresh.presentation.signal_live);
         observations.record("hci0", peer, None);
         let missing = observations.get("hci0", peer).unwrap();
         assert_eq!(
             Signal::resolve(Some(&missing), Some(&cached), false).rssi,
-            Some(-90)
+            Some(-70)
         );
     }
 }

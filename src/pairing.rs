@@ -519,54 +519,6 @@ mod tests {
         (events, request)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn pairing_confirms_opaque_prompts_and_owner_loss_cancels_remaining_interactions() {
-        let identities = DeviceIdentityRegistry::in_memory();
-        let expected_key = identities.device_key("hci0", "AA:BB:CC:DD:EE:FF".parse().unwrap());
-        let broker = PairingBroker::new(identities);
-        let (mut events, request) = confirmation_request(&broker, Some("123456".into()));
-        let event = events.recv().await.unwrap();
-        assert_eq!(event.kind, "confirmation");
-        assert_eq!(event.value.as_deref(), Some("123456"));
-        assert_eq!(event.device_key, expected_key);
-        assert!(!event.device_key.contains("AA:BB"));
-        broker
-            .respond(&json!({"request_id": event.request_id, "accept": true}))
-            .await
-            .unwrap();
-        assert_eq!(request.await.unwrap(), Ok(()));
-        let (mut events, request) = confirmation_request(&broker, Some("123456".into()));
-        let prompt = events.recv().await.unwrap();
-        broker.display(
-            "display-pin",
-            "hci0",
-            "AA:BB:CC:DD:EE:FF".parse().unwrap(),
-            "secret".into(),
-            None,
-        );
-        assert_eq!(events.recv().await.unwrap().event, "display");
-        broker.cancel_all("bluez-unavailable");
-        assert!(matches!(request.await.unwrap(), Err(ReqError::Canceled)));
-        for _ in 0..2 {
-            let cancelled = events.recv().await.unwrap();
-            assert_eq!(cancelled.event, "cancelled");
-            assert_eq!(cancelled.reason.as_deref(), Some("bluez-unavailable"));
-            assert!(cancelled.value.is_none());
-            assert!(!cancelled.response_required);
-        }
-        assert!(broker.pending_events().is_empty());
-        assert!(
-            broker
-                .respond(&json!({"request_id":prompt.request_id,"accept":true}))
-                .await
-                .is_err()
-        );
-        broker.cancel_all("again");
-        tokio::time::advance(Duration::from_secs(61)).await;
-        tokio::task::yield_now().await;
-        assert!(events.try_recv().is_err());
-    }
-
     #[tokio::test]
     async fn display_progress_replaces_old_prompts_and_cancellation_clears_secrets() {
         for (kind, progress) in [
@@ -613,8 +565,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_invalid_passkeys_without_answering_bluez() {
-        let broker = PairingBroker::new(DeviceIdentityRegistry::in_memory());
+    async fn prompt_responses_preserve_identity_validate_passkeys_and_answer_bluez() {
+        let identities = DeviceIdentityRegistry::in_memory();
+        let expected_key = identities.device_key("hci0", "AA:BB:CC:DD:EE:FF".parse().unwrap());
+        let broker = PairingBroker::new(identities);
+        let (mut events, request) = confirmation_request(&broker, Some("123456".into()));
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.kind, "confirmation");
+        assert_eq!(event.value.as_deref(), Some("123456"));
+        assert_eq!(event.device_key, expected_key);
+        assert!(!event.device_key.contains("AA:BB"));
+        broker
+            .respond(&json!({"request_id": event.request_id, "accept": true}))
+            .await
+            .unwrap();
+        assert_eq!(request.await.unwrap(), Ok(()));
         let mut events = broker.subscribe();
         let request_broker = broker.clone();
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
@@ -638,23 +603,47 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn abandoned_or_expired_requests_emit_one_terminal_event_and_reject_late_answers() {
-        for reason in ["bluez-cancelled", "timeout"] {
+    async fn interrupted_pairing_clears_secrets_emits_once_and_rejects_late_answers() {
+        for reason in ["bluez-cancelled", "timeout", "bluez-unavailable"] {
             let broker = PairingBroker::with_timeout(
                 DeviceIdentityRegistry::in_memory(),
                 Duration::from_millis(10),
             );
-            let (mut events, request) = confirmation_request(&broker, None);
+            let (mut events, request) = confirmation_request(&broker, Some("123456".into()));
             let requested = events.recv().await.unwrap();
+            let mut expected = vec![requested.request_id.clone()];
+            if reason == "bluez-unavailable" {
+                expected.push(broker.display(
+                    "display-pin",
+                    "hci0",
+                    "AA:BB:CC:DD:EE:FF".parse().unwrap(),
+                    "secret".into(),
+                    None,
+                ));
+                assert_eq!(events.recv().await.unwrap().event, "display");
+                broker.cancel_all(reason);
+            }
             if reason == "bluez-cancelled" {
                 request.abort();
             }
-            let cancelled = events.recv().await.unwrap();
-            assert_eq!(cancelled.event, "cancelled");
-            assert_eq!(cancelled.request_id, requested.request_id);
-            assert_eq!(cancelled.reason.as_deref(), Some(reason));
-            assert!(!cancelled.response_required);
-            if reason == "timeout" {
+            let mut terminal_ids = Vec::new();
+            for _ in 0..expected.len() {
+                let cancelled = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(cancelled.event, "cancelled");
+                assert_eq!(cancelled.reason.as_deref(), Some(reason));
+                assert!(!cancelled.response_required);
+                assert!(cancelled.value.is_none() && cancelled.entered.is_none());
+                terminal_ids.push(cancelled.request_id);
+            }
+            expected.sort();
+            terminal_ids.sort();
+            assert_eq!(terminal_ids, expected);
+            if reason == "bluez-cancelled" {
+                assert!(request.await.unwrap_err().is_cancelled());
+            } else {
                 assert_eq!(request.await.unwrap(), Err(ReqError::Canceled));
             }
             assert!(broker.pending_events().is_empty());
@@ -664,7 +653,8 @@ mod tests {
                     .await
                     .is_err()
             );
-            tokio::time::advance(Duration::from_secs(1)).await;
+            broker.cancel_all("again");
+            tokio::time::advance(Duration::from_secs(61)).await;
             tokio::task::yield_now().await;
             assert!(events.try_recv().is_err());
         }

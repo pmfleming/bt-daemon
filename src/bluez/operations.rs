@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effects_follow_policy_and_stop_at_the_first_failure() {
+    async fn effects_follow_policy_and_stop_on_failure_or_cancellation() {
         for (op, expected) in [
             (DeviceOperation::Pair, vec!["power", "operation", "audio"]),
             (
@@ -267,26 +267,13 @@ mod tests {
                     BackendErrorKind::DeviceUnavailable
                 );
                 assert_eq!(*fake.calls.lock().unwrap(), expected[..=i]);
+                let cancelled = Fake {
+                    block: Some(stage),
+                    ..Fake::default()
+                };
+                assert!(execute(&cancelled, plan(op)).now_or_never().is_none());
+                assert_eq!(*cancelled.calls.lock().unwrap(), expected[..=i]);
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn cancellation_drops_pending_effect_without_advancing() {
-        for (op, stage, expected) in [
-            (
-                DeviceOperation::Connect,
-                "operation",
-                vec!["power", "operation"],
-            ),
-            (DeviceOperation::Remove, "revoke", vec!["revoke"]),
-        ] {
-            let fake = Fake {
-                block: Some(stage),
-                ..Fake::default()
-            };
-            assert!(execute(&fake, plan(op)).now_or_never().is_none());
-            assert_eq!(*fake.calls.lock().unwrap(), expected);
         }
     }
 

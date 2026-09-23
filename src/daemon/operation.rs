@@ -236,11 +236,6 @@ impl OperationCoordinator {
         let _ = self.events.send(terminal);
         true
     }
-
-    #[cfg(test)]
-    pub(super) async fn is_empty(&self) -> bool {
-        self.state.lock().await.tasks.iter().next().is_none()
-    }
 }
 
 fn operation_request(params: &Value) -> Result<(String, DeviceOperation), Value> {

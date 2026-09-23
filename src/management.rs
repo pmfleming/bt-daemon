@@ -479,22 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_device_policy_save_keeps_the_previous_state() {
-        let path = std::env::temp_dir().join(format!("bt-policy-blocker-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, "not a directory").unwrap();
-        let mut store = ManagementStore::in_memory();
-        store.device_policy_path = Some(path.join("device-policy.json"));
-        assert!(
-            store
-                .update_device_policy("buds", &json!({"fast_pair_controls_enabled": false}))
-                .is_err()
-        );
-        assert!(store.device_policy("buds").fast_pair_controls_enabled);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn device_policy_overrides_persist_validate_and_reset_without_affecting_other_peers() {
+    fn device_policy_updates_validate_persist_reset_and_roll_back_failed_saves() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("device-policy.json");
         let mut store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
@@ -538,6 +523,14 @@ mod tests {
         );
         assert_eq!(store.device_policy("peer"), defaults);
         assert!(!store.device_policy_lock().devices.contains_key("peer"));
+        // The existing policy file cannot serve as a parent directory for a new save.
+        store.device_policy_path = Some(path.join("blocked.json"));
+        assert!(
+            store
+                .update_device_policy("peer", &json!({"fast_pair_controls_enabled": false}))
+                .is_err()
+        );
+        assert_eq!(store.device_policy("peer"), defaults);
         let restored = ManagementStore::load(None, None, Some(path)).unwrap();
         assert_eq!(restored.device_policy("peer"), defaults);
     }

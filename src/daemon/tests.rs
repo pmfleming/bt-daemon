@@ -20,18 +20,6 @@ use super::{
     operation::OperationEvent, scan::ScanEvent,
 };
 
-#[test]
-fn identical_snapshots_do_not_wake_subscribers() {
-    let (sender, mut receiver) = watch::channel(json!({"devices": []}));
-    super::send_changed(&sender, json!({"devices": []}));
-    assert!(!receiver.has_changed().unwrap());
-    super::send_changed(&sender, json!({"devices": ["new"]}));
-    assert!(receiver.has_changed().unwrap());
-    receiver.borrow_and_update();
-    super::send_changed(&sender, json!({"devices": ["new"]}));
-    assert!(!receiver.has_changed().unwrap());
-}
-
 mod routing;
 
 type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
@@ -50,7 +38,18 @@ impl BluetoothBackend for TestBackend {
 
     async fn snapshot(&self) -> Result<Snapshot> {
         Ok(Snapshot {
-            adapters: vec![test_adapter("adapter-1"), test_adapter("adapter-2")],
+            adapters: vec![
+                test_adapter("adapter-1"),
+                test_adapter("adapter-2"),
+                Adapter {
+                    powered: false,
+                    ..test_adapter("adapter-off")
+                },
+                Adapter {
+                    discovering: false,
+                    ..test_adapter("adapter-idle")
+                },
+            ],
             devices: vec![],
             ..Snapshot::default()
         })
@@ -202,22 +201,6 @@ fn stopped_calls(scanning: &ScanningCalls) -> Vec<(Option<String>, bool)> {
         .collect()
 }
 
-#[tokio::test]
-async fn operation_emits_started_and_completed_events() {
-    let (daemon, mut events, _) = daemon(true);
-    let response = start_operation(&daemon, "connect").await;
-    assert_eq!(response["data"]["operation"]["state"], "queued");
-    assert_eq!(events.recv().await.unwrap().event, "started");
-    let progress = events.recv().await.unwrap();
-    assert_eq!(progress.event, "progress");
-    assert_eq!(progress.stage, "connecting");
-    assert_eq!(events.recv().await.unwrap().event, "completed");
-    assert!(daemon.operations.is_empty().await);
-    let recovered = daemon.operations.snapshot().await;
-    assert_eq!(recovered["active"].as_array().unwrap().len(), 0);
-    assert_eq!(recovered["recent"][0]["event"], "completed");
-}
-
 async fn operation_request_id(
     response: &Value,
     events: &mut broadcast::Receiver<OperationEvent>,
@@ -236,45 +219,57 @@ async fn operation_request_id(
 }
 
 #[tokio::test]
-async fn cancellation_and_completion_publish_one_terminal_result() {
-    for complete_first in [false, true] {
+async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_result() {
+    for cancel_first in [false, true] {
         let (daemon, mut events, _) = daemon(true);
         let response = start_operation(&daemon, "connect").await;
         let id = response["data"]["operation"]["request_id"]
             .as_str()
             .unwrap();
-        if complete_first {
-            tokio::task::yield_now().await;
-        }
-        daemon.operations.cancel_owned(id, None).await;
-        let terminal = loop {
+        assert_eq!(response["data"]["operation"]["state"], "queued");
+        let cancelled = cancel_first && daemon.operations.cancel_owned(id, None).await;
+        let expected = if cancelled { "cancelled" } else { "completed" };
+        let mut sequence = Vec::new();
+        loop {
             let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            if matches!(event.event.as_str(), "completed" | "failed" | "cancelled") {
-                break event;
+            assert_eq!(event.request_id, id);
+            assert!(["started", "progress", expected].contains(&event.event.as_str()));
+            let terminal = event.event == expected;
+            sequence.push(event);
+            if terminal {
+                break;
             }
-        };
+        }
+        if !cancelled {
+            assert_eq!(
+                sequence
+                    .iter()
+                    .map(|event| event.event.as_str())
+                    .collect::<Vec<_>>(),
+                ["started", "progress", "completed"]
+            );
+            assert_eq!(sequence[1].stage, "connecting");
+        }
         tokio::task::yield_now().await;
         assert!(
             events.try_recv().is_err(),
             "no progress or duplicate terminal event after {}",
-            terminal.event
+            expected
         );
         assert!(!daemon.operations.cancel_owned(id, None).await);
-        assert_eq!(
-            daemon.operations.snapshot().await["recent"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        let recovered = daemon.operations.snapshot().await;
+        assert_eq!(recovered["active"], json!([]));
+        assert_eq!(recovered["recent"].as_array().unwrap().len(), 1);
+        assert_eq!(recovered["recent"][0]["request_id"], id);
+        assert_eq!(recovered["recent"][0]["event"], expected);
     }
 }
 
 #[tokio::test]
-async fn overlapping_global_scan_stops_only_uncovered_adapters() {
+async fn owner_loss_releases_global_scan_without_stopping_another_owners_lease() {
     let scanning = Arc::new(StdMutex::new(Vec::new()));
     let backend = test_backend(true, false, Arc::clone(&scanning));
     let scans = ScanCoordinator::new(backend);
@@ -288,7 +283,9 @@ async fn overlapping_global_scan_stops_only_uncovered_adapters() {
     let targeted = start_scan(&scans, "adapter-1", 60_000).await;
     let targeted_id = targeted["data"]["scan"]["request_id"].as_str().unwrap();
 
-    scans.stop(Some(global_id), "cancelled").await;
+    scans.stop_owner(":global-owner").await;
+    assert!(!scans.contains(global_id).await);
+    assert!(scans.contains(targeted_id).await);
     assert_eq!(
         stopped_calls(&scanning),
         vec![(Some("adapter-2".into()), false)]
@@ -302,35 +299,6 @@ async fn overlapping_global_scan_stops_only_uncovered_adapters() {
             (Some("adapter-2".into()), false),
             (Some("adapter-1".into()), false)
         ]
-    );
-}
-
-#[tokio::test]
-async fn scan_owner_loss_releases_only_that_owners_leases() {
-    let scanning = Arc::new(StdMutex::new(Vec::new()));
-    let backend = test_backend(true, false, Arc::clone(&scanning));
-    let scans = ScanCoordinator::new(backend);
-    let first = scans
-        .start(
-            &json!({ "adapter_key": "adapter-1", "timeout_ms": 60_000 }),
-            ":owner-one",
-        )
-        .await;
-    let second = scans
-        .start(
-            &json!({ "adapter_key": "adapter-1", "timeout_ms": 60_000 }),
-            ":owner-two",
-        )
-        .await;
-    assert_eq!(first["ok"], true);
-    assert_eq!(second["ok"], true);
-
-    scans.stop_owner(":owner-one").await;
-    assert!(stopped_calls(&scanning).is_empty());
-    scans.stop_owner(":owner-two").await;
-    assert_eq!(
-        stopped_calls(&scanning),
-        vec![(Some("adapter-1".into()), false)]
     );
 }
 

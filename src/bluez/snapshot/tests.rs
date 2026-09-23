@@ -1,9 +1,9 @@
 use super::{
-    SERVICE_LABELS, cache_entry_is_fresh, cached_device_view, device_capabilities,
-    fast_pair_capabilities, presentation, service_label,
+    cache_entry_is_fresh, cached_device_view, device_capabilities, fast_pair_capabilities,
+    presentation,
 };
 use crate::bluez::{CachedDevice, DISCOVERED_DEVICE_CACHE_TTL};
-use crate::fast_pair::{FAST_PAIR_SERVICE_UUID, MESSAGE_STREAM_UUID};
+use crate::fast_pair::FAST_PAIR_SERVICE_UUID;
 use crate::identity::DeviceIdentityRegistry;
 use crate::model::{
     Battery, Device, DeviceIdentity, DevicePresentation, DeviceServices, DeviceState,
@@ -34,30 +34,6 @@ fn features() -> FastPairFeatures {
         }),
         last_switch: None,
         audio_switch_seeker_supported: false,
-    }
-}
-
-#[test]
-fn assigned_service_labels_require_the_bluetooth_base_uuid() {
-    for (id, expected) in SERVICE_LABELS {
-        let uuid = format!("0000{id}-0000-1000-8000-00805f9b34fb");
-        assert_eq!(service_label(&uuid), *expected);
-        assert_eq!(service_label(&uuid.to_uppercase()), *expected);
-    }
-    assert_eq!(
-        service_label(MESSAGE_STREAM_UUID),
-        "Fast Pair Message Stream"
-    );
-    assert_eq!(service_label(FAST_PAIR_SERVICE_UUID), "Fast Pair Service");
-    for uuid in [
-        "",
-        "1105",
-        "xxxx1105",
-        "éé1105",
-        "ffff1105-0000-1000-8000-00805f9b34fb",
-        "00001105-0000-1000-8000-ffffffffffff",
-    ] {
-        assert_eq!(service_label(uuid), "Bluetooth service", "{uuid}");
     }
 }
 

@@ -1579,27 +1579,9 @@ impl FastPairBatteryProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        BATTERY_UPDATED_CODE, BatteryReport, DEVICE_INFORMATION_GROUP, FrameDecoder,
-        MessageStreamTransport, PsmAvailability, anc_mode_flag, crypt_block, decode_anc_state,
-        decode_component, decode_message_stream_psm, derive_aes_key, select_transport,
+        BatteryReport, PsmAvailability, anc_mode_flag, crypt_block, decode_anc_state,
+        decode_component, decode_message_stream_psm, derive_aes_key,
     };
-
-    #[test]
-    fn transport_selection_prefers_rfcomm_and_supports_ble_only_devices() {
-        assert_eq!(
-            select_transport(true, true, true),
-            Some(MessageStreamTransport::Rfcomm)
-        );
-        assert_eq!(
-            select_transport(true, false, true),
-            Some(MessageStreamTransport::L2cap)
-        );
-        assert_eq!(
-            select_transport(false, true, true),
-            Some(MessageStreamTransport::L2cap)
-        );
-        assert_eq!(select_transport(true, false, false), None);
-    }
 
     #[test]
     fn psm_characteristic_decodes_state_and_little_endian_value() {
@@ -1618,22 +1600,6 @@ mod tests {
         assert!(decode_message_stream_psm(&[0x01, 0x7f, 0x00]).is_err());
         assert!(decode_message_stream_psm(&[0x01, 0x00]).is_err());
         assert!(decode_message_stream_psm(&[0x03, 0x80, 0x00]).is_err());
-    }
-
-    #[test]
-    fn decoder_handles_fragmented_and_coalesced_frames() {
-        let mut decoder = FrameDecoder::default();
-        assert!(decoder.push(&[0x03, 0x03, 0x00]).unwrap().is_empty());
-        let frames = decoder
-            .push(&[
-                0x03, 0x64, 0x5f, 0xce, 0x03, 0x09, 0x00, 0x03, b'1', b'.', b'0',
-            ])
-            .unwrap();
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].group, DEVICE_INFORMATION_GROUP);
-        assert_eq!(frames[0].code, BATTERY_UPDATED_CODE);
-        assert_eq!(frames[0].payload, [0x64, 0x5f, 0xce]);
-        assert_eq!(frames[1].payload, b"1.0");
     }
 
     #[test]

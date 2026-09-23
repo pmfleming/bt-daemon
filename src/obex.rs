@@ -1010,10 +1010,15 @@ mod tests {
     use super::{reserve_incoming_destination_in, safe_file_name, validate_outgoing_path};
 
     #[test]
-    fn incoming_files_are_confined_and_never_overwrite_existing_files() {
+    fn transfer_paths_are_confined_non_overwriting_and_regular_files() {
         let directory = std::env::temp_dir().join(format!("bt-obex-in-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
+        assert!(validate_outgoing_path(directory.to_str().unwrap()).is_err());
         fs::write(directory.join("example.txt"), b"existing").unwrap();
+        assert_eq!(
+            validate_outgoing_path(directory.join("example.txt").to_str().unwrap()).unwrap(),
+            directory.join("example.txt")
+        );
         for (name, safe) in [
             ("../../secret.txt", "secret.txt"),
             ("..", "bluetooth-transfer"),
@@ -1035,20 +1040,6 @@ mod tests {
         assert_eq!(
             fs::read(directory.join("example.txt")).unwrap(),
             b"existing"
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn outgoing_paths_must_be_regular_files() {
-        let directory = std::env::temp_dir().join(format!("bt-obex-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        assert!(validate_outgoing_path(directory.to_str().unwrap()).is_err());
-        let file = directory.join("example.txt");
-        fs::write(&file, b"hello").unwrap();
-        assert_eq!(
-            validate_outgoing_path(file.to_str().unwrap()).unwrap(),
-            file
         );
         fs::remove_dir_all(directory).unwrap();
     }

@@ -16,24 +16,18 @@ class QualityGateTests(unittest.TestCase):
             "duplicate_lines": {"max": 312},
         }}
 
-    def test_boundaries_pass_and_each_regression_fails_independently(self):
+    def test_gate_accepts_boundaries_and_rejects_regressions_or_unknown_evidence(self):
         self.assertEqual(evaluate(self.metrics, self.config), [])
-        for metric, value in [("line_coverage_percent", 49.99), ("high_crap_functions", 74), ("duplicate_lines", 313)]:
-            with self.subTest(metric=metric):
+        cases = [("line_coverage_percent", 49.99), ("high_crap_functions", 74), ("duplicate_lines", 313)]
+        cases.extend(("line_coverage_percent", value)
+                     for value in [None, float("nan"), float("inf"), -float("inf"), True, "51"])
+        for metric, value in cases:
+            with self.subTest(metric=metric, value=value):
                 failures = evaluate({**self.metrics, metric: value}, self.config)
                 self.assertEqual(len(failures), 1)
                 self.assertIn(metric, failures[0])
 
-    def test_unknown_and_non_finite_evidence_never_passes(self):
-        for value in [None, float("nan"), float("inf"), -float("inf"), True, "51"]:
-            with self.subTest(value=value):
-                failures = evaluate({**self.metrics, "line_coverage_percent": value}, self.config)
-                self.assertEqual(len(failures), 1)
-        report = compare({"branch_coverage_percent": None}, {"branch_coverage_percent": None})
-        self.assertEqual(report["branch_coverage_percent"]["direction"], "unavailable")
-        self.assertIsNone(report["branch_coverage_percent"]["current"])
-
-    def test_invalid_configuration_never_disables_the_gate(self):
+    def test_invalid_inputs_fail_closed_and_absent_coverage_stays_unknown(self):
         configs = [None, [], {}, {"schema_version": True, "metrics": {}}, {"schema_version": 1, "metrics": {}},
                    {"schema_version": 1, "metrics": {"typo": {"min": 0}}}]
         configs.extend({"schema_version": 1, "metrics": {"line_coverage_percent": bounds}}
@@ -41,8 +35,6 @@ class QualityGateTests(unittest.TestCase):
         for config in configs:
             with self.subTest(config=config), self.assertRaises(ValueError):
                 evaluate(self.metrics, config)
-
-    def test_incomplete_missing_and_malformed_artifacts_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             with self.assertRaises(FileNotFoundError):
@@ -54,6 +46,9 @@ class QualityGateTests(unittest.TestCase):
             api.write_text("{malformed")
             with self.assertRaises(json.JSONDecodeError):
                 measurements(path)
+        report = compare({"branch_coverage_percent": None}, {"branch_coverage_percent": None})
+        self.assertEqual(report["branch_coverage_percent"]["direction"], "unavailable")
+        self.assertIsNone(report["branch_coverage_percent"]["current"])
 
 
 if __name__ == "__main__":

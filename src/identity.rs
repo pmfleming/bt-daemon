@@ -346,10 +346,6 @@ mod tests {
 
     use super::DeviceIdentityRegistry;
 
-    fn battery(percentage: u8) -> Battery {
-        Battery::bluez_aggregate(percentage)
-    }
-
     fn component_battery(component: &str, percentage: u8) -> Vec<Battery> {
         vec![Battery {
             id: component.into(),
@@ -362,74 +358,41 @@ mod tests {
         }]
     }
 
-    #[test]
-    fn registry_preserves_identity_and_presentation_across_reload_and_adapter_renames() {
-        let directory = std::env::temp_dir().join(format!("bt-daemon-{}", uuid::Uuid::new_v4()));
-        let path = directory.join("identities.json");
+    #[tokio::test]
+    async fn discovery_stays_private_until_pairing_and_paired_history_survives_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identities.json");
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let registry = DeviceIdentityRegistry::load(Some(path.clone())).unwrap();
         registry.register_adapter("hci0", "00:11:22:33:44:55");
-        let key = registry.promote_device("hci0", address);
-        let expected_battery = component_battery("left", 64);
-        registry.remember_presentation(
-            "device-known",
-            Some("audio-headphones"),
-            Some("a1b2c3"),
-            &expected_battery,
+        let key = registry.device_key("hci0", address);
+        registry.flush().await.unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("AA:BB:CC:DD:EE:FF")
         );
+        assert_eq!(registry.promote_device("hci0", address), key);
+        let mut components = component_battery("right", 75);
+        components.extend(component_battery("left", 80));
+        registry.remember_presentation(&key, Some("audio-headset"), Some("02fc97"), &components);
+        let expected_battery = vec![Battery::bluez_aggregate(79)];
+        registry.remember_presentation(&key, Some("audio-headphones"), None, &expected_battery);
         drop(registry);
-
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("AA:BB:CC:DD:EE:FF")
+        );
         let registry = DeviceIdentityRegistry::load(Some(path)).unwrap();
         assert_eq!(key, registry.device_key("hci0", address));
         registry.register_adapter("hci1", "00:11:22:33:44:55");
         assert_eq!(key, registry.device_key("hci1", address));
-        let presentation = registry.remember_presentation("device-known", None, None, &[]);
+        let presentation = registry.remember_presentation(&key, None, None, &[]);
         assert_eq!(presentation.icon.as_deref(), Some("audio-headphones"));
         assert_eq!(presentation.battery, expected_battery);
         assert_eq!(presentation.device_type, "Earbuds");
-        assert_eq!(presentation.model_id.as_deref(), Some("a1b2c3"));
-        assert_eq!(presentation.components, ["left"]);
-
-        drop(registry);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn discovery_identities_are_ephemeral_until_promoted() {
-        let registry = DeviceIdentityRegistry::in_memory();
-        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let key = registry.device_key("hci0", address);
-        let encoded = serde_json::to_string(&*registry.state()).unwrap();
-        assert!(!encoded.contains("AA:BB:CC:DD:EE:FF"));
-        assert_eq!(registry.promote_device("hci0", address), key);
-        assert!(
-            serde_json::to_string(&*registry.state())
-                .unwrap()
-                .contains("AA:BB:CC:DD:EE:FF")
-        );
-    }
-
-    #[test]
-    fn remembered_components_and_model_survive_transient_connection_metadata() {
-        let registry = DeviceIdentityRegistry::in_memory();
-        let mut component_reports = component_battery("right", 75);
-        component_reports.extend(component_battery("left", 80));
-        let observed = registry.remember_presentation(
-            "device-known",
-            Some("audio-headset"),
-            Some("02fc97"),
-            &component_reports,
-        );
-        assert_eq!(observed.components, ["left", "right"]);
-
-        let restored = registry.remember_presentation(
-            "device-known",
-            Some("audio-headphones"),
-            None,
-            &[battery(79)],
-        );
-        assert_eq!(restored.device_type, "Earbuds");
-        assert_eq!(restored.model_id.as_deref(), Some("02fc97"));
-        assert_eq!(restored.components, ["left", "right"]);
+        assert_eq!(presentation.model_id.as_deref(), Some("02fc97"));
+        assert_eq!(presentation.components, ["left", "right"]);
     }
 }

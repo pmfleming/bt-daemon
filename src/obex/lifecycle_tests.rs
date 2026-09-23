@@ -52,8 +52,15 @@ fn pending(broker: &IncomingBroker, id: &str) -> oneshot::Receiver<Authorization
 }
 
 #[tokio::test]
-async fn authorization_cancellation_is_scoped_until_agent_loss_and_rejects_late_answers() {
+async fn cancellation_is_request_scoped_for_authorizations_and_active_transfers() {
     let (broker, _) = broker();
+    let (cancel, transfer_cancelled) = oneshot::channel();
+    let (other, mut other_receiver) = oneshot::channel();
+    broker
+        .cancellations
+        .lock()
+        .await
+        .extend([("active".into(), cancel), ("other".into(), other)]);
     let cancelled = pending(&broker, "cancel");
     let accepted = pending(&broker, "accept");
     assert!(broker.cancel_transfer("cancel").await);
@@ -63,6 +70,12 @@ async fn authorization_cancellation_is_scoped_until_agent_loss_and_rejects_late_
     ));
     assert!(broker.respond("cancel", true).await.is_err());
     assert!(!broker.cancel_transfer("cancel").await);
+    assert!(broker.cancel_transfer("active").await);
+    transfer_cancelled.await.unwrap();
+    assert!(matches!(
+        other_receiver.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
     broker.respond("accept", true).await.unwrap();
     assert!(matches!(
         accepted.await.unwrap(),
@@ -79,30 +92,11 @@ async fn authorization_cancellation_is_scoped_until_agent_loss_and_rejects_late_
     }
     assert!(broker.respond("first", true).await.is_err());
     assert!(broker.respond("second", true).await.is_err());
-}
-
-#[tokio::test]
-async fn active_transfer_cancel_does_not_cancel_another_transfer() {
-    let (broker, _) = broker();
-    let (cancel, cancelled) = oneshot::channel();
-    let (other, mut other_receiver) = oneshot::channel();
-    broker
-        .cancellations
-        .lock()
-        .await
-        .insert("active".into(), cancel);
-    broker
-        .cancellations
-        .lock()
-        .await
-        .insert("other".into(), other);
-    assert!(broker.cancel_transfer("active").await);
-    cancelled.await.unwrap();
+    assert!(!broker.cancel_transfer("missing").await);
     assert!(matches!(
         other_receiver.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
-    assert!(!broker.cancel_transfer("missing").await);
 }
 
 #[tokio::test]

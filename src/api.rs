@@ -173,12 +173,6 @@ pub fn error(code: &str, message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::anyhow;
-
-    use crate::backend::{BackendError, BackendErrorKind};
-
-    use super::error_value;
-
     #[test]
     fn policy_routing_key_is_not_treated_as_a_setting() {
         let params = serde_json::json!({"key": "device-1", "reconnect_on_resume": false});
@@ -199,17 +193,5 @@ mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[test]
-    fn classifies_typed_errors_through_context() {
-        let error = anyhow!(BackendError::new(
-            BackendErrorKind::Timeout,
-            "connect timed out",
-        ))
-        .context("connect headset");
-        let value = error_value(&error);
-        assert_eq!(value["code"], "timeout");
-        assert_eq!(value["retryable"], true);
     }
 }

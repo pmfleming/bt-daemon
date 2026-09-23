@@ -1146,7 +1146,7 @@ mod tests {
     use super::{bluez_result, validate_obex_send_state};
 
     #[test]
-    fn disabled_fast_pair_policy_rejects_controls_but_preserves_bluetooth_operations() {
+    fn operation_policies_reject_disallowed_controls_and_file_transfers() {
         use crate::{backend::DeviceOperation, management::ManagementStore};
         let store = ManagementStore::in_memory();
         let policy = store
@@ -1188,10 +1188,6 @@ mod tests {
             super::validate_fast_pair_control_policy(DeviceOperation::SetMultipoint, &policy)
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn obex_policy_is_enforced() {
         assert!(validate_obex_send_state(true, false).is_ok());
         assert!(validate_obex_send_state(false, false).is_err());
         assert!(validate_obex_send_state(true, true).is_err());
@@ -1200,17 +1196,31 @@ mod tests {
     #[test]
     fn false_properties_are_values_but_unavailable_properties_are_errors() {
         assert!(!bluez_result(Ok(false), "read paired state").unwrap());
-        let error = bluez_result::<bool>(
-            Err(bluer::Error {
-                kind: bluer::ErrorKind::NotReady,
-                message: "adapter restarting".into(),
-            }),
-            "read paired state",
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<BackendError>().unwrap().kind,
-            BackendErrorKind::Unavailable
-        );
+        for (kind, expected, code) in [
+            (
+                bluer::ErrorKind::NotReady,
+                BackendErrorKind::Unavailable,
+                "bluez-unavailable",
+            ),
+            (
+                bluer::ErrorKind::AuthenticationTimeout,
+                BackendErrorKind::Timeout,
+                "timeout",
+            ),
+        ] {
+            let error = bluez_result::<bool>(
+                Err(bluer::Error {
+                    kind,
+                    message: "device unavailable".into(),
+                }),
+                "read paired state",
+            )
+            .unwrap_err()
+            .context("Bluetooth operation");
+            assert_eq!(error.downcast_ref::<BackendError>().unwrap().kind, expected);
+            let envelope = crate::api::error_value(&error);
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["retryable"], true);
+        }
     }
 }

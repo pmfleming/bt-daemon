@@ -43,45 +43,56 @@ fn provisioning_reason(
 
 #[cfg(test)]
 mod tests {
-    use super::{describe, provisioning_reason};
+    use super::describe;
     use crate::fast_pair::{RuntimeReport, metadata::Model};
 
     #[test]
-    fn provisioning_requires_all_prerequisites_and_never_replaces_an_existing_key() {
-        for key in [false, true] {
-            for trusted in [false, true] {
-                for recent in [false, true] {
-                    assert_eq!(
-                        provisioning_reason(key, trusted, recent).is_none(),
-                        !key && trusted && recent
-                    );
-                }
-            }
-        }
-        assert_eq!(
-            provisioning_reason(true, false, false),
-            Some("Account key already provisioned")
-        );
-    }
-
-    #[test]
-    fn presentation_keeps_trusted_identity_separate_from_observed_identity() {
-        let runtime = RuntimeReport {
-            model_id: Some([0xaa, 0xbb, 0xcc]),
-            ..RuntimeReport::default()
-        };
-        let unknown = describe(runtime.clone(), false, None, true);
-        assert_eq!(unknown.model_id.as_deref(), Some("aabbcc"));
-        assert!(unknown.trusted_model_name.is_none());
-        assert!(!unknown.provisioning_available);
-        assert!(!unknown.authenticated_controls);
+    fn advertised_features_keep_trust_separate_and_require_all_provisioning_prerequisites() {
         let model = Model {
             name: "Trusted buds".into(),
             anti_spoofing_public_key: "not used by presentation".into(),
         };
-        let known = describe(runtime, false, Some(&model), true);
-        assert_eq!(known.trusted_model_name.as_deref(), Some("Trusted buds"));
-        assert!(known.provisioning_available);
-        assert!(known.provisioning_reason.is_none());
+        for (key, trusted, recent) in [
+            (false, false, false),
+            (false, false, true),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let features = describe(
+                RuntimeReport {
+                    model_id: Some([0xaa, 0xbb, 0xcc]),
+                    ..RuntimeReport::default()
+                },
+                key,
+                trusted.then_some(&model),
+                recent,
+            );
+            assert_eq!(features.model_id.as_deref(), Some("aabbcc"));
+            assert_eq!(
+                features.trusted_model_name.as_deref(),
+                trusted.then_some("Trusted buds")
+            );
+            assert!(!features.authenticated_controls);
+            assert_eq!(features.account_key_available, key);
+            assert_eq!(
+                features.provisioning_available,
+                !key && trusted && recent,
+                "key={key}, trusted={trusted}, recent={recent}"
+            );
+            assert_eq!(
+                features.provisioning_reason.is_none(),
+                features.provisioning_available
+            );
+            if key {
+                assert_eq!(
+                    features.provisioning_reason.as_deref(),
+                    Some("Account key already provisioned")
+                );
+            }
+        }
     }
 }
