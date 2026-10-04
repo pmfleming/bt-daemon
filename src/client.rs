@@ -2,8 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use shelllist_daemon_core::DaemonEndpoint;
 use shelllist_daemon_tokio::{
-    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig, TrackedId, TrackedKind,
-    run_jsonl_client,
+    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig, run_jsonl_client,
 };
 
 use crate::{
@@ -17,20 +16,14 @@ const ENDPOINT: DaemonEndpoint = DaemonEndpoint::new("bt-daemon", BUS_NAME, OBJE
 struct BluetoothCorrelation;
 
 impl CorrelationPolicy for BluetoothCorrelation {
-    fn response_id(&self, response: &Value) -> Option<TrackedId> {
+    fn operation_id<'a>(&self, response: &'a Value) -> Option<&'a str> {
         [
             "/data/operation/request_id",
             "/data/scan/request_id",
             "/data/transfer/request_id",
         ]
         .into_iter()
-        .find_map(|path| tracked(response.pointer(path), TrackedKind::Operation))
-        .or_else(|| {
-            tracked(
-                response.pointer("/data/subscription/id"),
-                TrackedKind::Subscription,
-            )
-        })
+        .find_map(|path| response.pointer(path)?.as_str())
     }
 
     fn event_id(&self, stream: &str, event: &Value) -> Option<String> {
@@ -58,13 +51,6 @@ impl CorrelationPolicy for BluetoothCorrelation {
             Some("completed" | "failed" | "cancelled")
         )
     }
-}
-
-fn tracked(value: Option<&Value>, kind: TrackedKind) -> Option<TrackedId> {
-    value.and_then(Value::as_str).map(|id| TrackedId {
-        id: id.to_owned(),
-        kind,
-    })
 }
 
 fn call_failure(method: &str, error: &anyhow::Error) -> CallFailure {
