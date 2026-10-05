@@ -13,7 +13,7 @@ revision-pin it; persistent locks select third-party dependencies only.
 ```sh
 direnv allow
 # or without direnv:
-python3 ../daemon-framework/tools/local-build.py develop .
+../daemon-framework/tools/local-build develop .
 ```
 
 The shell provides Rust, Cargo, Clippy, rustfmt, rust-analyzer, BlueZ tools, D-Bus development headers, `busctl`, `wpctl`, LLVM coverage tools, and `just`.
@@ -22,7 +22,7 @@ Run the development checks:
 
 ```sh
 just check
-python3 ../daemon-framework/tools/local-build.py check .
+../daemon-framework/tools/local-build check .
 ```
 
 Verify access to BlueZ and print the current adapter/device snapshot, or run the read-only live acceptance smoke test:
@@ -37,8 +37,8 @@ The tracked interactive hardware matrix and rollout gates are in [`docs/hardware
 Build or run through Nix:
 
 ```sh
-python3 ../daemon-framework/tools/local-build.py build .
-python3 ../daemon-framework/tools/local-build.py run . -- probe-bluez
+../daemon-framework/tools/local-build build .
+../daemon-framework/tools/local-build run . -- probe-bluez
 ```
 
 ## Current status
