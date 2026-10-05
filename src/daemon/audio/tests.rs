@@ -75,6 +75,23 @@ fn snapshots_expose_only_resolvable_opaque_devices_and_endpoint_readiness() {
     }
 }
 
+#[tokio::test]
+async fn audio_changes_validate_their_own_parameter_before_probing() {
+    let pairing = PairingBroker::new(DeviceIdentityRegistry::in_memory());
+    for change in [super::DEFAULT, super::PROFILE] {
+        let parameter = change.parameter;
+        let result =
+            super::apply_change(&pairing, &serde_json::json!({"device_key": "peer"}), change).await;
+        assert_eq!(result["error"]["code"], "validation-error");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(parameter)
+        );
+    }
+}
+
 #[test]
 fn selection_checks_availability_and_device_scoped_keys_without_running_hardware_operations() {
     let key = "device-key";

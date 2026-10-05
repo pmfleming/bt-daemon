@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{
     api,
-    backend::{BluetoothBackend, DeviceOperation, Params},
+    backend::{BluetoothBackend, DeviceOperation},
 };
 
 #[derive(Clone, Serialize)]
@@ -28,7 +28,7 @@ pub(super) struct OperationEvent {
     state: String,
     pub(super) stage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    snapshot: Option<crate::model::Snapshot>,
+    snapshot: Option<Arc<crate::model::Snapshot>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
 }
@@ -67,7 +67,7 @@ impl OperationEvent {
 
     fn finished(mut self, result: anyhow::Result<crate::model::Snapshot>) -> Self {
         match result {
-            Ok(snapshot) => self.snapshot = Some(snapshot),
+            Ok(snapshot) => self.snapshot = Some(Arc::new(snapshot)),
             Err(error) => self.error = Some(api::error_value(&error)),
         }
         self.event = if self.error.is_some() {
@@ -128,21 +128,16 @@ impl OperationCoordinator {
     }
 
     pub(super) async fn snapshot(&self) -> Value {
-        let active = self
-            .state
-            .lock()
-            .await
-            .tasks
-            .iter()
-            .map(|(_, task)| task.value.event.clone())
-            .collect::<Vec<_>>();
-        let recent = self
-            .recent
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let active = json!(
+            self.state
+                .lock()
+                .await
+                .tasks
+                .iter()
+                .map(|(_, task)| &task.value.event)
+                .collect::<Vec<_>>()
+        );
+        let recent = json!(self.recent.lock().await.values().collect::<Vec<_>>());
         json!({ "active": active, "recent": recent })
     }
 
@@ -152,9 +147,9 @@ impl OperationCoordinator {
     }
 
     pub(super) async fn start_owned(&self, params: Value, owner: Option<String>) -> Value {
-        let (device_key, operation) = match operation_request(&params) {
-            Ok(request) => request,
-            Err(error) => return error,
+        let (device_key, operation) = match api::typed_operation::<DeviceOperation>(&params) {
+            Ok((key, operation)) => (key.to_owned(), operation),
+            Err(error) => return api::error("validation-error", error.to_string()),
         };
 
         let mut state = self.state.lock().await;
@@ -212,22 +207,22 @@ impl OperationCoordinator {
     pub(super) async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> bool {
         let task = {
             let mut state = self.state.lock().await;
-            let task = state
+            let Some(task) = state
                 .tasks
                 .claim_owned(request_id, owner)
-                .map(|entry| entry.value);
-            if let Some(task) = &task
-                && state
-                    .active_devices
-                    .get(&task.event.device_key)
-                    .is_some_and(|active| active == request_id)
+                .map(|entry| entry.value)
+            else {
+                return false;
+            };
+            if state
+                .active_devices
+                .get(&task.event.device_key)
+                .map(String::as_str)
+                == Some(request_id)
             {
                 state.active_devices.remove(&task.event.device_key);
             }
             task
-        };
-        let Some(task) = task else {
-            return false;
         };
         task.handle.abort();
         tracing::info!(%request_id, "Bluetooth device operation cancelled");
@@ -236,15 +231,6 @@ impl OperationCoordinator {
         let _ = self.events.send(terminal);
         true
     }
-}
-
-fn operation_request(params: &Value) -> Result<(String, DeviceOperation), Value> {
-    let (key, operation) = params
-        .require_strings("key", "operation")
-        .map_err(|error| api::error("validation-error", error.to_string()))?;
-    let operation = DeviceOperation::try_from(operation)
-        .map_err(|error| api::error("validation-error", error.to_string()))?;
-    Ok((key.to_string(), operation))
 }
 
 struct OperationExecution {
@@ -277,8 +263,8 @@ impl OperationExecution {
         )
         .await;
         log_operation_result(&event.request_id, &result);
-        let terminal = event.clone().finished(result);
         if self.remove_active(&event).await {
+            let terminal = event.finished(result);
             retain_terminal(&self.recent, terminal.clone()).await;
             let _ = self.events.send(terminal);
         }

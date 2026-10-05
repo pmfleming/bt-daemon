@@ -241,11 +241,7 @@ impl BluezBackend {
         let mut sleeping = self.sleeping.subscribe();
         tokio::select! {
             result = self.reconnect_while_awake(device_key) => result,
-            _ = async {
-                loop {
-                    if *sleeping.borrow() || sleeping.changed().await.is_err() { return; }
-                }
-            } => Ok(()),
+            _ = sleeping.wait_for(|sleeping| *sleeping) => Ok(()),
         }
     }
 

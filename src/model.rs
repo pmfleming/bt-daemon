@@ -182,18 +182,15 @@ fn is_earbud_component(report: &Battery) -> bool {
 }
 
 pub(crate) fn presentation_components(battery: &[Battery]) -> Vec<String> {
-    let mut components = battery
-        .iter()
-        .filter_map(|report| {
-            ["left", "right", "case"]
-                .into_iter()
-                .find(|component| report.component.eq_ignore_ascii_case(component))
-                .map(str::to_string)
+    ["left", "right", "case"]
+        .into_iter()
+        .filter(|component| {
+            battery
+                .iter()
+                .any(|report| report.component.eq_ignore_ascii_case(component))
         })
-        .collect::<Vec<_>>();
-    components.sort_by_key(|component| presentation_component_order(component));
-    components.dedup();
-    components
+        .map(str::to_owned)
+        .collect()
 }
 
 pub(crate) fn presentation_component_order(component: &str) -> u8 {

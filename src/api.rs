@@ -122,7 +122,7 @@ pub fn log_response(action: &str, response: &Value) {
     }
 }
 
-fn typed_operation<T>(params: &Value) -> anyhow::Result<(&str, T)>
+pub(crate) fn typed_operation<T>(params: &Value) -> anyhow::Result<(&str, T)>
 where
     for<'a> T: TryFrom<&'a str, Error = BackendError>,
 {
@@ -141,29 +141,19 @@ pub fn success(data: Value) -> Value {
 
 /// Preserve typed backend error codes and retryability through an anyhow context chain.
 pub fn error_value(error: &Error) -> Value {
+    error_details(error).into_value()
+}
+
+fn error_details(error: &Error) -> EnvelopeError {
     let kind = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<BackendError>())
         .map_or(BackendErrorKind::OperationFailed, |error| error.kind);
-    json!({
-        "code": kind.code(),
-        "message": format!("{error:#}"),
-        "retryable": kind.retryable(),
-    })
+    EnvelopeError::new(kind.code(), format!("{error:#}")).with_retryable(kind.retryable())
 }
 
 fn backend_error(cause: &Error) -> Value {
-    let details = error_value(cause);
-    shelllist_daemon_core::error(
-        API,
-        EnvelopeError::new(
-            details["code"].as_str().unwrap_or("operation-failed"),
-            details["message"]
-                .as_str()
-                .unwrap_or("Bluetooth operation failed"),
-        )
-        .with_retryable(details["retryable"].as_bool().unwrap_or(false)),
-    )
+    shelllist_daemon_core::error(API, error_details(cause))
 }
 
 /// Construct a versioned error response with the supplied code and human-readable message.
@@ -173,6 +163,27 @@ pub fn error(code: &str, message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backend_error_envelope_preserves_details_and_context() {
+        use crate::backend::{BackendError, BackendErrorKind};
+        for error in [
+            anyhow::anyhow!("untyped failure"),
+            anyhow::Error::new(BackendError::new(BackendErrorKind::Timeout, "timed out")),
+            anyhow::Error::new(BackendError::new(BackendErrorKind::Rejected, "denied")),
+        ] {
+            let error = error.context("operation context");
+            let response = super::backend_error(&error);
+            assert_eq!(response["error"], super::error_value(&error));
+            assert_eq!(response["ok"], false);
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("operation context")
+            );
+        }
+    }
+
     #[test]
     fn policy_routing_key_is_not_treated_as_a_setting() {
         let params = serde_json::json!({"key": "device-1", "reconnect_on_resume": false});

@@ -17,11 +17,25 @@ use pw::{
     types::ObjectType,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 mod profile;
 use profile::parse_profile;
-/// Deterministic, device-scoped identifiers that do not expose PipeWire node names.
-pub use profile::{endpoint_key, profile_key};
+
+/// Derive a stable profile identifier scoped to an opaque Bluetooth device key.
+pub fn profile_key(device_key: &str, profile_name: &str) -> String {
+    opaque_audio_key("profile", device_key, profile_name)
+}
+
+/// Derive a stable sink/source identifier scoped to an opaque Bluetooth device key.
+pub fn endpoint_key(device_key: &str, kind: &str) -> String {
+    opaque_audio_key("endpoint", device_key, kind)
+}
+
+fn opaque_audio_key(kind: &str, device_key: &str, value: &str) -> String {
+    let digest = Sha256::digest(format!("{device_key}:{value}").as_bytes());
+    format!("audio-{kind}-{}", hex::encode(&digest[..12]))
+}
 
 macro_rules! bind_or_return {
     ($registry:expr, $global:expr, $kind:ty) => {
@@ -97,6 +111,15 @@ struct Defaults {
 struct DeviceEndpoints {
     sink: Option<AudioEndpoint>,
     source: Option<AudioEndpoint>,
+}
+
+impl DeviceEndpoints {
+    fn slot(&mut self, kind: EndpointKind) -> &mut Option<AudioEndpoint> {
+        match kind {
+            EndpointKind::Sink => &mut self.sink,
+            EndpointKind::Source => &mut self.source,
+        }
+    }
 }
 
 type ChangeCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -587,23 +610,26 @@ impl ProbeState {
         let Some(kind) = endpoint_kind(properties.get("media.class")) else {
             return;
         };
-        set_endpoint(
-            &mut self.endpoints.borrow_mut(),
-            device_id,
-            kind,
-            AudioEndpoint {
-                name: properties.get("node.name").unwrap_or_default().to_string(),
-                state: "creating".to_string(),
-                is_default: false,
-            },
-        );
+        *self
+            .endpoints
+            .borrow_mut()
+            .entry(device_id)
+            .or_default()
+            .slot(kind) = Some(AudioEndpoint {
+            name: properties.get("node.name").unwrap_or_default().to_string(),
+            state: "creating".to_string(),
+            is_default: false,
+        });
         let node = bind_or_return!(registry, global, Node);
         let endpoints_for_info = Rc::clone(&self.endpoints);
         let listener = node
             .add_listener_local()
             .info(move |info| {
                 let mut endpoints = endpoints_for_info.borrow_mut();
-                let Some(endpoint) = endpoint_mut(&mut endpoints, device_id, kind) else {
+                let Some(endpoint) = endpoints
+                    .get_mut(&device_id)
+                    .and_then(|device| device.slot(kind).as_mut())
+                else {
                     return;
                 };
                 endpoint.state = node_state(info.state()).to_string();
@@ -730,31 +756,6 @@ fn endpoint_kind(media_class: Option<&str>) -> Option<EndpointKind> {
         Some("Audio/Sink") => Some(EndpointKind::Sink),
         Some("Audio/Source") => Some(EndpointKind::Source),
         _ => None,
-    }
-}
-
-fn set_endpoint(
-    endpoints: &mut HashMap<u32, DeviceEndpoints>,
-    device_id: u32,
-    kind: EndpointKind,
-    endpoint: AudioEndpoint,
-) {
-    let device = endpoints.entry(device_id).or_default();
-    match kind {
-        EndpointKind::Sink => device.sink = Some(endpoint),
-        EndpointKind::Source => device.source = Some(endpoint),
-    }
-}
-
-fn endpoint_mut(
-    endpoints: &mut HashMap<u32, DeviceEndpoints>,
-    device_id: u32,
-    kind: EndpointKind,
-) -> Option<&mut AudioEndpoint> {
-    let device = endpoints.get_mut(&device_id)?;
-    match kind {
-        EndpointKind::Sink => device.sink.as_mut(),
-        EndpointKind::Source => device.source.as_mut(),
     }
 }
 

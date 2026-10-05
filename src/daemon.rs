@@ -71,8 +71,12 @@ impl BluetoothDaemon {
             "bluetooth.obex.respond" => obex::respond(&self.obex.incoming, &params).await,
             "bluetooth.obex.snapshot" => self.obex.snapshot().await,
             "bluetooth.audio.snapshot" => self.audio_snapshots.borrow().clone(),
-            "bluetooth.audio.setProfile" => audio::set_profile(&self.pairing, &params).await,
-            "bluetooth.audio.setDefault" => audio::set_default(&self.pairing, &params).await,
+            "bluetooth.audio.setProfile" => {
+                audio::apply_change(&self.pairing, &params, audio::PROFILE).await
+            }
+            "bluetooth.audio.setDefault" => {
+                audio::apply_change(&self.pairing, &params, audio::DEFAULT).await
+            }
             "bluetooth.requests.snapshot" => api::success(json!({
                 "requests": {
                     "operations": self.operations.snapshot().await,
@@ -272,23 +276,16 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     // Claim the service name before probing BlueZ or PipeWire. Clients can
     // connect immediately and observe a typed loading state while snapshots
     // are populated in the background.
-    let snapshot_backend = Arc::clone(&backend);
-    let snapshot_updates = snapshots.clone();
     tasks.spawn("bluetooth-snapshots", async move {
-        snapshot_updates.send_replace(load_snapshot(&snapshot_backend).await);
+        snapshots.send_replace(load_snapshot(&backend).await);
         while receive_refresh(&mut changes, std::time::Duration::from_millis(80)).await {
-            send_changed(&snapshot_updates, load_snapshot(&snapshot_backend).await);
+            send_changed(&snapshots, load_snapshot(&backend).await);
         }
     });
-    let audio_updates = audio_snapshots.clone();
-    let audio_pairing = Arc::clone(&pairing);
     tasks.spawn("bluetooth-audio-snapshots", async move {
-        audio_updates.send_replace(audio::snapshot(Arc::clone(&audio_pairing)).await);
+        audio_snapshots.send_replace(audio::snapshot(&pairing).await);
         while receive_refresh(&mut audio_changes, std::time::Duration::from_millis(150)).await {
-            send_changed(
-                &audio_updates,
-                audio::snapshot(Arc::clone(&audio_pairing)).await,
-            );
+            send_changed(&audio_snapshots, audio::snapshot(&pairing).await);
         }
     });
     tracing::info!(

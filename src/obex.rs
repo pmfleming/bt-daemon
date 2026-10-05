@@ -664,62 +664,22 @@ pub async fn start_file(
 impl ActiveTransfer {
     pub async fn run(
         self,
-        mut cancel: oneshot::Receiver<()>,
+        cancel: oneshot::Receiver<()>,
         mut update: impl FnMut(TransferUpdate),
     ) -> Result<()> {
-        let result = async {
-            let mut current = TransferUpdate {
-                status: self.initial_status.clone(),
-                transferred: self.initial_transferred,
-                size: self.size,
-            };
-            update(current.clone());
-            if !current.terminal() {
-                let transfer = zbus::Proxy::new(
-                    &self.connection,
-                    BUS_NAME,
-                    self.transfer_path.as_str(),
-                    TRANSFER_INTERFACE,
-                )
-                .await
-                .context("create OBEX transfer proxy")?;
-                let properties = PropertiesProxy::builder(&self.connection)
-                    .destination(BUS_NAME)?
-                    .path(self.transfer_path.clone())?
-                    .build()
-                    .await?;
-                // Subscribe before refreshing the properties so completion cannot
-                // fall into the gap between SendFile's initial reply and monitoring.
-                let mut changes = properties.receive_properties_changed().await?;
-                let latest = properties
-                    .get_all(TRANSFER_INTERFACE.try_into()?)
-                    .await
-                    .context("read current outgoing OBEX transfer")?;
-                current.apply(&latest);
-                update(current.clone());
-                while !current.terminal() {
-                    tokio::select! {
-                        _ = &mut cancel => {
-                            transfer.call::<_, _, ()>("Cancel", &()).await.context("cancel OBEX transfer")?;
-                            current.status = "cancelled".into();
-                            update(current.clone());
-                            break;
-                        }
-                        signal = changes.next() => {
-                            let signal = signal.context("OBEX property stream ended")?;
-                            let args = signal.args()?;
-                            if args.interface_name() != TRANSFER_INTERFACE { continue; }
-                            current.apply_changed(args.changed_properties());
-                            update(current.clone());
-                        }
-                    }
-                }
-            }
-            if current.status == "error" {
-                bail!("OBEX transfer failed");
-            }
-            Ok(())
-        }
+        let current = TransferUpdate {
+            status: self.initial_status,
+            transferred: self.initial_transferred,
+            size: self.size,
+        };
+        update(current.clone());
+        let result = monitor_transfer(
+            &self.connection,
+            &self.transfer_path,
+            current,
+            cancel,
+            |current| update(current.clone()),
+        )
         .await;
         cleanup_session(&self.connection, self.session_path).await;
         result
@@ -818,53 +778,61 @@ async fn incoming_details(
 async fn monitor_incoming(
     connection: &zbus::Connection,
     transfer_path: OwnedObjectPath,
-    mut cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<()>,
     mut event: ObexEvent,
     events: &broadcast::Sender<ObexEvent>,
 ) -> Result<()> {
-    let transfer = zbus::Proxy::new(
-        connection,
-        BUS_NAME,
-        transfer_path.as_str(),
-        TRANSFER_INTERFACE,
-    )
-    .await
-    .context("create incoming OBEX transfer proxy")?;
-    let properties = PropertiesProxy::builder(connection)
-        .destination(BUS_NAME)?
-        .path(transfer_path.clone())?
-        .build()
-        .await?;
-    let mut changes = properties.receive_properties_changed().await?;
-    let initial = properties.get_all(TRANSFER_INTERFACE.try_into()?).await?;
-    let mut current = TransferUpdate {
+    let current = TransferUpdate {
         status: "queued".into(),
         transferred: 0,
         size: event.size,
     };
-    current.apply(&initial);
-    publish_transfer_update(&mut event, &current, events);
-    while !current.terminal() {
-        tokio::select! {
-            _ = &mut cancel => {
-                transfer.call::<_, _, ()>("Cancel", &()).await.context("cancel incoming OBEX transfer")?;
-                event.event = "cancelled".into();
-                event.status = "cancelled".into();
-                let _ = events.send(event.clone());
-                return Ok(());
+    monitor_transfer(connection, &transfer_path, current, cancel, |current| {
+        publish_transfer_update(&mut event, current, events);
+    })
+    .await
+    .context("monitor incoming OBEX transfer")
+}
+
+// Both directions subscribe before refreshing: completion can occur between the
+// initial request/authorization and the start of monitoring. Cancellation must
+// be acknowledged by obexd before publishing a terminal event.
+async fn monitor_transfer(
+    connection: &zbus::Connection,
+    path: &OwnedObjectPath,
+    mut current: TransferUpdate,
+    mut cancel: oneshot::Receiver<()>,
+    mut update: impl FnMut(&TransferUpdate),
+) -> Result<()> {
+    if !current.terminal() {
+        let transfer = zbus::Proxy::new(connection, BUS_NAME, path.as_str(), TRANSFER_INTERFACE)
+            .await
+            .context("create OBEX transfer proxy")?;
+        let properties = PropertiesProxy::builder(connection)
+            .destination(BUS_NAME)?
+            .path(path.as_str())?
+            .build()
+            .await?;
+        let mut changes = properties.receive_properties_changed().await?;
+        current.apply(&properties.get_all(TRANSFER_INTERFACE.try_into()?).await?);
+        update(&current);
+        while !current.terminal() {
+            tokio::select! {
+                _ = &mut cancel => {
+                    transfer.call::<_, _, ()>("Cancel", &()).await.context("cancel OBEX transfer")?;
+                    current.status = "cancelled".into();
+                }
+                signal = changes.next() => {
+                    let signal = signal.context("OBEX property stream ended")?;
+                    let args = signal.args()?;
+                    if args.interface_name() != TRANSFER_INTERFACE { continue; }
+                    current.apply_changed(args.changed_properties());
+                }
             }
-            signal = changes.next() => {
-                let signal = signal.context("incoming OBEX property stream ended")?;
-                let args = signal.args()?;
-                if args.interface_name() != TRANSFER_INTERFACE { continue; }
-                current.apply_changed(args.changed_properties());
-                publish_transfer_update(&mut event, &current, events);
-            }
+            update(&current);
         }
     }
-    if event.status == "error" {
-        bail!("incoming OBEX transfer failed");
-    }
+    anyhow::ensure!(current.status != "error", "OBEX transfer failed");
     Ok(())
 }
 
@@ -1008,6 +976,44 @@ mod tests {
     use std::fs;
 
     use super::{reserve_incoming_destination_in, safe_file_name, validate_outgoing_path};
+
+    #[test]
+    fn refreshed_and_incremental_transfer_states_publish_consistent_events() {
+        use super::{
+            HashMap, ObexEvent, OwnedValue, TransferUpdate, Value, broadcast,
+            publish_transfer_update,
+        };
+        let mut current = TransferUpdate {
+            status: "queued".into(),
+            transferred: 0,
+            size: 1,
+        };
+        current.apply(&HashMap::from([
+            ("Status".into(), Value::from("active").try_into().unwrap()),
+            ("Size".into(), OwnedValue::from(100_u64)),
+        ]));
+        let mut event = ObexEvent::outgoing("request", "peer", "file", 1);
+        let (events, mut received) = broadcast::channel(1);
+        for (status, expected, terminal) in [
+            ("active", "progress", false),
+            ("complete", "completed", true),
+            ("cancelled", "cancelled", true),
+            ("error", "failed", true),
+        ] {
+            current.apply_changed(&HashMap::from([
+                ("Status", Value::from(status)),
+                ("Transferred", Value::from(42_u64)),
+            ]));
+            assert_eq!(current.terminal(), terminal);
+            publish_transfer_update(&mut event, &current, &events);
+            let published = received.try_recv().unwrap();
+            assert_eq!(
+                (published.event.as_str(), published.status.as_str()),
+                (expected, status)
+            );
+            assert_eq!((published.transferred, published.size), (42, 100));
+        }
+    }
 
     #[test]
     fn transfer_paths_are_confined_non_overwriting_and_regular_files() {

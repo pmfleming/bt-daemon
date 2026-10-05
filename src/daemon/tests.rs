@@ -265,6 +265,10 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
         assert_eq!(recovered["recent"].as_array().unwrap().len(), 1);
         assert_eq!(recovered["recent"][0]["request_id"], id);
         assert_eq!(recovered["recent"][0]["event"], expected);
+        assert_eq!(
+            recovered["recent"][0],
+            serde_json::to_value(sequence.last().unwrap()).unwrap()
+        );
     }
 }
 

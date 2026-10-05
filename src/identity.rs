@@ -129,7 +129,7 @@ impl DeviceIdentityRegistry {
         if first_registration {
             migrate_legacy_devices(&mut state, adapter, stable_identity);
         }
-        self.persist(&state, "adapter identity");
+        self.persist(&state);
     }
 
     pub fn device_key(&self, adapter: &str, address: Address) -> String {
@@ -172,7 +172,7 @@ impl DeviceIdentityRegistry {
         if !state.devices.contains_key(&identity) {
             state.ephemeral.remove(&identity);
             state.devices.insert(identity, key.clone());
-            self.persist(&state, "paired device identity");
+            self.persist(&state);
         }
         key
     }
@@ -195,14 +195,14 @@ impl DeviceIdentityRegistry {
                 presentation.values(),
             )
         };
-        self.persist_if(changed, &state, "device presentation");
+        self.persist_if(changed, &state);
         remembered
     }
 
     pub fn forget_presentation(&self, device_key: &str) {
         let mut state = self.state();
         let changed = state.presentations.remove(device_key).is_some();
-        self.persist_if(changed, &state, "forgotten device presentation");
+        self.persist_if(changed, &state);
     }
 
     fn state(&self) -> MutexGuard<'_, RegistryFile> {
@@ -211,13 +211,13 @@ impl DeviceIdentityRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn persist_if(&self, changed: bool, state: &RegistryFile, description: &str) {
+    fn persist_if(&self, changed: bool, state: &RegistryFile) {
         if changed {
-            self.persist(state, description);
+            self.persist(state);
         }
     }
 
-    fn persist(&self, state: &RegistryFile, _description: &str) {
+    fn persist(&self, state: &RegistryFile) {
         if let Some(writer) = &self.writer {
             writer.schedule(RegistryFile {
                 version: state.version,
@@ -234,14 +234,14 @@ impl RememberedPresentation {
     fn update(&mut self, icon: Option<&str>, model_id: Option<&str>, battery: &[Battery]) -> bool {
         let icon = icon.filter(|value| !value.trim().is_empty());
         let observed_type = presentation_type(icon, battery);
-        let resolved_type = self.resolved_type(observed_type).to_string();
+        let resolved_type = self.resolved_type(observed_type);
         let type_changed = resolved_type != "Bluetooth device"
-            && self.device_type.as_deref() != Some(resolved_type.as_str());
+            && self.device_type.as_deref() != Some(resolved_type);
         if type_changed {
-            self.device_type = Some(resolved_type);
+            self.device_type = Some(resolved_type.into());
         }
-        let icon_changed = self.update_icon(icon);
-        let model_changed = self.update_model_id(model_id);
+        let icon_changed = update_text(&mut self.icon, icon);
+        let model_changed = update_text(&mut self.model_id, model_id);
         let components_changed = self.update_components(battery);
         let battery_changed = self.update_battery(battery);
         type_changed || icon_changed || model_changed || components_changed || battery_changed
@@ -260,23 +260,6 @@ impl RememberedPresentation {
         self.device_type
             .as_deref()
             .unwrap_or_else(|| presentation_type(self.icon.as_deref(), &self.battery))
-    }
-
-    fn update_icon(&mut self, icon: Option<&str>) -> bool {
-        if icon.is_none_or(|icon| self.icon.as_deref() == Some(icon)) {
-            return false;
-        }
-        self.icon = icon.map(Into::into);
-        true
-    }
-
-    fn update_model_id(&mut self, model_id: Option<&str>) -> bool {
-        let model_id = model_id.filter(|value| !value.trim().is_empty());
-        if model_id.is_none_or(|model_id| self.model_id.as_deref() == Some(model_id)) {
-            return false;
-        }
-        self.model_id = model_id.map(Into::into);
-        true
     }
 
     fn update_components(&mut self, battery: &[Battery]) -> bool {
@@ -311,6 +294,15 @@ impl RememberedPresentation {
     }
 }
 
+fn update_text(target: &mut Option<String>, value: Option<&str>) -> bool {
+    let value = value.filter(|value| !value.trim().is_empty());
+    if value.is_none_or(|value| target.as_deref() == Some(value)) {
+        return false;
+    }
+    *target = value.map(Into::into);
+    true
+}
+
 fn type_confidence(device_type: &str) -> u8 {
     match device_type {
         "Earbuds" => 3,
@@ -324,12 +316,9 @@ fn migrate_legacy_devices(state: &mut RegistryFile, adapter: &str, stable_identi
     let legacy_prefix = format!("{adapter}:");
     let legacy = state
         .devices
-        .iter()
-        .filter(|(identity, _)| identity.starts_with(&legacy_prefix))
-        .map(|(identity, key)| (identity.clone(), key.clone()))
+        .extract_if(|identity, _| identity.starts_with(&legacy_prefix))
         .collect::<Vec<_>>();
     for (identity, key) in legacy {
-        state.devices.remove(&identity);
         let address = &identity[legacy_prefix.len()..];
         state
             .devices
@@ -345,6 +334,22 @@ mod tests {
     use crate::model::Battery;
 
     use super::DeviceIdentityRegistry;
+
+    #[test]
+    fn legacy_migration_moves_only_matching_devices_and_preserves_stable_ids() {
+        let mut state = super::RegistryFile::default();
+        state.devices.extend([
+            ("hci0:AA".into(), "old-a".into()),
+            ("hci0:BB".into(), "old-b".into()),
+            ("stable:BB".into(), "stable-b".into()),
+            ("hci01:CC".into(), "other".into()),
+        ]);
+        super::migrate_legacy_devices(&mut state, "hci0", "stable");
+        assert_eq!(state.devices.len(), 3);
+        assert_eq!(state.devices["stable:AA"], "old-a");
+        assert_eq!(state.devices["stable:BB"], "stable-b");
+        assert_eq!(state.devices["hci01:CC"], "other");
+    }
 
     fn component_battery(component: &str, percentage: u8) -> Vec<Battery> {
         vec![Battery {
@@ -375,6 +380,8 @@ mod tests {
         assert_eq!(registry.promote_device("hci0", address), key);
         let mut components = component_battery("right", 75);
         components.extend(component_battery("left", 80));
+        components.extend(component_battery("LEFT", 80));
+        components.extend(component_battery("main", 79));
         registry.remember_presentation(&key, Some("audio-headset"), Some("02fc97"), &components);
         let expected_battery = vec![Battery::bluez_aggregate(79)];
         registry.remember_presentation(&key, Some("audio-headphones"), None, &expected_battery);
@@ -394,5 +401,18 @@ mod tests {
         assert_eq!(presentation.device_type, "Earbuds");
         assert_eq!(presentation.model_id.as_deref(), Some("02fc97"));
         assert_eq!(presentation.components, ["left", "right"]);
+        assert_eq!(
+            registry.remember_presentation(&key, Some("  "), Some("\t"), &[]),
+            presentation
+        );
+        assert_eq!(
+            registry.remember_presentation(
+                &key,
+                Some("audio-headphones"),
+                Some("02fc97"),
+                &expected_battery
+            ),
+            presentation
+        );
     }
 }

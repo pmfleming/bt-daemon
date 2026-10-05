@@ -1,22 +1,6 @@
 use pipewire as pw;
-use sha2::{Digest, Sha256};
 
 use super::AudioProfile;
-
-/// Derive a stable profile identifier scoped to an opaque Bluetooth device key.
-pub fn profile_key(device_key: &str, profile_name: &str) -> String {
-    opaque_audio_key("profile", device_key, profile_name)
-}
-
-/// Derive a stable sink/source identifier scoped to an opaque Bluetooth device key.
-pub fn endpoint_key(device_key: &str, kind: &str) -> String {
-    opaque_audio_key("endpoint", device_key, kind)
-}
-
-fn opaque_audio_key(kind: &str, device_key: &str, value: &str) -> String {
-    let digest = Sha256::digest(format!("{device_key}:{value}").as_bytes());
-    format!("audio-{kind}-{}", hex::encode(&digest[..12]))
-}
 
 pub(super) fn parse_profile(pod: &pw::spa::pod::Pod) -> Option<AudioProfile> {
     use pw::spa::pod::{Value, deserialize::PodDeserializer};

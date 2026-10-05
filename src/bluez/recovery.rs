@@ -78,20 +78,16 @@ impl RecoveringBackend {
     }
 
     fn forward_changes(&self, backend: Arc<BluezBackend>) {
-        let mut receiver = backend.subscribe_changes();
+        let receiver = backend.subscribe_changes();
         let changes = self.changes.clone();
-        backend
-            .tasks
-            .spawn("recovering-bluez-change-forwarder", async move {
-                loop {
-                    match receiver.recv().await {
-                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let _ = changes.send(());
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-            });
+        backend.tasks.spawn(
+            "recovering-bluez-change-forwarder",
+            shelllist_daemon_tokio::forward_broadcast(receiver, move |_| {
+                // Both a change and a gap require a fresh snapshot.
+                let _ = changes.send(());
+                std::future::ready(())
+            }),
+        );
     }
 
     pub fn start_recovery(self: &Arc<Self>, pairing: Arc<PairingBroker>) {

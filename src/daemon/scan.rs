@@ -101,14 +101,7 @@ impl ScanCoordinator {
     }
 
     pub(super) async fn snapshot(&self) -> Value {
-        let active = self
-            .tasks
-            .lock()
-            .await
-            .values()
-            .map(|task| task.event.clone())
-            .collect::<Vec<_>>();
-        json!({ "active": active })
+        json!({ "active": self.tasks.lock().await.values().map(|task| &task.event).collect::<Vec<_>>() })
     }
 
     #[cfg(test)]

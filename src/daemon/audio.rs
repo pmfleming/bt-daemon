@@ -78,39 +78,28 @@ fn select_profile(
     }))
 }
 
-pub(super) async fn set_default(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
-    apply_change(
-        pairing,
-        params,
-        "endpoint_key",
-        "audio-endpoint-unavailable",
-        "Bluetooth audio endpoint is not available",
-        select_default,
-    )
-    .await
-}
-
-pub(super) async fn set_profile(pairing: &Arc<PairingBroker>, params: &Value) -> Value {
-    apply_change(
-        pairing,
-        params,
-        "profile_key",
-        "audio-profile-unavailable",
-        "Bluetooth audio profile is not available",
-        select_profile,
-    )
-    .await
-}
-
-async fn apply_change(
-    pairing: &Arc<PairingBroker>,
-    params: &Value,
-    parameter: &str,
-    unavailable_code: &str,
-    unavailable_message: &str,
+pub(super) struct Change {
+    parameter: &'static str,
+    unavailable_code: &'static str,
+    unavailable_message: &'static str,
     select: SelectOperation,
-) -> Value {
-    let (device_key, requested_key) = match params.require_strings("device_key", parameter) {
+}
+
+pub(super) const DEFAULT: Change = Change {
+    parameter: "endpoint_key",
+    unavailable_code: "audio-endpoint-unavailable",
+    unavailable_message: "Bluetooth audio endpoint is not available",
+    select: select_default,
+};
+pub(super) const PROFILE: Change = Change {
+    parameter: "profile_key",
+    unavailable_code: "audio-profile-unavailable",
+    unavailable_message: "Bluetooth audio profile is not available",
+    select: select_profile,
+};
+
+pub(super) async fn apply_change(pairing: &PairingBroker, params: &Value, change: Change) -> Value {
+    let (device_key, requested_key) = match params.require_strings("device_key", change.parameter) {
         Ok(params) => params,
         Err(error) => return api::error("validation-error", error.to_string()),
     };
@@ -125,26 +114,29 @@ async fn apply_change(
         if device.adapter.is_empty() || pairing.device_key(&device.adapter, address) != device_key {
             return None;
         }
-        select(device_key, requested_key, device)
+        (change.select)(device_key, requested_key, device)
     });
     let Some(operation) = operation else {
-        return api::error(unavailable_code, unavailable_message.to_string());
+        return api::error(
+            change.unavailable_code,
+            change.unavailable_message.to_string(),
+        );
     };
     match tokio::task::spawn_blocking(operation).await {
-        Ok(Ok(())) => snapshot(Arc::clone(pairing)).await,
+        Ok(Ok(())) => snapshot(pairing).await,
         Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
         Err(error) => api::error("audio-operation-failed", error.to_string()),
     }
 }
 
-pub(super) async fn snapshot(pairing: Arc<PairingBroker>) -> Value {
+pub(super) async fn snapshot(pairing: &PairingBroker) -> Value {
     let devices = match devices().await {
         Ok(devices) => devices,
         Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
     };
     let devices = devices
         .into_iter()
-        .filter_map(|device| device_snapshot(&pairing, device))
+        .filter_map(|device| device_snapshot(pairing, device))
         .collect::<Vec<_>>();
     api::success(json!({ "audio_devices": devices }))
 }
