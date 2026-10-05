@@ -23,7 +23,7 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
         assert!(!state.begin(peer, ble));
         assert!(state.begin(peer, rfcomm));
         assert!(!state.begin(peer, rfcomm));
-        state.connection_failed(peer);
+        state.connection_failed(peer, false);
         assert!(!state.retry.ready(peer));
         assert!(state.retry.ready(other));
         tokio::time::advance(Duration::from_secs(360)).await;
@@ -32,7 +32,7 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
         assert!(state.retry.ready(peer));
         let (writer, mut receiver) = mpsc::channel(1);
         state.writers.insert(peer, writer);
-        state.connection_failed(peer); // A late connection failure must not tear down a live stream.
+        state.connection_failed(peer, true); // A late busy failure must not tear down a live stream.
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)

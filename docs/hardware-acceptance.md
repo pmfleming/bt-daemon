@@ -39,6 +39,32 @@ Follow-up acceptance on the same machine:
 - Fast Pair retroactive account-key provisioning: **implementation complete; trusted model metadata and hardware acceptance pending**. Verify ECDH response, encrypted account-key write, reconnect persistence, and rejection outside the Provider's one-minute window.
 - The alternate no-trust pairing policy, audio playback/profile readiness, component-update behavior as batteries discharge, and reconnect behavior remain to be checked separately.
 
+## Fast Pair reconnect latency regression
+
+Pending hardware validation after the retry/readiness fix:
+
+1. Rebuild/deploy `bt-daemon` and follow `journalctl --user -u bt-daemon.service -f`
+   with `RUST_LOG=bt_daemon=debug` enabled.
+2. Disconnect/reconnect compatible earbuds through Shelllist. Compare the
+   `BlueZ device services changed resolved=true`, operation completion,
+   `Fast Pair battery stream started`, and `Fast Pair component battery updated`
+   timestamps. Outgoing stream attempts now wait for resolved services.
+3. If BlueZ still returns `InProgress` / `br-connection-busy`, expect retries after
+   250ms, 500ms, then 1s (at most six short retries per connection session), not
+   the old 15–18s backoff followed by a 10s polling boundary. Persistent failures
+   retain exponential backoff; its deadlines also wake the reconciler directly.
+4. Confirm left/right/case readings appear promptly after the first battery frame,
+   then disconnect and reconnect again. Check that a disconnected/unresolved
+   peer causes neither a retry loop nor duplicate live streams. Repeat with a
+   BLE-only Fast Pair device when available.
+
+The original 2026-10-05 journal showed connection completion at 13:44:02,
+`br-connection-busy` failures during setup, and the first component report at
+13:44:26. Snapshot publication took only about 85ms after that report. Automated
+virtual-time tests cover the bounded retry budget, error classification, deadline
+ordering/consumption, and preservation of live streams after late failures;
+post-fix hardware timing is not yet measured.
+
 ## Interactive Rofi-replacement gate
 
 Record a date, device, and result for every row before moving `SUPER+B`.

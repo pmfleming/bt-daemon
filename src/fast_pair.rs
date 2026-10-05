@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Mutex, RwLock, broadcast, mpsc},
+    sync::{Mutex, Notify, RwLock, broadcast, mpsc},
 };
 use uuid::Uuid;
 
@@ -425,10 +425,10 @@ impl ConnectionState {
         true
     }
 
-    fn connection_failed(&mut self, address: Address) {
+    fn connection_failed(&mut self, address: Address, busy: bool) {
         if self.links.get(&address) == Some(&LinkState::Connecting) {
             self.links.remove(&address);
-            self.retry.failed(address);
+            self.retry.connection_failed(address, busy);
         }
     }
 }
@@ -469,6 +469,7 @@ pub struct FastPairBatteryProvider {
     reports: RwLock<HashMap<Address, BatteryReport>>,
     runtime: RwLock<HashMap<Address, RuntimeReport>>,
     connections: Mutex<ConnectionState>,
+    retry_changed: Notify,
     pending_commands: PendingCommands,
     changes: broadcast::Sender<()>,
     uuids: FastPairUuids,
@@ -920,6 +921,7 @@ impl FastPairBatteryProvider {
             reports: RwLock::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
             connections: Mutex::new(ConnectionState::default()),
+            retry_changed: Notify::new(),
             pending_commands: PendingCommands::default(),
             changes,
             uuids,
@@ -1314,8 +1316,13 @@ impl FastPairBatteryProvider {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                let deadline = provider.connections.lock().await.retry.next_deadline();
                 tokio::select! {
                     _ = interval.tick() => {}
+                    _ = retry::wait_for_deadline(deadline) => {}
+                    // Re-arm the timer when a worker schedules a retry. Notify
+                    // retains a permit if the failure races with this select.
+                    _ = provider.retry_changed.notified() => continue,
                     result = changes.recv() => match result {
                         Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1324,6 +1331,9 @@ impl FastPairBatteryProvider {
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                // Consume due deadlines even if a device vanished or its
+                // services are no longer ready, avoiding an expired-timer spin.
+                provider.connections.lock().await.retry.clear_due();
                 provider.reconcile().await;
             }
         });
@@ -1372,6 +1382,15 @@ impl FastPairBatteryProvider {
             self.connections.lock().await.retry.reset_session(address);
             return Ok(());
         }
+        // Connected becomes true before BlueZ finishes service/profile setup.
+        // ServicesResolved changes already wake this reconciler via `changes`.
+        if !device
+            .is_services_resolved()
+            .await
+            .context("read Fast Pair service readiness")?
+        {
+            return Ok(());
+        }
         let Some(uuids) = device
             .uuids()
             .await
@@ -1409,7 +1428,8 @@ impl FastPairBatteryProvider {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%address, ?transport, error = %error, error_chain = %format!("{error:#}"), "Fast Pair connection failed");
-                    provider.connections.lock().await.connection_failed(address);
+                    provider.connections.lock().await.connection_failed(address, retry::is_connection_busy(&error));
+                    provider.retry_changed.notify_one();
                 }
             }
         });
@@ -1567,6 +1587,7 @@ impl FastPairBatteryProvider {
 
     async fn connection_ended(&self, address: Address) {
         self.connections.lock().await.ended(address);
+        self.retry_changed.notify_one();
         self.pending_commands.disconnect(address);
         let runtime_changed = self.runtime.write().await.remove(&address).is_some();
         self.remove_report(address).await;
