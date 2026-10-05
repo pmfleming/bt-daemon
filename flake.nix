@@ -9,26 +9,47 @@
     inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, daemonFramework }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      daemonFramework,
+    }:
     let
       systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
     in
     {
-      packages = forAllSystems (system: pkgs:
+      packages = forAllSystems (
+        system: pkgs:
         let
-          btDaemon = pkgs.rustPlatform.buildRustPackage {
+          btDaemon = daemonFramework.lib.buildRustPackage pkgs {
             pname = "bt-daemon";
             version = "0.1.0";
-            src = ./.;
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./src
+                ./test_support
+                ./resource
+              ];
+            };
             postUnpack = ''
-              cp -R --no-preserve=mode ${daemonFramework} "$(dirname "$sourceRoot")/daemon-framework"
+              cp -R --no-preserve=mode ${daemonFramework.lib.daemonSource pkgs} "$(dirname "$sourceRoot")/daemon-framework"
             '';
             cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = with pkgs; [ llvmPackages.libclang pkg-config ];
+            nativeBuildInputs = with pkgs; [
+              llvmPackages.libclang
+              pkg-config
+            ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
-            buildInputs = with pkgs; [ dbus pipewire ];
+            buildInputs = with pkgs; [
+              dbus
+              pipewire
+            ];
             strictDeps = true;
             postInstall = ''
               install -Dm644 ${./packaging/systemd/bt-daemon.service} $out/share/systemd/user/bt-daemon.service
@@ -48,53 +69,60 @@
         in
         {
           default = btDaemon;
-        });
+        }
+      );
 
-      apps = forAllSystems (system: pkgs: {
-        default = {
-          type = "app";
-          program = "${self.packages.${system}.default}/bin/bt-daemon";
-          meta.description = "Run the Shelllist Bluetooth backend";
-        };
-      });
+      apps = forAllSystems (
+        system: pkgs: {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/bt-daemon";
+            meta.description = "Run the Shelllist Bluetooth backend";
+          };
+        }
+      );
 
-      checks = forAllSystems (system: pkgs: {
-        default = self.packages.${system}.default;
-      });
+      checks = forAllSystems (
+        system: pkgs: {
+          default = self.packages.${system}.default;
+        }
+      );
 
-      devShells = forAllSystems (system: pkgs: {
-        default = pkgs.mkShell {
-          packages = with pkgs; [
-            bluez
-            cargo
-            cargo-audit
-            cargo-llvm-cov
-            cargo-mutants
-            clippy
-            dbus
-            gcc
-            jq
-            just
-            llvmPackages.libclang
-            llvmPackages.llvm
-            pkg-config
-            pipewire
-            python3
-            rust-analyzer
-            rustc
-            rustfmt
-            systemd
-            wireplumber
-          ];
+      devShells = forAllSystems (
+        system: pkgs: {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              bluez
+              cargo
+              cargo-audit
+              cargo-llvm-cov
+              cargo-mutants
+              clippy
+              dbus
+              gcc
+              jq
+              just
+              llvmPackages.libclang
+              llvmPackages.llvm
+              pkg-config
+              pipewire
+              python3
+              rust-analyzer
+              rustc
+              rustfmt
+              systemd
+              wireplumber
+            ];
 
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
-          LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
-          LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
-          RUST_BACKTRACE = "1";
-          RUST_LOG = "bt_daemon=debug";
-        };
-      });
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+            LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
+            LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
+            RUST_BACKTRACE = "1";
+            RUST_LOG = "bt_daemon=debug";
+          };
+        }
+      );
 
       formatter = forAllSystems (system: pkgs: pkgs.nixpkgs-fmt);
     };
