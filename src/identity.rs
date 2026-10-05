@@ -29,8 +29,9 @@ struct RememberedPresentation {
     model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     components: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    battery: Vec<Battery>,
+    // Immutable readings are shared by registry views and queued disk snapshots.
+    #[serde(default, skip_serializing_if = "<[Battery]>::is_empty")]
+    battery: Arc<[Battery]>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,7 +40,7 @@ pub(crate) struct RememberedPresentationValues {
     pub device_type: String,
     pub model_id: Option<String>,
     pub components: Vec<String>,
-    pub battery: Vec<Battery>,
+    pub battery: Arc<[Battery]>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -276,10 +277,10 @@ impl RememberedPresentation {
     }
 
     fn update_battery(&mut self, battery: &[Battery]) -> bool {
-        if battery.is_empty() || self.battery == battery {
+        if battery.is_empty() || self.battery.as_ref() == battery {
             return false;
         }
-        self.battery = battery.to_vec();
+        self.battery = battery.into();
         true
     }
 
@@ -289,7 +290,7 @@ impl RememberedPresentation {
             device_type: self.device_type().into(),
             model_id: self.model_id.clone(),
             components: self.components.clone(),
-            battery: self.battery.clone(),
+            battery: Arc::clone(&self.battery),
         }
     }
 }
@@ -351,6 +352,61 @@ mod tests {
         assert_eq!(state.devices["hci01:CC"], "other");
     }
 
+    #[test]
+    fn battery_views_and_persistence_snapshots_share_immutable_readings() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        let battery = [Battery::bluez_aggregate(75)];
+        let first = registry.remember_presentation("peer", None, None, &battery);
+        let frozen = registry.state().clone();
+        let unchanged = registry.remember_presentation("peer", None, None, &battery);
+        let missing = registry.remember_presentation("peer", None, None, &[]);
+        for retained in [
+            unchanged.battery.as_ref(),
+            missing.battery.as_ref(),
+            frozen.presentations["peer"].battery.as_ref(),
+        ] {
+            assert_eq!(first.battery.as_ptr(), retained.as_ptr());
+        }
+        let changed =
+            registry.remember_presentation("peer", None, None, &[Battery::bluez_aggregate(74)]);
+        assert_ne!(first.battery.as_ptr(), changed.battery.as_ptr());
+        assert_eq!(first.battery[0].percentage, 75);
+        assert_eq!(changed.battery[0].percentage, 74);
+        let saved = serde_json::to_value(&frozen).unwrap();
+        assert_eq!(
+            saved["presentations"]["peer"]["battery"],
+            serde_json::json!(battery)
+        );
+        registry.forget_presentation("peer");
+        assert!(
+            registry
+                .remember_presentation("peer", None, None, &[])
+                .battery
+                .is_empty()
+        );
+        assert_eq!(first.battery[0].percentage, 75);
+    }
+
+    #[test]
+    fn legacy_battery_arrays_and_missing_readings_keep_their_disk_format() {
+        let legacy = serde_json::json!({
+            "version": 1, "devices": {}, "presentations": {
+                "peer": {"battery": [Battery::bluez_aggregate(75)]},
+                "empty": {"battery": []}, "missing": {}
+            }
+        });
+        let loaded: super::RegistryFile = serde_json::from_value(legacy.clone()).unwrap();
+        let saved = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(
+            saved["presentations"]["peer"]["battery"],
+            legacy["presentations"]["peer"]["battery"]
+        );
+        for key in ["empty", "missing"] {
+            assert!(loaded.presentations[key].battery.is_empty());
+            assert!(saved["presentations"][key].get("battery").is_none());
+        }
+    }
+
     fn component_battery(component: &str, percentage: u8) -> Vec<Battery> {
         vec![Battery {
             id: component.into(),
@@ -397,7 +453,7 @@ mod tests {
         assert_eq!(key, registry.device_key("hci1", address));
         let presentation = registry.remember_presentation(&key, None, None, &[]);
         assert_eq!(presentation.icon.as_deref(), Some("audio-headphones"));
-        assert_eq!(presentation.battery, expected_battery);
+        assert_eq!(presentation.battery.as_ref(), expected_battery);
         assert_eq!(presentation.device_type, "Earbuds");
         assert_eq!(presentation.model_id.as_deref(), Some("02fc97"));
         assert_eq!(presentation.components, ["left", "right"]);

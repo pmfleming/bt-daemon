@@ -318,7 +318,7 @@ fn presentation(
             components: presentation_components(&battery),
             model_id: model_id.map(Into::into),
             icon: icon.map(Into::into),
-            battery: Vec::new(),
+            battery: Default::default(),
         }
     };
     let restored_icon = icon.is_none_or(|icon| icon.trim().is_empty()) && remembered.icon.is_some();
@@ -332,7 +332,8 @@ fn presentation(
         "resolved snapshot presentation"
     );
     let battery = if restored_battery {
-        remembered.battery
+        // Only disconnected fallback needs owned copies of remembered readings.
+        remembered.battery.to_vec()
     } else {
         battery
     };

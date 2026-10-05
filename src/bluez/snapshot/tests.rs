@@ -121,6 +121,18 @@ fn presentation_restores_paired_history_but_not_live_or_unpaired_batteries() {
     assert!(
         !connected_without_battery.battery_live && !connected_without_battery.battery_last_known
     );
+    for connected in [true, false] {
+        let current = vec![Battery::bluez_aggregate(50)];
+        let allocation = current.as_ptr();
+        let view = presentation(&identities, &key, true, connected, None, None, current);
+        // Current readings are moved into the snapshot, not replaced by a cache copy.
+        assert_eq!(view.battery.as_ptr(), allocation);
+        assert_eq!(view.battery_live, connected);
+        assert_eq!(view.battery_last_known, !connected);
+    }
+    let fallback = presentation(&identities, &key, true, false, None, None, vec![]);
+    assert_eq!(fallback.battery[0].percentage, 50);
+    assert!(!fallback.battery_live && fallback.battery_last_known);
     let unpaired = presentation(&identities, &key, false, false, None, None, vec![]);
     assert_eq!(
         key,
