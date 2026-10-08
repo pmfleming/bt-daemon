@@ -204,6 +204,30 @@ fn cached_device_views_expire_and_never_claim_live_state() {
     assert!(view.capabilities.can_connect && !view.capabilities.can_disconnect);
     assert!(!view.capabilities.can_set_multipoint && !view.capabilities.can_set_noise_control);
     assert!(cached.device.state.connected);
+    let mut devices = vec![cached.device.clone()];
+    let entries = [
+        ("device-test", "adapter-test", 42),
+        ("fallback", "adapter-test", 42),
+        ("other", "adapter-other", 42),
+        ("stale", "adapter-test", 41),
+    ]
+    .map(|(key, adapter, observed_at_ms)| {
+        let mut device = cached.device.clone();
+        device.key = key.into();
+        device.adapter_key = adapter.into();
+        CachedDevice {
+            device,
+            observed_at_ms,
+        }
+    });
+    super::extend_cached_devices(&mut devices, entries.iter(), "adapter-test", 42 + ttl);
+    assert_eq!(
+        devices.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(),
+        ["device-test", "fallback"]
+    );
+    assert!(devices[0].state.connected);
+    assert!(!devices[1].state.connected);
+    assert!(entries[1].device.state.connected);
     let snapshot = crate::model::Snapshot {
         adapters: vec![crate::model::Adapter {
             key: "adapter-test".into(),

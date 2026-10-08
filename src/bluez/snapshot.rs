@@ -33,13 +33,14 @@ pub(super) async fn build(backend: &BluezBackend) -> Result<Snapshot> {
             let address = adapter
                 .address()
                 .await
-                .backend_context("read stable adapter identity")?;
+                .backend_context("read stable adapter identity")?
+                .to_string();
             backend
                 .identities
-                .register_adapter(adapter.name(), &address.to_string());
-            let adapter_key = opaque_key("adapter", &address.to_string());
+                .register_adapter(adapter.name(), &address);
+            let adapter_key = opaque_key("adapter", &address);
             let (adapter, devices) = tokio::try_join!(
-                adapter_snapshot(&adapter, &adapter_key),
+                adapter_snapshot(&adapter, &adapter_key, address),
                 adapter_devices(backend, &adapter, &adapter_key),
             )?;
             Ok::<_, anyhow::Error>((adapter, devices))
@@ -93,32 +94,42 @@ async fn adapter_devices(
         .try_collect::<Vec<_>>()
         .await?;
     let mut devices = live.into_iter().flatten().collect::<Vec<_>>();
-    let included = devices
-        .iter()
-        .map(|device| device.key.clone())
-        .collect::<HashSet<_>>();
-
-    let now_ms = unix_time_ms();
-    let cached = backend.device_cache.lock().await;
-    devices.extend(
-        cached
-            .values()
-            .filter(|cached| {
-                cached.device.adapter_key == adapter_key
-                    && !included.contains(&cached.device.key)
-                    && cache_entry_is_fresh(cached.observed_at_ms, now_ms)
-            })
-            .map(cached_device_view),
+    extend_cached_devices(
+        &mut devices,
+        backend.device_cache.lock().await.values(),
+        adapter_key,
+        unix_time_ms(),
     );
     Ok(devices)
 }
 
-async fn adapter_snapshot(adapter: &BluezAdapter, key: &str) -> Result<Adapter> {
+fn extend_cached_devices<'a>(
+    devices: &mut Vec<Device>,
+    cached: impl Iterator<Item = &'a CachedDevice>,
+    adapter_key: &str,
+    now_ms: u64,
+) {
+    let included = devices
+        .iter()
+        .map(|device| device.key.as_str())
+        .collect::<HashSet<_>>();
+    // Stage references, not cloned device keys or full snapshots, before extending the live list.
+    let missing = cached
+        .filter(|cached| {
+            cached.device.adapter_key == adapter_key
+                && !included.contains(cached.device.key.as_str())
+                && cache_entry_is_fresh(cached.observed_at_ms, now_ms)
+        })
+        .collect::<Vec<_>>();
+    devices.extend(missing.into_iter().map(cached_device_view));
+}
+
+async fn adapter_snapshot(adapter: &BluezAdapter, key: &str, address: String) -> Result<Adapter> {
     Ok(Adapter {
         key: key.to_string(),
         name: adapter.name().to_string(),
         alias: bluez_result(adapter.alias().await, "read adapter alias")?,
-        address: bluez_result(adapter.address().await, "read adapter address")?.to_string(),
+        address,
         address_type: bluez_result(adapter.address_type().await, "read adapter address type")?
             .to_string(),
         powered: bluez_result(adapter.is_powered().await, "read adapter power")?,
