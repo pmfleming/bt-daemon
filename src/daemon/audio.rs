@@ -94,6 +94,18 @@ pub(super) const PROFILE: Change = Change {
     select: select_profile,
 };
 
+impl Change {
+    fn request<'a>(&self, params: &'a Value) -> Result<(&'a str, &'a str, bool)> {
+        let remember = match params.get("remember") {
+            None => false,
+            Some(Value::Bool(value)) if self.parameter == "profile_key" => *value,
+            _ => anyhow::bail!("remember must be a boolean on setProfile"),
+        };
+        let (device, requested) = params.require_strings("device_key", self.parameter)?;
+        Ok((device, requested, remember))
+    }
+}
+
 // An apply failure never persists; a persistence failure never claims that the
 // already-applied hardware change was rolled back.
 fn apply_then_remember(
@@ -110,17 +122,7 @@ pub(super) async fn apply_change(
     change: Change,
     persist: impl FnOnce(&str, &str) -> Result<()> + Send + 'static,
 ) -> Value {
-    let remember = match params.get("remember") {
-        None => false,
-        Some(Value::Bool(value)) if change.parameter == "profile_key" => *value,
-        _ => {
-            return api::error(
-                "validation-error",
-                "remember must be a boolean on setProfile".into(),
-            );
-        }
-    };
-    let (device_key, requested_key) = match params.require_strings("device_key", change.parameter) {
+    let (device_key, requested_key, remember) = match change.request(params) {
         Ok(params) => params,
         Err(error) => return api::error("validation-error", error.to_string()),
     };
@@ -160,21 +162,30 @@ pub(super) async fn apply_change(
     .await
     {
         Ok(Ok(persistence_error)) => {
-            let mut response = snapshot(pairing).await;
-            if remember {
-                if response["ok"] != true {
-                    response = api::success(json!({"refresh_error": response["error"]}));
-                }
-                response["data"]["profile_outcome"] = json!({
-                    "applied": true, "remembered": persistence_error.is_none(),
-                    "persistence_error": persistence_error
-                });
-            }
-            response
+            applied_response(snapshot(pairing).await, remember, persistence_error)
         }
         Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
         Err(error) => api::error("audio-operation-failed", error.to_string()),
     }
+}
+
+// Refresh failure must not hide a successfully applied profile or a failed policy save.
+fn applied_response(
+    mut response: Value,
+    remember: bool,
+    persistence_error: Option<String>,
+) -> Value {
+    if !remember {
+        return response;
+    }
+    if response["ok"] != true {
+        response = api::success(json!({"refresh_error": response["error"]}));
+    }
+    response["data"]["profile_outcome"] = json!({
+        "applied": true, "remembered": persistence_error.is_none(),
+        "persistence_error": persistence_error
+    });
+    response
 }
 
 pub(super) async fn snapshot(pairing: &PairingBroker) -> Value {

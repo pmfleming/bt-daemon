@@ -98,6 +98,66 @@ async fn audio_changes_validate_their_own_parameter_before_probing() {
 }
 
 #[test]
+fn remember_is_validated_before_audio_effects() {
+    use serde_json::json;
+    for change in [super::PROFILE, super::DEFAULT] {
+        let mut params = json!({"device_key": "peer", change.parameter: "selection"});
+        assert_eq!(
+            change.request(&params).unwrap(),
+            ("peer", "selection", false)
+        );
+        for invalid in [json!(null), json!("true"), json!(1)] {
+            params["remember"] = invalid;
+            assert_eq!(
+                change.request(&params).unwrap_err().to_string(),
+                "remember must be a boolean on setProfile"
+            );
+        }
+        for remember in [false, true] {
+            params["remember"] = json!(remember);
+            if change.parameter == "profile_key" {
+                assert_eq!(
+                    change.request(&params).unwrap(),
+                    ("peer", "selection", remember)
+                );
+            } else {
+                assert!(change.request(&params).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn applied_profiles_report_persistence_and_refresh_failures_independently() {
+    use serde_json::json;
+    for snapshot in [
+        crate::api::success(json!({"audio_devices": []})),
+        crate::api::error("audio-unavailable", "offline".into()),
+    ] {
+        assert_eq!(
+            super::applied_response(snapshot.clone(), false, None),
+            snapshot
+        );
+        for error in [None, Some("disk full".to_string())] {
+            let response = super::applied_response(snapshot.clone(), true, error.clone());
+            assert_eq!(response["ok"], true);
+            assert_eq!(
+                response["data"]["profile_outcome"],
+                json!({
+                    "applied": true, "remembered": error.is_none(), "persistence_error": error
+                })
+            );
+            if snapshot["ok"] == true {
+                assert_eq!(response["data"]["audio_devices"], json!([]));
+                assert!(response["data"].get("refresh_error").is_none());
+            } else {
+                assert_eq!(response["data"]["refresh_error"], snapshot["error"]);
+            }
+        }
+    }
+}
+
+#[test]
 fn apply_and_remember_preserves_partial_outcomes() {
     assert!(
         super::apply_then_remember(
