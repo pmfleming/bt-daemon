@@ -174,6 +174,7 @@ impl ScanCoordinator {
             error: None,
         };
         let handle = self.spawn_timeout(request_id.clone(), adapter_key, timeout_ms);
+        let response = api::success(json!({ "scan": running, "snapshot": snapshot }));
         self.tasks.lock().await.insert(
             request_id,
             ScanTask {
@@ -181,8 +182,8 @@ impl ScanCoordinator {
                 event: running.clone(),
             },
         );
-        let _ = self.events.send(running.clone());
-        api::success(json!({ "scan": running, "snapshot": snapshot }))
+        let _ = self.events.send(running);
+        response
     }
 
     fn spawn_timeout(
@@ -201,9 +202,10 @@ impl ScanCoordinator {
             let mut terminal_adapter = Some(task_adapter);
             loop {
                 let _transition = transition.lock().await;
-                let Some(adapters) = removable_adapters(&tasks, &task_id).await else {
+                let (selected, adapters) = select_scans(&*tasks.lock().await, Some(&task_id));
+                if selected.is_empty() {
                     return;
-                };
+                }
                 let result = crate::task::catch(
                     "Bluetooth scan completion",
                     stop_adapters(&backend, &adapters),
@@ -246,29 +248,7 @@ impl ScanCoordinator {
 
     pub(super) async fn stop(&self, request_id: Option<&str>, event: &str) -> Value {
         let _transition = self.transition.lock().await;
-        let (selected_ids, adapters_to_stop) = {
-            let tasks = self.tasks.lock().await;
-            let selected_ids = match request_id {
-                Some(request_id) if tasks.contains_key(request_id) => vec![request_id.to_string()],
-                Some(_) => Vec::new(),
-                None => tasks.keys().cloned().collect::<Vec<_>>(),
-            };
-            let selected = selected_ids
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>();
-            let active_adapters = retained_adapters(&tasks, |id| selected.contains(id));
-            let adapters = selected_ids
-                .iter()
-                .filter_map(|id| tasks.get(id))
-                .flat_map(|task| &task.event.adapter_keys)
-                .filter(|adapter| !active_adapters.contains(adapter.as_str()))
-                .cloned()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            (selected_ids, adapters)
-        };
+        let (selected_ids, adapters_to_stop) = select_scans(&*self.tasks.lock().await, request_id);
         if selected_ids.is_empty() {
             tracing::warn!(
                 ?request_id,
@@ -307,34 +287,32 @@ impl ScanCoordinator {
     }
 }
 
-async fn removable_adapters(
-    tasks: &Mutex<HashMap<String, ScanTask>>,
-    request_id: &str,
-) -> Option<Vec<String>> {
-    let active = tasks.lock().await;
-    let finished = active.get(request_id)?;
-    let retained = retained_adapters(&active, |id| id == request_id);
-    Some(
-        finished
-            .event
-            .adapter_keys
-            .iter()
-            .filter(|adapter| !retained.contains(adapter.as_str()))
-            .cloned()
-            .collect(),
-    )
-}
-
-// Borrow keys while holding the task lock; clone only adapters actually stopped.
-fn retained_adapters(
+// Both explicit stops and timeout cleanup preserve adapters leased by other scans.
+// Deduplicate borrowed adapter keys before allocating the owned stop list.
+fn select_scans(
     tasks: &HashMap<String, ScanTask>,
-    selected: impl Fn(&str) -> bool,
-) -> HashSet<&str> {
-    tasks
+    request_id: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let selected = |id: &str| request_id.is_none_or(|requested| requested == id);
+    let retained = tasks
         .iter()
         .filter(|(id, _)| !selected(id))
-        .flat_map(|(_, task)| task.event.adapter_keys.iter().map(String::as_str))
-        .collect()
+        .flat_map(|(_, task)| &task.event.adapter_keys)
+        .collect::<HashSet<_>>();
+    let mut ids = Vec::new();
+    let mut adapters = HashSet::new();
+    for (id, task) in tasks.iter().filter(|(id, _)| selected(id)) {
+        ids.push(id.clone());
+        adapters.extend(
+            task.event
+                .adapter_keys
+                .iter()
+                .filter(|key| !retained.contains(key)),
+        );
+    }
+    let mut adapters = adapters.into_iter().cloned().collect::<Vec<_>>();
+    adapters.sort(); // Stable ordering also makes the first backend failure deterministic.
+    (ids, adapters)
 }
 
 fn terminal_event(

@@ -324,6 +324,45 @@ async fn owner_loss_releases_global_scan_without_stopping_another_owners_lease()
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn timeout_preserves_shared_adapters_and_stop_all_deduplicates_them() {
+    let scanning = Arc::new(StdMutex::new(Vec::new()));
+    let scans = ScanCoordinator::new(test_backend(true, false, Arc::clone(&scanning)));
+    let global = scans.start(&json!({"timeout_ms": 1_000}), ":global").await;
+    let targeted = start_scan(&scans, "adapter-1", 60_000).await;
+    let mut events = scans.subscribe();
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+    let completed = events.recv().await.unwrap();
+    assert_eq!(completed.event, "completed");
+    assert_eq!(completed.request_id, global["data"]["scan"]["request_id"]);
+    assert!(
+        scans
+            .contains(targeted["data"]["scan"]["request_id"].as_str().unwrap())
+            .await
+    );
+    assert_eq!(
+        stopped_calls(&scanning),
+        [(Some("adapter-2".into()), false)]
+    );
+    scanning.lock().unwrap().clear();
+    scans.start(&json!({"timeout_ms": 60_000}), ":global").await;
+    assert_eq!(
+        scans.stop(Some("missing"), "cancelled").await["error"]["code"],
+        "request-not-found"
+    );
+    assert!(stopped_calls(&scanning).is_empty());
+    assert_eq!(scans.stop(None, "cancelled").await["ok"], true);
+    assert_eq!(
+        stopped_calls(&scanning),
+        [
+            (Some("adapter-1".into()), false),
+            (Some("adapter-2".into()), false)
+        ]
+    );
+    assert_eq!(scans.snapshot().await["active"], json!([]));
+}
+
 #[tokio::test]
 async fn failed_scan_stop_is_reported_and_remains_retryable() {
     let scanning = Arc::new(StdMutex::new(Vec::new()));
