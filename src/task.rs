@@ -7,6 +7,15 @@ pub(crate) use shelllist_daemon_tokio::{TaskGroup, catch_task as catch, spawn_na
 
 /// Device serialization also covers resume policy and native audio operations.
 pub(crate) fn device_gate(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    mutation_gate(&format!("device:{key}"))
+}
+
+/// Serialize submitted adapter settings, including legacy single-setting requests.
+pub(crate) fn adapter_gate(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    mutation_gate(&format!("adapter:{key}"))
+}
+
+fn mutation_gate(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     static GATES: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let mut gates = GATES
         .get_or_init(Mutex::default)
@@ -30,6 +39,7 @@ mod tests {
         let other = super::device_gate("b");
         let held = first.lock().await;
         assert!(same.try_lock().is_err());
+        assert!(super::adapter_gate("a").try_lock().is_ok());
         assert!(other.try_lock().is_ok());
         drop(held);
         assert!(same.try_lock().is_ok());

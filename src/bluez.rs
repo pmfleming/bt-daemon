@@ -501,7 +501,7 @@ impl BluetoothBackend for BluezBackend {
         adapter_key: &str,
         operation: AdapterOperation,
         params: &Value,
-    ) -> Result<Snapshot> {
+    ) -> Result<()> {
         tracing::info!(%adapter_key, %operation, "Bluetooth adapter operation started");
         let adapter = self.find_adapter(adapter_key).await?;
         let result = match operation {
@@ -529,8 +529,7 @@ impl BluetoothBackend for BluezBackend {
                     .await
             }
         };
-        result.backend_context(&format!("{operation} on adapter {adapter_key}"))?;
-        self.snapshot().await
+        result.backend_context(&format!("{operation} on adapter {adapter_key}"))
     }
 
     async fn update_management(&self, params: &Value) -> Result<Snapshot> {

@@ -29,7 +29,7 @@ offline_backend! {
     fn snapshot() -> Snapshot;
     fn set_powered(adapter_key: Option<&str>, powered: bool) -> Snapshot;
     fn set_scanning(adapter_key: Option<&str>, enabled: bool) -> Snapshot;
-    fn adapter_operation(adapter_key: &str, operation: AdapterOperation, params: &Value) -> Snapshot;
+    fn adapter_operation(adapter_key: &str, operation: AdapterOperation, params: &Value) -> ();
     fn update_management(params: &Value) -> Snapshot;
     fn update_device_policy(device_key: &str, params: &Value) -> Snapshot;
     fn obex_target(device_key: &str) -> ObexTarget;

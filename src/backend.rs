@@ -207,7 +207,8 @@ pub struct ObexRemote {
 #[async_trait]
 /// Injectable Bluetooth backend used by request coordinators and hardware-free tests.
 /// Implementations must validate current hardware state, even when a prior snapshot
-/// advertised an operation as available. Mutations return the resulting snapshot.
+/// advertised an operation as available. Adapter setters return the write acknowledgement
+/// separately from snapshot reads, so a failed read cannot erase a known applied write.
 pub trait BluetoothBackend: Send + Sync {
     fn subscribe_changes(&self) -> broadcast::Receiver<()>;
     async fn snapshot(&self) -> Result<Snapshot>;
@@ -218,7 +219,7 @@ pub trait BluetoothBackend: Send + Sync {
         adapter_key: &str,
         operation: AdapterOperation,
         params: &Value,
-    ) -> Result<Snapshot>;
+    ) -> Result<()>;
     async fn update_management(&self, params: &Value) -> Result<Snapshot>;
     async fn update_device_policy(&self, device_key: &str, params: &Value) -> Result<Snapshot>;
     /// Persist only, without reacquiring the caller-held device gate.

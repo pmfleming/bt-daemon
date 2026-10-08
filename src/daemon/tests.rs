@@ -20,6 +20,7 @@ use super::{
     operation::OperationEvent, scan::ScanEvent,
 };
 
+mod adapter;
 mod routing;
 
 type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
@@ -28,6 +29,7 @@ struct TestBackend {
     complete: bool,
     fail_scan_stop: bool,
     scanning: ScanningCalls,
+    adapter: Option<Arc<adapter::Effects>>,
 }
 
 #[async_trait]
@@ -37,6 +39,13 @@ impl BluetoothBackend for TestBackend {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
+        if self
+            .adapter
+            .as_ref()
+            .is_some_and(|effects| effects.fail_snapshot)
+        {
+            anyhow::bail!("snapshot unavailable after write");
+        }
         Ok(Snapshot {
             adapters: vec![
                 test_adapter("adapter-1"),
@@ -70,8 +79,16 @@ impl BluetoothBackend for TestBackend {
         self.snapshot().await
     }
 
-    async fn adapter_operation(&self, _: &str, _: AdapterOperation, _: &Value) -> Result<Snapshot> {
-        self.snapshot().await
+    async fn adapter_operation(
+        &self,
+        key: &str,
+        operation: AdapterOperation,
+        params: &Value,
+    ) -> Result<()> {
+        if let Some(effects) = &self.adapter {
+            effects.apply(key, operation, params).await?;
+        }
+        Ok(())
     }
 
     async fn update_management(&self, _: &Value) -> Result<Snapshot> {
@@ -134,6 +151,7 @@ fn test_backend(
         complete,
         fail_scan_stop,
         scanning,
+        adapter: None,
     })
 }
 

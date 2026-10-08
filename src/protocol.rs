@@ -35,6 +35,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = method_registry! {
     "bluetooth.setPowered", r#"{"adapter_key":null,"powered":true}"#, "snapshot", Some(stream::CHANGED);
     "bluetooth.scan", r#"{"adapter_key":"adapter-opaque","enabled":true,"timeout_ms":15000}"#, "scan", Some(stream::SCAN);
     "bluetooth.adapter.operation", r#"{"key":"adapter-opaque","operation":"set-discoverable","discoverable":true}"#, "snapshot", Some(stream::CHANGED);
+    "bluetooth.adapter.update", r#"{"key":"adapter-opaque","changes":{"alias":"Computer","discoverable_timeout":120,"pairable_timeout":0}}"#, "adapter_batch", Some(stream::CHANGED);
     "bluetooth.management.update", r#"{"launch_state":"remember","reconnect_on_resume":true,"trust_after_pair":true,"preferred_adapter_key":"adapter-opaque","show_blocked_devices":false,"show_recent_devices":false}"#, "snapshot", Some(stream::CHANGED);
     "bluetooth.device.policy.update", r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"fast_pair_controls_enabled":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#, "snapshot", Some(stream::CHANGED);
     "bluetooth.obex.snapshot", "{}", "obex", None;
@@ -73,6 +74,9 @@ fn method_description(name: &str) -> &'static str {
         "bluetooth.setPowered" => "Set global or adapter Bluetooth power.",
         "bluetooth.scan" => "Acquire or release a bounded caller-owned discovery lease.",
         "bluetooth.adapter.operation" => "Mutate one adapter setting.",
+        "bluetooth.adapter.update" => {
+            "Apply a validated adapter patch in alias/discoverable_timeout/pairable_timeout order. Returns per-field applied/unknown/not-attempted outcomes; stops on error, without rollback or replay. Survives caller disconnect, but not daemon restart. Snapshot failure does not erase write acknowledgements."
+        }
         "bluetooth.management.update" => "Update persistent global Bluetooth policy.",
         "bluetooth.device.policy.update" => {
             "Update persistent policy for one device; null clears an override."
@@ -128,7 +132,7 @@ fn parameter_contract(name: &str, encoded: &str) -> (Value, Value) {
             "type": "object",
             "properties": properties,
             "required": required,
-            "additionalProperties": true,
+            "additionalProperties": name != "bluetooth.adapter.update",
         }),
     )
 }
@@ -137,6 +141,7 @@ fn required_parameters(name: &str) -> &'static [&'static str] {
     match name {
         "bluetooth.setPowered" => &["powered"],
         "bluetooth.adapter.operation" => &["key", "operation"],
+        "bluetooth.adapter.update" => &["key", "changes"],
         "bluetooth.device.policy.update" => &["key"],
         "bluetooth.obex.send" => &["device_key", "path"],
         "bluetooth.obex.respond" => &["request_id", "accept"],
@@ -161,6 +166,16 @@ fn inferred_schema(value: &Value) -> Value {
 }
 
 fn apply_constraints(method: &str, property: &str, schema: &mut Value) {
+    if method == "bluetooth.adapter.update" && property == "changes" {
+        *schema = json!({
+            "type": "object", "minProperties": 1, "additionalProperties": false,
+            "properties": {
+                "alias": {"type": "string", "minLength": 1},
+                "discoverable_timeout": {"type": "integer", "minimum": 0, "maximum": u32::MAX},
+                "pairable_timeout": {"type": "integer", "minimum": 0, "maximum": u32::MAX}
+            }
+        });
+    }
     let enum_values = match (method, property) {
         ("bluetooth.adapter.operation", "operation") => Some(AdapterOperation::VALUES),
         ("bluetooth.device.operation", "operation") => Some(DeviceOperation::VALUES),
@@ -235,6 +250,7 @@ fn error_registry() -> Value {
     errors.extend([
         json!({ "code": "daemon-unavailable", "retryable": true }),
         json!({ "code": "device-busy", "retryable": true }),
+        json!({ "code": "adapter-outcome-unknown", "retryable": false }),
         json!({ "code": "request-not-found", "retryable": false }),
         json!({ "code": "unsupported-method", "retryable": false }),
         json!({ "code": "unsupported-stream", "retryable": false }),

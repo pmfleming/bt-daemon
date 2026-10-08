@@ -10,6 +10,8 @@ use crate::backend::{AdapterOperation, BackendError, BackendErrorKind, Bluetooth
 pub use crate::protocol::{NAME as PROTOCOL, VERSION};
 const API: ApiIdentity = ApiIdentity::new(PROTOCOL, VERSION as u32);
 
+mod adapter;
+
 enum BackendRequest<'a> {
     Snapshot,
     SetPowered {
@@ -39,7 +41,13 @@ impl BackendRequest<'_> {
                 powered,
             } => backend.set_powered(adapter_key, powered).await,
             Self::AdapterOperation { key, operation } => {
-                backend.adapter_operation(key, operation, params).await
+                adapter::single(
+                    Arc::clone(backend),
+                    key.to_owned(),
+                    operation,
+                    params.clone(),
+                )
+                .await
             }
             Self::UpdateManagement => backend.update_management(params).await,
             Self::UpdateDevicePolicy { key } => {
@@ -63,6 +71,11 @@ fn policy_values(params: &Value) -> Value {
 /// Validation errors never invoke a backend operation.
 pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: Value) -> Value {
     tracing::debug!(%method, "backend API request started");
+    if method == "bluetooth.adapter.update" {
+        let response = adapter::submit(backend, params).await;
+        log_response(method, &response);
+        return response;
+    }
     let request = match parse_backend_request(method, &params) {
         Ok(request) => request,
         Err(response) => {

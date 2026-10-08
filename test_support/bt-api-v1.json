@@ -1,4 +1,41 @@
 {
+  "adapter_update": {
+    "data": {
+      "adapter_batch": {
+        "key": "adapter-opaque",
+        "outcomes": [
+          {
+            "field": "alias",
+            "state": "applied",
+            "value": "Computer"
+          },
+          {
+            "error": {
+              "code": "operation-failed",
+              "message": "write acknowledgement lost",
+              "retryable": false
+            },
+            "field": "discoverable_timeout",
+            "state": "unknown",
+            "value": 120
+          },
+          {
+            "field": "pairable_timeout",
+            "state": "not-attempted",
+            "value": 0
+          }
+        ],
+        "snapshot_error": {
+          "code": "operation-failed",
+          "message": "snapshot unavailable after write",
+          "retryable": false
+        }
+      }
+    },
+    "ok": true,
+    "protocol": "bt-api",
+    "version": 1
+  },
   "audio_snapshot": {
     "data": {
       "audio_devices": [
@@ -150,6 +187,10 @@
       {
         "code": "device-busy",
         "retryable": true
+      },
+      {
+        "code": "adapter-outcome-unknown",
+        "retryable": false
       },
       {
         "code": "request-not-found",
@@ -309,6 +350,58 @@
         },
         "required_capability": null,
         "response_key": "snapshot",
+        "stream": "bluetooth.changed"
+      },
+      {
+        "cancellable": false,
+        "description": "Apply a validated adapter patch in alias/discoverable_timeout/pairable_timeout order. Returns per-field applied/unknown/not-attempted outcomes; stops on error, without rollback or replay. Survives caller disconnect, but not daemon restart. Snapshot failure does not erase write acknowledgements.",
+        "name": "bluetooth.adapter.update",
+        "params_example": {
+          "changes": {
+            "alias": "Computer",
+            "discoverable_timeout": 120,
+            "pairable_timeout": 0
+          },
+          "key": "adapter-opaque"
+        },
+        "params_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "changes": {
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "alias": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "discoverable_timeout": {
+                  "maximum": 4294967295,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pairable_timeout": {
+                  "maximum": 4294967295,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "key": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "changes",
+            "key"
+          ],
+          "type": "object"
+        },
+        "required_capability": null,
+        "response_key": "adapter_batch",
         "stream": "bluetooth.changed"
       },
       {
@@ -1005,8 +1098,8 @@
                 "source": "bluez"
               }
             ],
-            "battery_live": true,
             "battery_last_known": false,
+            "battery_live": true,
             "blocked": false,
             "bonded": true,
             "capabilities": {
@@ -1031,8 +1124,9 @@
                 "wake": "BlueZ does not expose wake control for this device"
               }
             },
-            "connected": false,
             "components": [],
+            "connected": false,
+            "device_type": "Headset",
             "icon": "audio-headset",
             "key": "device-opaque",
             "last_seen_ms": null,
@@ -1040,7 +1134,6 @@
             "modalias": null,
             "name": "Headphones",
             "paired": true,
-            "present": false,
             "policy": {
               "audio_route_on_connect": "keep",
               "fast_pair_controls_enabled": true,
@@ -1050,6 +1143,8 @@
               "trust_after_pair": true,
               "wait_for_services": true
             },
+            "present": false,
+            "remote_name": "Headphones",
             "rssi": null,
             "services": [
               {
@@ -1064,28 +1159,26 @@
             "uuids": [
               "0000110b-0000-1000-8000-00805f9b34fb"
             ],
-            "wake_allowed": null,
-            "remote_name": "Headphones",
-            "device_type": "Headset"
+            "wake_allowed": null
           }
         ],
+        "management": {
+          "launch_state": "remember",
+          "preferred_adapter_key": "adapter-opaque",
+          "reconnect_on_resume": true,
+          "show_blocked_devices": false,
+          "show_recent_devices": false,
+          "trust_after_pair": true,
+          "version": 1
+        },
         "radio": {
+          "adapter_count": 1,
           "available": true,
+          "hard_blocked": false,
           "operational": true,
           "powered": true,
-          "adapter_count": 1,
           "rfkill_present": true,
-          "soft_blocked": false,
-          "hard_blocked": false
-        },
-        "management": {
-          "version": 1,
-          "launch_state": "remember",
-          "reconnect_on_resume": true,
-          "trust_after_pair": true,
-          "preferred_adapter_key": "adapter-opaque",
-          "show_blocked_devices": false,
-          "show_recent_devices": false
+          "soft_blocked": false
         }
       }
     },
