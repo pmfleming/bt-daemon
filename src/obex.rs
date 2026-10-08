@@ -82,10 +82,10 @@ impl ObexEvent {
         }
     }
 
-    pub(crate) fn updated(&self, update: TransferUpdate) -> Self {
+    pub(crate) fn updated(&self, update: &TransferUpdate) -> Self {
         Self {
             event: lifecycle_event(&update.status).into(),
-            status: update.status,
+            status: update.status.clone(),
             transferred: update.transferred,
             size: update.size,
             ..self.clone()
@@ -181,40 +181,20 @@ struct IncomingAuthorization {
 
 impl IncomingAuthorization {
     fn event(&self, event: &str, status: &str, timeout_ms: Option<u64>) -> ObexEvent {
-        incoming_event(
-            &self.request_id,
-            &self.remote,
-            &self.details,
-            &self.file_name,
-            event,
-            status,
+        ObexEvent {
+            event: event.into(),
+            request_id: self.request_id.clone(),
+            direction: "incoming".into(),
+            device_key: self.remote.device_key.clone(),
+            device_name: Some(self.remote.name.clone()),
+            file_name: self.file_name.clone(),
+            media_type: self.details.media_type.clone(),
+            status: status.into(),
+            transferred: 0,
+            size: self.details.size,
             timeout_ms,
-        )
-    }
-}
-
-fn incoming_event(
-    request_id: &str,
-    remote: &ObexRemote,
-    details: &IncomingDetails,
-    file_name: &str,
-    event: &str,
-    status: &str,
-    timeout_ms: Option<u64>,
-) -> ObexEvent {
-    ObexEvent {
-        event: event.into(),
-        request_id: request_id.into(),
-        direction: "incoming".into(),
-        device_key: remote.device_key.clone(),
-        device_name: Some(remote.name.clone()),
-        file_name: file_name.into(),
-        media_type: details.media_type.clone(),
-        status: status.into(),
-        transferred: 0,
-        size: details.size,
-        timeout_ms,
-        error: None,
+            error: None,
+        }
     }
 }
 
@@ -642,7 +622,7 @@ pub async fn start_file(
         Ok(result) => result,
         Err(error) => {
             if let Err(cleanup_error) = client
-                .call::<_, _, ()>("RemoveSession", &(session_path.clone(),))
+                .call::<_, _, ()>("RemoveSession", &(&session_path,))
                 .await
             {
                 tracing::warn!(%cleanup_error, path = %session_path, "could not clean up failed OBEX session");
@@ -665,20 +645,20 @@ impl ActiveTransfer {
     pub async fn run(
         self,
         cancel: oneshot::Receiver<()>,
-        mut update: impl FnMut(TransferUpdate),
+        mut update: impl FnMut(&TransferUpdate),
     ) -> Result<()> {
         let current = TransferUpdate {
             status: self.initial_status,
             transferred: self.initial_transferred,
             size: self.size,
         };
-        update(current.clone());
+        update(&current);
         let result = monitor_transfer(
             &self.connection,
             &self.transfer_path,
             current,
             cancel,
-            |current| update(current.clone()),
+            update,
         )
         .await;
         cleanup_session(&self.connection, self.session_path).await;
@@ -710,13 +690,13 @@ struct IncomingDetails {
 
 async fn read_properties(
     connection: &zbus::Connection,
-    path: OwnedObjectPath,
+    path: &OwnedObjectPath,
     interface: &'static str,
     description: &'static str,
 ) -> Result<HashMap<String, OwnedValue>> {
     PropertiesProxy::builder(connection)
         .destination(BUS_NAME)?
-        .path(path)?
+        .path(path.as_str())?
         .build()
         .await?
         .get_all(interface.try_into()?)
@@ -750,7 +730,7 @@ async fn incoming_details(
 ) -> Result<IncomingDetails> {
     let values = read_properties(
         connection,
-        transfer_path.clone(),
+        transfer_path,
         TRANSFER_INTERFACE,
         "incoming OBEX transfer",
     )
@@ -759,7 +739,7 @@ async fn incoming_details(
         property_path(&values, "Session").context("incoming OBEX transfer has no session")?;
     let session_values = read_properties(
         connection,
-        session_path,
+        &session_path,
         SESSION_INTERFACE,
         "incoming OBEX session",
     )
@@ -1012,6 +992,10 @@ mod tests {
                 (expected, status)
             );
             assert_eq!((published.transferred, published.size), (42, 100));
+            assert_eq!(
+                serde_json::to_value(event.updated(&current)).unwrap(),
+                serde_json::to_value(&published).unwrap()
+            );
         }
     }
 

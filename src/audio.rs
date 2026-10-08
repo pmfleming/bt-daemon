@@ -83,6 +83,47 @@ pub struct AudioProfile {
     pub codec: Option<String>,
 }
 
+impl AudioDevice {
+    pub(crate) fn available_profile(&self, device_key: &str, key: &str) -> Option<&AudioProfile> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.available && profile_key(device_key, &profile.name) == key)
+    }
+}
+
+pub(crate) struct PolicyRequest {
+    pub device_key: String,
+    pub address: String,
+    pub preferred_profile_key: Option<String>,
+    pub switch_output: bool,
+}
+
+impl PolicyRequest {
+    pub(crate) fn apply(&self) -> Result<()> {
+        let device = probe()?
+            .into_iter()
+            .find(|device| device.address.eq_ignore_ascii_case(&self.address))
+            .context("Bluetooth audio card is not ready")?;
+        if let Some(profile) = self.preferred_profile(&device)? {
+            set_profile(&self.address, profile)?;
+        }
+        if self.switch_output {
+            set_default_sink(&self.address)?;
+        }
+        Ok(())
+    }
+
+    fn preferred_profile(&self, device: &AudioDevice) -> Result<Option<u32>> {
+        let Some(key) = &self.preferred_profile_key else {
+            return Ok(None);
+        };
+        let profile = device
+            .available_profile(&self.device_key, key)
+            .context("preferred Bluetooth audio profile is unavailable")?;
+        Ok((device.active_profile != Some(profile.index)).then_some(profile.index))
+    }
+}
+
 type RetainedObject = (Box<dyn ProxyT>, Box<dyn Listener>);
 
 #[derive(Default)]
@@ -844,6 +885,27 @@ mod tests {
         assert!(endpoints.is_empty());
         assert_eq!(devices[0].active_profile, Some(2));
         assert!(devices[0].sink.as_ref().unwrap().is_default);
+    }
+
+    #[test]
+    fn profile_selection_is_scoped_available_and_skips_active_policy_profiles() {
+        let mut device = audio_device();
+        device.profiles.push(audio_profile(2, 100));
+        let mut request = super::PolicyRequest {
+            device_key: "peer".into(),
+            address: device.address.clone(),
+            preferred_profile_key: None,
+            switch_output: false,
+        };
+        assert_eq!(request.preferred_profile(&device).unwrap(), None);
+        request.preferred_profile_key = Some(super::profile_key("other", "a2dp-sink"));
+        assert!(request.preferred_profile(&device).is_err());
+        request.preferred_profile_key = Some(super::profile_key("peer", "a2dp-sink"));
+        assert_eq!(request.preferred_profile(&device).unwrap(), Some(2));
+        device.active_profile = Some(2);
+        assert_eq!(request.preferred_profile(&device).unwrap(), None);
+        device.profiles[0].available = false;
+        assert!(request.preferred_profile(&device).is_err());
     }
 
     fn audio_device() -> AudioDevice {

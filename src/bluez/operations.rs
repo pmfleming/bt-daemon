@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::{BluezAdapter, BluezBackend, BluezDevice};
 use crate::management::DevicePolicy;
 use crate::{
-    audio,
+    audio::PolicyRequest,
     backend::{DeviceOperation, OperationProgress, Params},
 };
 
@@ -120,7 +120,7 @@ impl Effects for DeviceEffects<'_> {
 
     async fn route_audio(&self) -> Result<()> {
         (self.progress)("waiting-for-audio");
-        let request = Arc::new(AudioPolicyRequest {
+        let request = Arc::new(PolicyRequest {
             device_key: self.key.to_string(),
             address: self.device.address().to_string(),
             preferred_profile_key: self.policy.preferred_audio_profile_key.clone(),
@@ -141,44 +141,6 @@ impl Effects for DeviceEffects<'_> {
                 Err(error) => return Err(error.context("apply Bluetooth per-device audio policy")),
             }
         }
-    }
-}
-
-struct AudioPolicyRequest {
-    device_key: String,
-    address: String,
-    preferred_profile_key: Option<String>,
-    switch_output: bool,
-}
-
-impl AudioPolicyRequest {
-    fn apply(&self) -> Result<()> {
-        let device = audio::probe()?
-            .into_iter()
-            .find(|device| device.address.eq_ignore_ascii_case(&self.address))
-            .context("Bluetooth audio card is not ready")?;
-        if let Some(profile) = self.preferred_profile(&device)? {
-            audio::set_profile(&self.address, profile)?;
-        }
-        if self.switch_output {
-            audio::set_default_sink(&self.address)?;
-        }
-        Ok(())
-    }
-
-    fn preferred_profile(&self, device: &audio::AudioDevice) -> Result<Option<u32>> {
-        let Some(profile_key) = &self.preferred_profile_key else {
-            return Ok(None);
-        };
-        let profile = device
-            .profiles
-            .iter()
-            .find(|profile| {
-                profile.available
-                    && audio::profile_key(&self.device_key, &profile.name) == *profile_key
-            })
-            .context("preferred Bluetooth audio profile is unavailable")?;
-        Ok((device.active_profile != Some(profile.index)).then_some(profile.index))
     }
 }
 

@@ -70,12 +70,8 @@ fn select_profile(
     requested_key: &str,
     device: audio::AudioDevice,
 ) -> Option<AudioOperation> {
-    let profile = device.profiles.into_iter().find(|profile| {
-        profile.available && audio::profile_key(device_key, &profile.name) == requested_key
-    })?;
-    Some(Box::new(move || {
-        audio::set_profile(&device.address, profile.index)
-    }))
+    let index = device.available_profile(device_key, requested_key)?.index;
+    Some(Box::new(move || audio::set_profile(&device.address, index)))
 }
 
 pub(super) struct Change {

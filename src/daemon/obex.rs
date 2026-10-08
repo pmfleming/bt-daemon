@@ -24,7 +24,7 @@ impl ObexCoordinator {
         let (events, _) = broadcast::channel(32);
         Arc::new(Self {
             outgoing: OutgoingTransfers::new(Arc::clone(&backend), events.clone()),
-            incoming: obex::IncomingBroker::new(backend, events.clone()),
+            incoming: obex::IncomingBroker::new(backend, events),
         })
     }
 
@@ -134,13 +134,7 @@ impl OutgoingTransfers {
             Ok(target) => target,
             Err(error) => {
                 tracing::warn!(%device_key, error = %error, error_chain = %format!("{error:#}"), "could not resolve outgoing OBEX target");
-                let details = api::error_value(&error);
-                return json!({
-                    "protocol": api::PROTOCOL,
-                    "version": api::VERSION,
-                    "ok": false,
-                    "error": details,
-                });
+                return api::backend_error(&error);
             }
         };
         let transfer = match obex::start_file(&target.source, &target.destination, path).await {
@@ -154,9 +148,9 @@ impl OutgoingTransfers {
             "obex-transfer-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
-        let file_name = transfer.file_name.clone();
+        let file_name = &transfer.file_name;
         let size = transfer.size;
-        let queued = obex::ObexEvent::outgoing(&request_id, device_key, &file_name, size);
+        let queued = obex::ObexEvent::outgoing(&request_id, device_key, file_name, size);
         tracing::info!(%request_id, %device_key, %file_name, size, "outgoing OBEX transfer queued");
         let (cancel_sender, cancel_receiver) = oneshot::channel();
         self.cancellations.lock().await.insert(
@@ -169,26 +163,24 @@ impl OutgoingTransfers {
         let events = self.events.clone();
         let cancellations = Arc::clone(&self.cancellations);
         let task_id = request_id;
-        let task_event = queued.clone();
+        let response = api::success(json!({ "transfer": queued }));
         crate::task::spawn("outgoing-obex-transfer", async move {
-            let update_events = events.clone();
-            let update_event = task_event.clone();
             let result = crate::task::catch(
                 "outgoing OBEX transfer",
-                transfer.run(cancel_receiver, move |update| {
-                    let _ = update_events.send(update_event.updated(update));
+                transfer.run(cancel_receiver, |update| {
+                    let _ = events.send(queued.updated(update));
                 }),
             )
             .await;
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
                 tracing::warn!(request_id = %task_id, error = %error, error_chain = %format!("{error:#}"), "outgoing OBEX transfer failed");
-                let _ = events.send(task_event.failed(api::error_value(&error)));
+                let _ = events.send(queued.failed(api::error_value(&error)));
             } else {
                 tracing::info!(request_id = %task_id, "outgoing OBEX transfer completed");
             }
         });
-        api::success(json!({ "transfer": queued }))
+        response
     }
 
     pub(super) async fn cancel(&self, request_id: &str) -> bool {

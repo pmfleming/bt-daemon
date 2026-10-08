@@ -152,7 +152,7 @@ fn error_details(error: &Error) -> EnvelopeError {
     EnvelopeError::new(kind.code(), format!("{error:#}")).with_retryable(kind.retryable())
 }
 
-fn backend_error(cause: &Error) -> Value {
+pub(crate) fn backend_error(cause: &Error) -> Value {
     shelllist_daemon_core::error(API, error_details(cause))
 }
 

@@ -47,13 +47,11 @@ impl OperationEvent {
         }
     }
 
-    fn with_state(&self, event: &str, state: &str) -> Self {
-        Self {
-            event: event.into(),
-            state: state.into(),
-            stage: state.into(),
-            ..self.clone()
-        }
+    fn with_state(mut self, event: &str, state: &str) -> Self {
+        self.event = event.into();
+        self.state = state.into();
+        self.stage = state.into();
+        self
     }
 
     fn progress(&self, stage: &str) -> Self {
@@ -179,6 +177,7 @@ impl OperationCoordinator {
             events: self.events.clone(),
             recent: Arc::clone(&self.recent),
         };
+        let response = api::success(json!({ "operation": queued }));
         let task_event = queued.clone();
         let (start_sender, start_receiver) = oneshot::channel();
         let handle = crate::task::spawn("device-operation", async move {
@@ -192,7 +191,7 @@ impl OperationCoordinator {
             owner,
             OperationTask {
                 handle,
-                event: queued.clone(),
+                event: queued,
             },
         ) {
             abort.abort();
@@ -201,7 +200,7 @@ impl OperationCoordinator {
         state.active_devices.insert(device_key, request_id);
         drop(state);
         let _ = start_sender.send(());
-        api::success(json!({ "operation": queued }))
+        response
     }
 
     pub(super) async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> bool {
@@ -271,7 +270,7 @@ impl OperationExecution {
     }
 
     async fn publish_started(&self, event: &OperationEvent) -> bool {
-        let started = event.with_state("started", "running");
+        let started = event.clone().with_state("started", "running");
         let mut state = self.state.lock().await;
         let Some(task) = state.tasks.get_mut(&event.request_id) else {
             return false;

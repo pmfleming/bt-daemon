@@ -1,5 +1,3 @@
-use std::future::Future;
-
 use serde::Serialize;
 use serde_json::{Value, json};
 use shelllist_daemon_tokio::{BroadcastEvent, WatchPhase, forward_broadcast, forward_watch};
@@ -16,37 +14,13 @@ use super::{
     PAIRING_STREAM, SCAN_STREAM, SharedSnapshot,
 };
 
-#[derive(Clone, Copy)]
-struct RequestedStreams {
-    changes: bool,
-    pairing: bool,
-    operations: bool,
-    scans: bool,
-    audio: bool,
-    obex: bool,
-}
-
-impl RequestedStreams {
-    fn parse(streams: &[String]) -> Option<Self> {
-        if streams.is_empty()
-            || streams.iter().any(|requested| {
-                !protocol::STREAMS
-                    .iter()
-                    .any(|(supported, _)| requested == supported)
-            })
-        {
-            return None;
-        }
-        let wants = |target| streams.iter().any(|stream| stream == target);
-        Some(Self {
-            changes: wants(CHANGED_STREAM),
-            pairing: wants(PAIRING_STREAM),
-            operations: wants(OPERATION_STREAM),
-            scans: wants(SCAN_STREAM),
-            audio: wants(AUDIO_STREAM),
-            obex: wants(OBEX_STREAM),
+fn valid_streams(streams: &[String]) -> bool {
+    !streams.is_empty()
+        && streams.iter().all(|requested| {
+            protocol::STREAMS
+                .iter()
+                .any(|(supported, _)| requested == supported)
         })
-    }
 }
 
 pub(super) async fn start(
@@ -55,7 +29,7 @@ pub(super) async fn start(
     owner: UniqueName<'static>,
     emitter: SignalEmitter<'_>,
 ) -> String {
-    let Some(requested) = RequestedStreams::parse(&streams) else {
+    if !valid_streams(&streams) {
         tracing::warn!(
             ?streams,
             "subscription rejected because it contains unsupported streams"
@@ -65,7 +39,7 @@ pub(super) async fn start(
             "Subscriptions require bluetooth.changed, pairing.request, bluetooth.operation, bluetooth.scan, bluetooth.audio.changed, and/or bluetooth.obex.transfer".to_string(),
         )
         .to_string();
-    };
+    }
 
     let id = daemon.subscriptions.next_id("subscription");
     let subscription_id = id.clone();
@@ -79,79 +53,64 @@ pub(super) async fn start(
     let obex_events = daemon.obex.subscribe();
 
     tracing::info!(%subscription_id, %owner, ?streams, "subscription started");
+    let response =
+        api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string();
     let events = async move {
+        let wants = |target| streams.iter().any(|stream| stream == target);
         let mut forwarders = JoinSet::new();
-        spawn_if(
-            &mut forwarders,
-            requested.changes,
-            forward_snapshots(
-                snapshots,
-                signal_emitter.clone(),
-                subscription_id.clone(),
-                CHANGED_STREAM,
-                snapshot_fields,
-            ),
-        );
-        spawn_if(
-            &mut forwarders,
-            requested.audio,
-            forward_snapshots(
-                audio_snapshots,
-                signal_emitter.clone(),
-                subscription_id.clone(),
-                AUDIO_STREAM,
-                audio_fields,
-            ),
-        );
         macro_rules! forward {
-            ($enabled:expr, $receiver:expr, $stream:expr) => {
-                if $enabled {
-                    forwarders.spawn(forward_events(
+            ($stream:expr, $receiver:expr) => {
+                forward!($stream, $receiver, forward_events, |event| &event.event);
+            };
+            ($stream:expr, $receiver:expr, $forward:ident, $fields:expr) => {
+                if wants($stream) {
+                    forwarders.spawn($forward(
                         $receiver,
                         signal_emitter.clone(),
-                        $stream,
                         subscription_id.clone(),
-                        |event| &event.event,
+                        $stream,
+                        $fields,
                     ));
                 }
             };
         }
-        forward!(requested.pairing, pairing_events, PAIRING_STREAM);
-        forward!(requested.operations, operation_events, OPERATION_STREAM);
-        forward!(requested.scans, scan_events, SCAN_STREAM);
-        forward!(requested.obex, obex_events, OBEX_STREAM);
+        forward!(
+            CHANGED_STREAM,
+            snapshots,
+            forward_snapshots,
+            snapshot_fields
+        );
+        forward!(
+            AUDIO_STREAM,
+            audio_snapshots,
+            forward_snapshots,
+            audio_fields
+        );
+        forward!(PAIRING_STREAM, pairing_events);
+        forward!(OPERATION_STREAM, operation_events);
+        forward!(SCAN_STREAM, scan_events);
+        forward!(OBEX_STREAM, obex_events);
         if let Some(Err(error)) = forwarders.join_next().await {
             tracing::error!(%subscription_id, %error, "subscription forwarder task failed");
         }
         forwarders.abort_all();
         tracing::info!(%subscription_id, "subscription ended");
     };
-    if let Err(error) = daemon.subscriptions.spawn_for_owner(
-        id.clone(),
-        Some(owner.to_string()),
-        &connection,
-        events,
-    ) {
+    if let Err(error) =
+        daemon
+            .subscriptions
+            .spawn_for_owner(id, Some(owner.to_string()), &connection, events)
+    {
         return api::error("subscription-unavailable", error.to_string()).to_string();
     }
-    api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
-}
-
-fn spawn_if(
-    tasks: &mut JoinSet<()>,
-    enabled: bool,
-    future: impl Future<Output = ()> + Send + 'static,
-) {
-    if enabled {
-        tasks.spawn(future);
-    }
+    response
 }
 
 async fn forward_events<T>(
     receiver: broadcast::Receiver<T>,
     emitter: SignalEmitter<'static>,
-    stream: &'static str,
     subscription_id: String,
+    stream: &'static str,
     event_name: fn(&T) -> &str,
 ) where
     T: Clone + Send + Serialize + 'static,
@@ -211,14 +170,21 @@ fn snapshot_fields(snapshot: SharedSnapshot, event: &'static str) -> (&'static s
     }
 }
 
-fn audio_fields(envelope: Value, event: &'static str) -> (&'static str, Value) {
+fn audio_fields(mut envelope: Value, event: &'static str) -> (&'static str, Value) {
     if envelope["ok"].as_bool() == Some(true) {
-        (
-            event,
-            json!({ "data": { "audio_devices": envelope["data"]["audio_devices"] } }),
-        )
+        let mut fields = json!({ "data": {} });
+        fields["data"]["audio_devices"] = envelope
+            .pointer_mut("/data/audio_devices")
+            .map(Value::take)
+            .unwrap_or_default();
+        (event, fields)
     } else {
-        ("unavailable", json!({ "error": envelope["error"] }))
+        let mut fields = json!({});
+        fields["error"] = envelope
+            .get_mut("error")
+            .map(Value::take)
+            .unwrap_or_default();
+        ("unavailable", fields)
     }
 }
 
@@ -255,12 +221,16 @@ fn watch_event(phase: WatchPhase) -> &'static str {
 mod tests {
     #[test]
     fn snapshot_payloads_preserve_loading_failure_and_watch_phases() {
-        use super::{RequestedStreams, SharedSnapshot, audio_fields, snapshot_fields};
+        use super::{SharedSnapshot, audio_fields, snapshot_fields, valid_streams};
         use serde_json::json;
         use std::sync::Arc;
 
-        assert!(RequestedStreams::parse(&[]).is_none());
-        assert!(RequestedStreams::parse(&["unsupported".into()]).is_none());
+        assert!(!valid_streams(&[]));
+        assert!(!valid_streams(&["unsupported".into()]));
+        for (stream, _) in crate::protocol::STREAMS {
+            assert!(valid_streams(&[stream.to_string(), stream.to_string()]));
+            assert!(!valid_streams(&[stream.to_string(), "unsupported".into()]));
+        }
         assert_eq!(
             snapshot_fields(SharedSnapshot::Loading, "subscribed"),
             ("loading", json!({"data": {"status": "loading"}}))
@@ -281,17 +251,33 @@ mod tests {
                 (phase, expected)
             );
             assert_eq!(
-                audio_fields(crate::api::success(json!({"audio_devices": []})), phase),
-                (phase, json!({"data": {"audio_devices": []}}))
+                audio_fields(
+                    crate::api::success(
+                        json!({"audio_devices": [{"profiles": [1, 2]}], "ignored": true})
+                    ),
+                    phase
+                ),
+                (
+                    phase,
+                    json!({"data": {"audio_devices": [{"profiles": [1, 2]}]}})
+                )
             );
             assert_eq!(
                 audio_fields(json!({"ok": false, "error": error}), phase),
                 ("unavailable", json!({"error": error}))
             );
         }
-        assert_eq!(
-            audio_fields(json!(null), "changed"),
-            ("unavailable", json!({"error": null}))
-        );
+        for malformed in [json!(null), json!(false), json!([])] {
+            assert_eq!(
+                audio_fields(malformed, "changed"),
+                ("unavailable", json!({"error": null}))
+            );
+        }
+        for data in [json!(null), json!(false), json!([]), json!({})] {
+            assert_eq!(
+                audio_fields(json!({"ok": true, "data": data}), "changed"),
+                ("changed", json!({"data": {"audio_devices": null}}))
+            );
+        }
     }
 }

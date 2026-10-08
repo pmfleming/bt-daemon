@@ -77,21 +77,12 @@ struct BatteryReport {
 
 impl BatteryReport {
     fn from_payload(payload: &[u8]) -> Result<Self> {
-        if payload.len() != 3 {
-            bail!(
-                "Fast Pair battery update has {} bytes instead of 3",
-                payload.len()
-            );
-        }
+        let [left, right, case] = decode_fixed(payload, "battery update")?;
         Ok(Self {
-            left: decode_component(payload[0])?,
-            right: decode_component(payload[1])?,
-            case: decode_component(payload[2])?,
-            charging: [
-                payload[0] & 0x80 != 0,
-                payload[1] & 0x80 != 0,
-                payload[2] & 0x80 != 0,
-            ],
+            left: decode_component(left)?,
+            right: decode_component(right)?,
+            case: decode_component(case)?,
+            charging: [left, right, case].map(|value| value & 0x80 != 0),
         })
     }
 
@@ -129,14 +120,8 @@ struct RuntimeReport {
 }
 
 fn decode_audio_switch_capability(payload: &[u8]) -> Result<FastPairMultipoint> {
-    if payload.len() != 4 {
-        bail!(
-            "Fast Pair Audio Switch capability has {} bytes instead of 4",
-            payload.len()
-        );
-    }
-    let version = u16::from_be_bytes([payload[0], payload[1]]);
-    let flags = payload[2];
+    let [major, minor, flags, _] = decode_fixed(payload, "Audio Switch capability")?;
+    let version = u16::from_be_bytes([major, minor]);
     Ok(FastPairMultipoint {
         version,
         supported: version != 0,
@@ -146,60 +131,71 @@ fn decode_audio_switch_capability(payload: &[u8]) -> Result<FastPairMultipoint> 
     })
 }
 
+const ANC_MODES: [(u8, &str); 4] = [
+    (0x80, "transparent"),
+    (0x40, "adaptive"),
+    (0x20, "off"),
+    (0x08, "noise-cancelling"),
+];
+
 fn anc_modes(flags: u8) -> Vec<String> {
-    [
-        (0x80, "transparent"),
-        (0x40, "adaptive"),
-        (0x20, "off"),
-        (0x08, "noise-cancelling"),
-    ]
-    .into_iter()
-    .filter(|(flag, _)| flags & flag != 0)
-    .map(|(_, name)| name.to_string())
-    .collect()
+    ANC_MODES
+        .into_iter()
+        .filter(|(flag, _)| flags & flag != 0)
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
 fn anc_mode_flag(mode: &str) -> Result<u8> {
-    match mode {
-        "transparent" => Ok(0x80),
-        "adaptive" => Ok(0x40),
-        "off" => Ok(0x20),
-        "noise-cancelling" => Ok(0x08),
-        _ => bail!(
+    ANC_MODES.into_iter().find(|(_, name)| *name == mode)
+        .map(|(flag, _)| flag)
+        .with_context(|| format!(
             "unsupported Fast Pair noise-control mode {mode}; expected transparent, adaptive, off, or noise-cancelling"
-        ),
-    }
+        ))
 }
 
 fn decode_anc_state(payload: &[u8]) -> Result<FastPairNoiseControl> {
-    if payload.len() != 4 {
-        bail!(
-            "Fast Pair ANC state has {} bytes instead of 4",
-            payload.len()
-        );
-    }
-    let active = anc_modes(payload[3]);
+    let [version, available, settable, active] = decode_fixed(payload, "ANC state")?;
+    let active = anc_modes(active);
     if active.len() != 1 {
         bail!("Fast Pair ANC state must contain exactly one known active mode");
     }
     Ok(FastPairNoiseControl {
-        version: payload[0],
-        available_modes: anc_modes(payload[1]),
-        settable_modes: anc_modes(payload[2]),
+        version,
+        available_modes: anc_modes(available),
+        settable_modes: anc_modes(settable),
         active_mode: active.into_iter().next(),
     })
 }
 
-fn decode_address(payload: &[u8]) -> Result<Address> {
-    if payload.len() != 6 {
-        bail!(
-            "Fast Pair BLE address has {} bytes instead of 6",
-            payload.len()
-        );
+fn noise_control_payload(state: &FastPairNoiseControl, mode: &str) -> Result<[u8; 4]> {
+    ensure!(
+        state.version == 2,
+        "unsupported Fast Pair ANC protocol version"
+    );
+    let mode_flag = anc_mode_flag(mode)?;
+    if !state
+        .settable_modes
+        .iter()
+        .any(|candidate| candidate == mode)
+    {
+        bail!("Fast Pair noise-control mode {mode} is not currently settable");
     }
-    Ok(Address(
-        payload.try_into().context("decode Fast Pair BLE address")?,
-    ))
+    let flags = |modes: &[String]| {
+        modes.iter().try_fold(0_u8, |flags, mode| {
+            Ok::<_, anyhow::Error>(flags | anc_mode_flag(mode)?)
+        })
+    };
+    Ok([
+        2,
+        flags(&state.available_modes)?,
+        flags(&state.settable_modes)?,
+        mode_flag,
+    ])
+}
+
+fn decode_address(payload: &[u8]) -> Result<Address> {
+    decode_fixed(payload, "BLE address").map(Address)
 }
 
 fn decode_component(value: u8) -> Result<Option<u8>> {
@@ -221,16 +217,11 @@ enum PsmAvailability {
 }
 
 fn decode_message_stream_psm(value: &[u8]) -> Result<PsmAvailability> {
-    if value.len() != 3 {
-        bail!(
-            "Fast Pair Message Stream PSM value has {} bytes instead of 3",
-            value.len()
-        );
-    }
-    match value[0] {
+    let [state, low, high] = decode_fixed(value, "Message Stream PSM value")?;
+    match state {
         0x00 => Ok(PsmAvailability::Unknown),
         0x01 => {
-            let psm = u16::from_le_bytes([value[1], value[2]]);
+            let psm = u16::from_le_bytes([low, high]);
             if !(PSM_LE_DYN_START..=PSM_LE_MAX).contains(&psm) {
                 bail!("Fast Pair Message Stream PSM is out of range: 0x{psm:04x}");
             }
@@ -1105,36 +1096,19 @@ impl FastPairBatteryProvider {
     }
 
     pub async fn set_noise_control(&self, device: &Device, mode: &str) -> Result<()> {
-        let state = self
-            .runtime
-            .read()
-            .await
-            .get(&device.address())
-            .and_then(|state| state.noise_control.clone())
-            .context("Fast Pair ANC state has not been reported")?;
-        ensure!(
-            state.version == 2,
-            "unsupported Fast Pair ANC protocol version"
-        );
-        let mode_flag = anc_mode_flag(mode)?;
-        if !state
-            .settable_modes
-            .iter()
-            .any(|candidate| candidate == mode)
-        {
-            bail!("Fast Pair noise-control mode {mode} is not currently settable");
-        }
-        let available_flags = state.available_modes.iter().try_fold(0_u8, |flags, mode| {
-            Ok::<_, anyhow::Error>(flags | anc_mode_flag(mode)?)
-        })?;
-        let settable_flags = state.settable_modes.iter().try_fold(0_u8, |flags, mode| {
-            Ok::<_, anyhow::Error>(flags | anc_mode_flag(mode)?)
-        })?;
+        let payload = {
+            let runtime = self.runtime.read().await;
+            let state = runtime
+                .get(&device.address())
+                .and_then(|state| state.noise_control.as_ref())
+                .context("Fast Pair ANC state has not been reported")?;
+            noise_control_payload(state, mode)?
+        };
         self.send_authenticated(
             device,
             HEARABLE_CONTROLS_GROUP,
             SET_ANC_STATE_CODE,
-            &[2, available_flags, settable_flags, mode_flag],
+            &payload,
         )
         .await
     }
@@ -1605,6 +1579,24 @@ mod tests {
     };
 
     #[test]
+    fn fixed_payloads_reject_both_truncation_and_trailing_bytes() {
+        for length in 0..=8 {
+            let bytes = vec![0; length];
+            assert_eq!(BatteryReport::from_payload(&bytes).is_ok(), length == 3);
+            assert_eq!(
+                super::decode_audio_switch_capability(&bytes).is_ok(),
+                length == 4
+            );
+            assert_eq!(super::decode_address(&bytes).is_ok(), length == 6);
+            assert_eq!(decode_message_stream_psm(&bytes).is_ok(), length == 3);
+            let mut anc = vec![0x20; length];
+            assert_eq!(decode_anc_state(&anc).is_ok(), length == 4);
+            anc.fill(0);
+            assert!(decode_anc_state(&anc).is_err());
+        }
+    }
+
+    #[test]
     fn psm_characteristic_decodes_state_and_little_endian_value() {
         assert_eq!(
             decode_message_stream_psm(&[0x01, 0x80, 0x00]).unwrap(),
@@ -1664,7 +1656,7 @@ mod tests {
 
     #[test]
     fn anc_state_exposes_only_documented_modes() {
-        let state = decode_anc_state(&[0x02, 0xe8, 0xa8, 0x20]).unwrap();
+        let mut state = decode_anc_state(&[0x02, 0xe8, 0xa8, 0x20]).unwrap();
         assert_eq!(
             state.available_modes,
             ["transparent", "adaptive", "off", "noise-cancelling"]
@@ -1677,6 +1669,18 @@ mod tests {
         assert_eq!(anc_mode_flag("noise-cancelling").unwrap(), 0x08);
         assert!(decode_anc_state(&[2, 0xa8, 0xa8, 0xa0]).is_err());
         assert!(anc_mode_flag("wind").is_err());
+        for (flag, mode) in super::ANC_MODES {
+            assert_eq!(super::anc_modes(anc_mode_flag(mode).unwrap()), [mode]);
+            let payload = super::noise_control_payload(&state, mode);
+            if mode == "adaptive" {
+                assert!(payload.is_err());
+            } else {
+                assert_eq!(payload.unwrap(), [2, 0xe8, 0xa8, flag]);
+            }
+        }
+        assert!(super::noise_control_payload(&state, "wind").is_err());
+        state.version = 1;
+        assert!(super::noise_control_payload(&state, "off").is_err());
     }
 
     #[test]
