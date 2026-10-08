@@ -231,9 +231,12 @@ impl ManagementStore {
 
     pub fn forget_device_policy(&self, device_key: &str) {
         let mut policies = self.device_policy_lock();
-        if policies.devices.remove(device_key).is_some()
-            && let Err(error) = self.persist_device_policies(&policies)
-        {
+        let Some((key, removed)) = policies.devices.remove_entry(device_key) else {
+            return;
+        };
+        if let Err(error) = self.persist_device_policies(&policies) {
+            // Keep Forget retryable and the in-memory view consistent with the saved file.
+            policies.devices.insert(key, removed);
             tracing::warn!(%error, %device_key, "could not remove Bluetooth device policy");
         }
     }
@@ -452,6 +455,32 @@ mod tests {
     use serde_json::json;
 
     use super::ManagementStore;
+
+    #[test]
+    fn failed_forget_retains_policy_until_a_successful_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device-policy.json");
+        let mut store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
+        let policy = store
+            .update_device_policy("peer", &json!({"trust_after_pair": false}))
+            .unwrap();
+        store
+            .update_device_policy("other", &json!({"trust_after_pair": false}))
+            .unwrap();
+        store.device_policy_path = Some(path.join("blocked.json"));
+        store.forget_device_policy("peer");
+        store.forget_device_policy("missing");
+        assert_eq!(store.device_policy("peer"), policy);
+        let saved = ManagementStore::load(None, None, Some(path.clone())).unwrap();
+        assert_eq!(saved.device_policy("peer"), policy);
+        store.device_policy_path = Some(path.clone());
+        store.forget_device_policy("peer");
+        store.forget_device_policy("peer");
+        assert!(store.device_policy("peer").trust_after_pair);
+        let saved = ManagementStore::load(None, None, Some(path)).unwrap();
+        assert!(saved.device_policy("peer").trust_after_pair);
+        assert_eq!(saved.device_policy("other"), policy);
+    }
 
     #[test]
     fn policy_updates_are_retained_only_after_complete_validation() {
