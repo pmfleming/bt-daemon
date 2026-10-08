@@ -519,11 +519,12 @@
       },
       {
         "cancellable": false,
-        "description": "Activate an available Bluetooth audio profile.",
+        "description": "Activate an available Bluetooth audio profile; remember=true persists it under the same device gate and returns profile_outcome with explicit partial success. Never automatically replay an uncertain write.",
         "name": "bluetooth.audio.setProfile",
         "params_example": {
           "device_key": "device-opaque",
-          "profile_key": "audio-profile-opaque"
+          "profile_key": "audio-profile-opaque",
+          "remember": true
         },
         "params_schema": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -536,6 +537,9 @@
             "profile_key": {
               "minLength": 1,
               "type": "string"
+            },
+            "remember": {
+              "type": "boolean"
             }
           },
           "required": [

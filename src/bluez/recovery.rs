@@ -213,6 +213,10 @@ macro_rules! impl_recovering_backend {
                 self.changes.subscribe()
             }
 
+            fn remember_audio_profile(&self, device_key: &str, profile_key: &str) -> Result<()> {
+                self.current().remember_audio_profile(device_key, profile_key)
+            }
+
             $(async fn $name(&self, $($argument: $type),*) -> Result<$output> {
                 if !self.available.load(Ordering::Acquire) {
                     return Err(BackendError::new(BackendErrorKind::Unavailable, "BlueZ is recovering").into());

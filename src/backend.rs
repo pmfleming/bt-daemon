@@ -221,6 +221,10 @@ pub trait BluetoothBackend: Send + Sync {
     ) -> Result<Snapshot>;
     async fn update_management(&self, params: &Value) -> Result<Snapshot>;
     async fn update_device_policy(&self, device_key: &str, params: &Value) -> Result<Snapshot>;
+    /// Persist only, without reacquiring the caller-held device gate.
+    fn remember_audio_profile(&self, _device_key: &str, _profile_key: &str) -> Result<()> {
+        anyhow::bail!("audio profile persistence is unavailable")
+    }
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget>;
     async fn obex_remote(&self, source: &str, destination: &str) -> Result<ObexRemote>;
     async fn device_operation(

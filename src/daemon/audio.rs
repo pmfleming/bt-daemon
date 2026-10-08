@@ -94,13 +94,38 @@ pub(super) const PROFILE: Change = Change {
     select: select_profile,
 };
 
-pub(super) async fn apply_change(pairing: &PairingBroker, params: &Value, change: Change) -> Value {
+// An apply failure never persists; a persistence failure never claims that the
+// already-applied hardware change was rolled back.
+fn apply_then_remember(
+    apply: impl FnOnce() -> Result<()>,
+    remember: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
+    apply()?;
+    Ok(remember().err().map(|error| format!("{error:#}")))
+}
+
+pub(super) async fn apply_change(
+    pairing: &PairingBroker,
+    params: &Value,
+    change: Change,
+    persist: impl FnOnce(&str, &str) -> Result<()> + Send + 'static,
+) -> Value {
+    let remember = match params.get("remember") {
+        None => false,
+        Some(Value::Bool(value)) if change.parameter == "profile_key" => *value,
+        _ => {
+            return api::error(
+                "validation-error",
+                "remember must be a boolean on setProfile".into(),
+            );
+        }
+    };
     let (device_key, requested_key) = match params.require_strings("device_key", change.parameter) {
         Ok(params) => params,
         Err(error) => return api::error("validation-error", error.to_string()),
     };
     let gate = crate::task::device_gate(device_key);
-    let _exclusive = gate.lock().await;
+    let exclusive = gate.lock_owned().await;
     let devices = match devices().await {
         Ok(devices) => devices,
         Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
@@ -118,8 +143,35 @@ pub(super) async fn apply_change(pairing: &PairingBroker, params: &Value, change
             change.unavailable_message.to_string(),
         );
     };
-    match tokio::task::spawn_blocking(operation).await {
-        Ok(Ok(())) => snapshot(pairing).await,
+    let device_key = device_key.to_owned();
+    let requested_key = requested_key.to_owned();
+    // Keep both effects and the gate inside a non-abortable worker: disconnecting
+    // a caller cannot release serialization while PipeWire is still mutating.
+    match tokio::task::spawn_blocking(move || {
+        let _exclusive = exclusive;
+        apply_then_remember(operation, || {
+            if remember {
+                persist(&device_key, &requested_key)
+            } else {
+                Ok(())
+            }
+        })
+    })
+    .await
+    {
+        Ok(Ok(persistence_error)) => {
+            let mut response = snapshot(pairing).await;
+            if remember {
+                if response["ok"] != true {
+                    response = api::success(json!({"refresh_error": response["error"]}));
+                }
+                response["data"]["profile_outcome"] = json!({
+                    "applied": true, "remembered": persistence_error.is_none(),
+                    "persistence_error": persistence_error
+                });
+            }
+            response
+        }
         Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
         Err(error) => api::error("audio-operation-failed", error.to_string()),
     }

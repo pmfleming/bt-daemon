@@ -72,10 +72,17 @@ impl BluetoothDaemon {
             "bluetooth.obex.snapshot" => self.obex.snapshot().await,
             "bluetooth.audio.snapshot" => self.audio_snapshots.borrow().clone(),
             "bluetooth.audio.setProfile" => {
-                audio::apply_change(&self.pairing, &params, audio::PROFILE).await
+                let backend = Arc::clone(&self.backend);
+                audio::apply_change(
+                    &self.pairing,
+                    &params,
+                    audio::PROFILE,
+                    move |device, profile| backend.remember_audio_profile(device, profile),
+                )
+                .await
             }
             "bluetooth.audio.setDefault" => {
-                audio::apply_change(&self.pairing, &params, audio::DEFAULT).await
+                audio::apply_change(&self.pairing, &params, audio::DEFAULT, |_, _| Ok(())).await
             }
             "bluetooth.requests.snapshot" => api::success(json!({
                 "requests": {

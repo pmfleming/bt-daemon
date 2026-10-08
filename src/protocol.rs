@@ -41,7 +41,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = method_registry! {
     "bluetooth.obex.send", r#"{"device_key":"device-opaque","path":"/selected/file"}"#, "transfer", Some(stream::OBEX);
     "bluetooth.obex.respond", r#"{"request_id":"obex-incoming-1","accept":true}"#, "authorization", Some(stream::OBEX);
     "bluetooth.audio.snapshot", "{}", "audio_devices", None;
-    "bluetooth.audio.setProfile", r#"{"device_key":"device-opaque","profile_key":"audio-profile-opaque"}"#, "audio_devices", None;
+    "bluetooth.audio.setProfile", r#"{"device_key":"device-opaque","profile_key":"audio-profile-opaque","remember":true}"#, "audio_devices", None;
     "bluetooth.audio.setDefault", r#"{"device_key":"device-opaque","endpoint_key":"audio-endpoint-opaque"}"#, "audio_devices", Some(stream::AUDIO);
     "bluetooth.requests.snapshot", "{}", "requests", None;
     "bluetooth.device.operation", r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#, "operation", Some(stream::OPERATION);
@@ -81,7 +81,9 @@ fn method_description(name: &str) -> &'static str {
         "bluetooth.obex.send" => "Start an outgoing object-push transfer.",
         "bluetooth.obex.respond" => "Answer an incoming object-push authorization request.",
         "bluetooth.audio.snapshot" => "Return Bluetooth PipeWire cards, profiles, and endpoints.",
-        "bluetooth.audio.setProfile" => "Activate an available Bluetooth audio profile.",
+        "bluetooth.audio.setProfile" => {
+            "Activate an available Bluetooth audio profile; remember=true persists it under the same device gate and returns profile_outcome with explicit partial success. Never automatically replay an uncertain write."
+        }
         "bluetooth.audio.setDefault" => "Make a Bluetooth sink or source the PipeWire default.",
         "bluetooth.requests.snapshot" => {
             "Recover active and recent request state after reconnect or event loss."

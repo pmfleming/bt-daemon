@@ -80,8 +80,13 @@ async fn audio_changes_validate_their_own_parameter_before_probing() {
     let pairing = PairingBroker::new(DeviceIdentityRegistry::in_memory());
     for change in [super::DEFAULT, super::PROFILE] {
         let parameter = change.parameter;
-        let result =
-            super::apply_change(&pairing, &serde_json::json!({"device_key": "peer"}), change).await;
+        let result = super::apply_change(
+            &pairing,
+            &serde_json::json!({"device_key": "peer"}),
+            change,
+            |_, _| Ok(()),
+        )
+        .await;
         assert_eq!(result["error"]["code"], "validation-error");
         assert!(
             result["error"]["message"]
@@ -90,6 +95,27 @@ async fn audio_changes_validate_their_own_parameter_before_probing() {
                 .contains(parameter)
         );
     }
+}
+
+#[test]
+fn apply_and_remember_preserves_partial_outcomes() {
+    assert!(
+        super::apply_then_remember(
+            || anyhow::bail!("unavailable"),
+            || panic!("must not persist")
+        )
+        .is_err()
+    );
+    assert_eq!(
+        super::apply_then_remember(|| Ok(()), || anyhow::bail!("disk full"))
+            .unwrap()
+            .as_deref(),
+        Some("disk full")
+    );
+    assert_eq!(
+        super::apply_then_remember(|| Ok(()), || Ok(())).unwrap(),
+        None
+    );
 }
 
 #[test]

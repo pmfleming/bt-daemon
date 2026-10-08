@@ -547,6 +547,17 @@ impl BluetoothBackend for BluezBackend {
         self.snapshot().await
     }
 
+    fn remember_audio_profile(&self, device_key: &str, profile_key: &str) -> Result<()> {
+        self.management.update_device_policy(
+            device_key,
+            &serde_json::json!({
+                "preferred_audio_profile_key": profile_key
+            }),
+        )?;
+        let _ = self.changes.send(());
+        Ok(())
+    }
+
     async fn obex_target(&self, device_key: &str) -> Result<ObexTarget> {
         tracing::debug!(%device_key, "resolving outgoing OBEX target");
         let (adapter, device) = self.find_device(device_key).await?;
