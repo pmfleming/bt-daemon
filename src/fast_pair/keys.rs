@@ -78,19 +78,19 @@ impl AccountKeyStore {
         if !keys.contains_key(device_key) {
             return Ok(());
         }
-        let mut updated = keys.clone();
-        updated.remove(device_key);
-        self.persist(&updated)?;
-        *keys = updated;
+        self.persist(
+            keys.iter()
+                .filter(|(device, _)| device.as_str() != device_key),
+        )?;
+        keys.remove(device_key);
         Ok(())
     }
 
-    fn persist(&self, keys: &HashMap<String, [u8; 16]>) -> Result<()> {
+    fn persist<'a>(&self, keys: impl Iterator<Item = (&'a String, &'a [u8; 16])>) -> Result<()> {
         if let Some(path) = &self.path {
             let file = KeyFile {
                 version: STORE_VERSION,
                 account_keys: keys
-                    .iter()
                     .map(|(device, key)| (device.clone(), hex::encode(key)))
                     .collect(),
             };
@@ -105,10 +105,13 @@ impl AccountKeyStore {
             .keys
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let mut updated = keys.clone();
-        updated.insert(device_key, key);
-        self.persist(&updated)?;
-        *keys = updated;
+        // Serialize the candidate view before committing; failed saves leave every key intact.
+        self.persist(
+            keys.iter()
+                .filter(|(device, _)| *device != &device_key)
+                .chain(std::iter::once((&device_key, &key))),
+        )?;
+        keys.insert(device_key, key);
         Ok(())
     }
 }
@@ -125,6 +128,35 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::AccountKeyStore;
+
+    #[test]
+    fn failed_key_writes_leave_insert_replace_and_remove_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.json");
+        let mut store = AccountKeyStore::load(Some(path.clone())).unwrap();
+        let original = [4; 16];
+        let replacement = [4, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        store.insert("peer".into(), original).unwrap();
+        store.insert("other".into(), original).unwrap();
+        store.path = Some(path.join("blocked.json"));
+        assert!(store.insert("new".into(), replacement).is_err());
+        assert!(store.insert("peer".into(), replacement).is_err());
+        assert!(store.remove("peer").is_err());
+        assert_eq!(store.get("peer"), Some(original));
+        assert_eq!(store.get("other"), Some(original));
+        assert_eq!(store.get("new"), None);
+        store.remove("missing").unwrap();
+        store.path = Some(path.clone());
+        assert!(store.insert("peer".into(), [0; 16]).is_err());
+        let saved = AccountKeyStore::load(Some(path.clone())).unwrap();
+        assert_eq!(saved.get("peer"), Some(original));
+        assert_eq!(saved.get("new"), None);
+        store.insert("peer".into(), replacement).unwrap();
+        store.remove("other").unwrap();
+        let saved = AccountKeyStore::load(Some(path)).unwrap();
+        assert_eq!(saved.get("peer"), Some(replacement));
+        assert_eq!(saved.get("other"), None);
+    }
 
     #[test]
     fn keys_survive_a_secure_store_reload() {
