@@ -74,6 +74,8 @@ The daemon optionally reads Linux Bluetooth management **Get Connection
 Information** (`0x0031`) for already-connected devices, without starting discovery
 or changing their connections. Reads run in a separate cancellable monitor every
 five seconds (four concurrent requests maximum, two-second request deadline).
+BlueZ enumeration has a separate four-second deadline; request batches finish
+before the next poll, skipping missed ticks rather than overlapping polls.
 Transient/unsupported reads back off for thirty seconds. Snapshot requests never
 wait for this hardware I/O.
 

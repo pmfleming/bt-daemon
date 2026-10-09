@@ -2,12 +2,14 @@
 //! device. Hardware I/O stays off snapshot paths and is bounded/cancellable.
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    io,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bluer::{Address, AddressType};
 use futures::{StreamExt, stream};
-use tokio::time::Instant;
+use tokio::{sync::Mutex, time::Instant};
 
 use super::{BluezBackend, DISCOVERED_DEVICE_CACHE_TTL};
 use crate::model::RssiKind;
@@ -18,6 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const LIVE_TTL: Duration = Duration::from_secs(12);
 type Key = (String, Address);
+type Peer = (Key, u16, bool);
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Reading {
@@ -150,11 +153,8 @@ pub(super) async fn run(backend: &BluezBackend) {
             });
             (signals.denied, had_entries)
         };
-        // Also bound BlueZ enumeration (service disappearance must not stall us).
-        if !denied
-            && let Err(error) = tokio::time::timeout(Duration::from_secs(4), poll(backend)).await
-        {
-            tracing::debug!(%error, "connected Bluetooth RSSI poll timed out");
+        if !denied {
+            poll(&backend.link_signals, connected_peers(backend), mgmt::read).await;
         }
         // Publish ageing too, but do not rebuild snapshots forever with no peers.
         if had_entries || !backend.link_signals.lock().await.entries.is_empty() {
@@ -163,10 +163,9 @@ pub(super) async fn run(backend: &BluezBackend) {
     }
 }
 
-async fn poll(backend: &BluezBackend) {
-    let epoch = backend.link_signals.lock().await.begin_poll();
+async fn connected_peers(backend: &BluezBackend) -> Vec<Peer> {
     let Ok(names) = backend.session.adapter_names().await else {
-        return;
+        return Vec::new();
     };
     let mut peers = Vec::new();
     for name in names {
@@ -198,19 +197,39 @@ async fn poll(backend: &BluezBackend) {
             }
         }
     }
+    peers
+}
+
+async fn poll<F>(
+    signals: &Mutex<Signals>,
+    peers: impl Future<Output = Vec<Peer>>,
+    read: impl Fn(u16, Address, bool) -> F + Copy,
+) where
+    F: Future<Output = io::Result<(mgmt::Reply, bool)>>,
+{
+    let epoch = signals.lock().await.begin_poll();
+    // Bound enumeration independently. A whole-poll deadline would cancel later
+    // request batches before their own deadlines could record failure/backoff.
+    let peers = match tokio::time::timeout(Duration::from_secs(4), peers).await {
+        Ok(peers) => peers,
+        Err(error) => {
+            tracing::debug!(%error, "connected Bluetooth RSSI enumeration timed out");
+            return;
+        }
+    };
     stream::iter(peers).for_each_concurrent(4, |(key, index, random)| async move {
         {
-            let signals = backend.link_signals.lock().await;
+            let signals = signals.lock().await;
             if signals.denied || !signals.current(&key, epoch) { return; }
         }
-        let result = mgmt::read(index, key.1, random).await;
+        let result = read(index, key.1, random).await;
         let denied = matches!(&result, Ok((mgmt::Reply::Denied, _)))
             || result.as_ref().err().is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
         let reading = match result {
             Ok((mgmt::Reply::Reading(rssi), relative)) => Some((rssi, if relative { RssiKind::BrEdrRelative } else { RssiKind::Dbm })),
             _ => None,
         };
-        let mut signals = backend.link_signals.lock().await;
+        let mut signals = signals.lock().await;
         if denied && !signals.denied {
             signals.denied = true;
             tracing::info!("connected Bluetooth RSSI unavailable: CAP_NET_ADMIN required; retaining discovery/cached signal readings");
@@ -222,6 +241,63 @@ async fn poll(backend: &BluezBackend) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_enumeration_and_multiple_batches_record_every_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut signals = Signals::default();
+        let peers: Vec<Peer> = (0..9)
+            .map(|index| ((format!("hci{index}"), Address::default()), index, false))
+            .collect();
+        for (key, _, _) in &peers {
+            signals.accept(key.clone(), 0, Some((-60, RssiKind::Dbm)));
+        }
+        let signals = Mutex::new(signals);
+        let active = &AtomicUsize::new(0);
+        let completed = &AtomicUsize::new(0);
+        let started = Instant::now();
+        poll(
+            &signals,
+            async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                peers.clone()
+            },
+            |_, _, _| async move {
+                assert!(active.fetch_add(1, Ordering::SeqCst) < 4);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                Err(io::ErrorKind::TimedOut.into())
+            },
+        )
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(9));
+        assert_eq!(completed.load(Ordering::SeqCst), peers.len());
+        let signals = signals.lock().await;
+        for (key, _, _) in &peers {
+            let reading = signals.get(&key.0, key.1, true).unwrap();
+            assert_eq!(reading.rssi, -60);
+            assert!(!reading.live);
+            assert!(!signals.due(key));
+        }
+        tokio::time::advance(FAILURE_BACKOFF).await;
+        for (key, _, _) in &peers {
+            assert!(signals.due(key));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_enumeration_is_bounded_without_starting_reads() {
+        let signals = Mutex::new(Signals::default());
+        let started = Instant::now();
+        poll(&signals, std::future::pending(), |_, _, _| async {
+            panic!("enumeration did not supply any peers");
+        })
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        assert!(signals.lock().await.entries.is_empty());
+    }
 
     #[tokio::test]
     async fn invalidation_is_scoped_even_before_the_first_read_completes() {
