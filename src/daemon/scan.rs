@@ -124,7 +124,9 @@ impl ScanCoordinator {
                 timeout_ms,
             }) => (adapter_key, timeout_ms),
             Ok(ScanRequest::Stop(request_id)) => {
-                return self.stop(request_id.as_deref(), "cancelled").await;
+                return self
+                    .stop_owned(request_id.as_deref(), owner, "cancelled")
+                    .await;
             }
             Err(error) => return api::error("validation-error", error.to_string()),
         };
@@ -202,7 +204,7 @@ impl ScanCoordinator {
             let mut terminal_adapter = Some(task_adapter);
             loop {
                 let _transition = transition.lock().await;
-                let (selected, adapters) = select_scans(&*tasks.lock().await, Some(&task_id));
+                let (selected, adapters) = select_scans(&*tasks.lock().await, Some(&task_id), None);
                 if selected.is_empty() {
                     return;
                 }
@@ -247,8 +249,27 @@ impl ScanCoordinator {
     }
 
     pub(super) async fn stop(&self, request_id: Option<&str>, event: &str) -> Value {
+        self.stop_selected(request_id, None, event).await
+    }
+
+    pub(super) async fn stop_owned(
+        &self,
+        request_id: Option<&str>,
+        owner: &str,
+        event: &str,
+    ) -> Value {
+        self.stop_selected(request_id, Some(owner), event).await
+    }
+
+    async fn stop_selected(
+        &self,
+        request_id: Option<&str>,
+        owner: Option<&str>,
+        event: &str,
+    ) -> Value {
         let _transition = self.transition.lock().await;
-        let (selected_ids, adapters_to_stop) = select_scans(&*self.tasks.lock().await, request_id);
+        let (selected_ids, adapters_to_stop) =
+            select_scans(&*self.tasks.lock().await, request_id, owner);
         if selected_ids.is_empty() {
             tracing::warn!(
                 ?request_id,
@@ -292,16 +313,20 @@ impl ScanCoordinator {
 fn select_scans(
     tasks: &HashMap<String, ScanTask>,
     request_id: Option<&str>,
+    owner: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
-    let selected = |id: &str| request_id.is_none_or(|requested| requested == id);
+    let selected = |id: &str, task: &ScanTask| {
+        request_id.is_none_or(|requested| requested == id)
+            && owner.is_none_or(|owner| task.event.owner == owner)
+    };
     let retained = tasks
         .iter()
-        .filter(|(id, _)| !selected(id))
+        .filter(|(id, task)| !selected(id, task))
         .flat_map(|(_, task)| &task.event.adapter_keys)
         .collect::<HashSet<_>>();
     let mut ids = Vec::new();
     let mut adapters = HashSet::new();
-    for (id, task) in tasks.iter().filter(|(id, _)| selected(id)) {
+    for (id, task) in tasks.iter().filter(|(id, task)| selected(id, task)) {
         ids.push(id.clone());
         adapters.extend(
             task.event

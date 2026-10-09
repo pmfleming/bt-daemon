@@ -153,7 +153,7 @@ impl BluetoothDaemon {
         {
             return self
                 .scans
-                .stop(Some(request_id), "cancelled")
+                .stop_owned(Some(request_id), owner.unwrap_or("internal"), "cancelled")
                 .await
                 .to_string();
         }

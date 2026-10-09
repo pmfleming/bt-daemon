@@ -542,6 +542,7 @@ impl BluetoothBackend for BluezBackend {
 
     async fn update_management(&self, params: &Value) -> Result<Snapshot> {
         self.management.update(params)?;
+        let _ = self.changes.send(());
         self.snapshot().await
     }
 

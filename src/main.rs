@@ -66,15 +66,9 @@ async fn run() -> Result<()> {
     tracing::info!(command = ?cli.command, "bt-daemon command started");
     match cli.command {
         Command::Daemon => {
-            let bluez = Arc::new(BluezBackend::new().await?);
-            bluez.start_monitoring();
-            bluez.start_lifecycle_monitoring();
-            let identities = bluez.identity_registry();
+            let recovering = RecoveringBackend::load_default()?;
+            let identities = recovering.identity_registry();
             let pairing = PairingBroker::new(Arc::clone(&identities));
-            let agent = bluez.register_agent(pairing.agent()).await?;
-            bluez.apply_startup_policy().await;
-            let recovering = RecoveringBackend::new(bluez);
-            recovering.set_agent(agent).await;
             recovering.start_recovery(Arc::clone(&pairing));
             let backend: Arc<dyn BluetoothBackend> = recovering;
             let result = daemon::run(backend, pairing).await;

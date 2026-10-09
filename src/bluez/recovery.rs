@@ -18,6 +18,8 @@ use crate::{
         AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
         ObexRemote, ObexTarget, OperationProgress,
     },
+    identity::DeviceIdentityRegistry,
+    management::ManagementStore,
     model::Snapshot,
     pairing::PairingBroker,
 };
@@ -47,7 +49,9 @@ impl Drop for Candidate {
 /// Rebuilds the BlueZ backend and pairing agent when the BlueZ bus owner changes.
 /// Callers receive typed unavailability errors while recovery is in progress.
 pub struct RecoveringBackend {
-    current: RwLock<Arc<BluezBackend>>,
+    current: RwLock<Option<Arc<BluezBackend>>>,
+    identities: Arc<DeviceIdentityRegistry>,
+    management: Arc<ManagementStore>,
     changes: broadcast::Sender<()>,
     agent: Mutex<Option<AgentHandle>>,
     available: AtomicBool,
@@ -57,7 +61,9 @@ impl RecoveringBackend {
     pub fn new(initial: Arc<BluezBackend>) -> Arc<Self> {
         let (changes, _) = broadcast::channel(64);
         let backend = Arc::new(Self {
-            current: RwLock::new(Arc::clone(&initial)),
+            current: RwLock::new(Some(Arc::clone(&initial))),
+            identities: Arc::clone(&initial.identities),
+            management: Arc::clone(&initial.management),
             changes,
             agent: Mutex::new(None),
             available: AtomicBool::new(true),
@@ -66,15 +72,48 @@ impl RecoveringBackend {
         backend
     }
 
+    /// Load durable state without contacting BlueZ. Recovery initializes the first generation.
+    pub fn load_default() -> Result<Arc<Self>> {
+        Ok(Self::new_unavailable(
+            DeviceIdentityRegistry::load_default()?,
+            Arc::new(ManagementStore::load_default()?),
+        ))
+    }
+
+    pub fn identity_registry(&self) -> Arc<DeviceIdentityRegistry> {
+        Arc::clone(&self.identities)
+    }
+
+    fn new_unavailable(
+        identities: Arc<DeviceIdentityRegistry>,
+        management: Arc<ManagementStore>,
+    ) -> Arc<Self> {
+        let (changes, _) = broadcast::channel(64);
+        Arc::new(Self {
+            current: RwLock::new(None),
+            identities,
+            management,
+            changes,
+            agent: Mutex::new(None),
+            available: AtomicBool::new(false),
+        })
+    }
+
     pub async fn set_agent(&self, agent: AgentHandle) {
         *self.agent.lock().await = Some(agent);
     }
 
-    fn current(&self) -> Arc<BluezBackend> {
-        self.current
+    fn current(&self) -> Result<Arc<BluezBackend>> {
+        let current = self
+            .current
             .read()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.available.load(Ordering::Acquire)
+            && let Some(backend) = current.as_ref()
+        {
+            return Ok(Arc::clone(backend));
+        }
+        Err(BackendError::new(BackendErrorKind::Unavailable, "BlueZ is recovering").into())
     }
 
     fn forward_changes(&self, backend: Arc<BluezBackend>) {
@@ -93,11 +132,14 @@ impl RecoveringBackend {
     pub fn start_recovery(self: &Arc<Self>, pairing: Arc<PairingBroker>) {
         let backend = Arc::clone(self);
         crate::task::spawn("bluez-session-recovery", async move {
-            if let Err(error) = backend.monitor_owner(Arc::clone(&pairing)).await {
-                // Setup/stream failure is not proof that the last backend is live.
-                backend.invalidate(&pairing);
-                backend.stop_generation().await;
-                tracing::error!(%error, "BlueZ recovery monitor stopped");
+            loop {
+                if let Err(error) = backend.monitor_owner(Arc::clone(&pairing)).await {
+                    // Setup/stream failure is not proof that the last backend is live.
+                    backend.invalidate(&pairing);
+                    backend.stop_generation().await;
+                    tracing::warn!(%error, "BlueZ recovery monitor is retrying");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
@@ -109,7 +151,20 @@ impl RecoveringBackend {
     }
 
     async fn stop_generation(&self) {
-        self.current().shutdown().await;
+        // Keep the retiring generation reachable until shutdown completes. An
+        // owner change can cancel this future; the next pass must finish cleanup.
+        let previous = self
+            .current
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        self.current
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
         self.agent.lock().await.take();
     }
 
@@ -129,13 +184,20 @@ impl RecoveringBackend {
             .receive_signal("NameOwnerChanged")
             .await
             .context("subscribe to BlueZ owner changes")?;
+        // Subscribe before checking current ownership so startup does not depend on
+        // a future NameOwnerChanged signal, and owner transitions cannot be missed.
+        let present: bool = proxy
+            .call("NameHasOwner", &("org.bluez",))
+            .await
+            .context("query initial BlueZ owner")?;
+        let initial_owner = if present { "initial" } else { "" }.to_string();
         let events = changes.map(|message| {
             message
                 .body()
                 .deserialize()
                 .context("decode BlueZ owner change")
         });
-        owner::drive(events, |new_owner| {
+        owner::drive(events, Some(initial_owner), |new_owner| {
             self.invalidate(&pairing);
             let pairing = &pairing;
             async move {
@@ -155,15 +217,14 @@ impl RecoveringBackend {
     async fn recover(&self, pairing: &Arc<PairingBroker>) {
         tracing::info!("BlueZ appeared; rebuilding Bluetooth backend");
         loop {
-            let previous = self.current();
-            match Self::replacement(pairing, &previous).await {
+            match self.replacement(pairing).await {
                 Ok((mut replacement, agent)) => {
                     *self.agent.lock().await = Some(agent);
                     *self
                         .current
                         .write()
                         .unwrap_or_else(|poison| poison.into_inner()) =
-                        Arc::clone(&replacement.backend);
+                        Some(Arc::clone(&replacement.backend));
                     self.forward_changes(Arc::clone(&replacement.backend));
                     replacement.installed = true;
                     self.available.store(true, Ordering::Release);
@@ -179,15 +240,12 @@ impl RecoveringBackend {
         }
     }
 
-    async fn replacement(
-        pairing: &Arc<PairingBroker>,
-        previous: &BluezBackend,
-    ) -> Result<(Candidate, AgentHandle)> {
+    async fn replacement(&self, pairing: &Arc<PairingBroker>) -> Result<(Candidate, AgentHandle)> {
         let replacement = Candidate {
             backend: Arc::new(
                 BluezBackend::with_state(
-                    Arc::clone(&previous.identities),
-                    Arc::clone(&previous.management),
+                    Arc::clone(&self.identities),
+                    Arc::clone(&self.management),
                 )
                 .await?,
             ),
@@ -214,17 +272,49 @@ macro_rules! impl_recovering_backend {
             }
 
             fn remember_audio_profile(&self, device_key: &str, profile_key: &str) -> Result<()> {
-                self.current().remember_audio_profile(device_key, profile_key)
+                self.current()?.remember_audio_profile(device_key, profile_key)
             }
 
             $(async fn $name(&self, $($argument: $type),*) -> Result<$output> {
-                if !self.available.load(Ordering::Acquire) {
-                    return Err(BackendError::new(BackendErrorKind::Unavailable, "BlueZ is recovering").into());
-                }
-                self.current().$name($($argument),*).await
+                self.current()?.$name($($argument),*).await
             })+
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_backend_needs_no_bluez_generation() {
+        let identities = DeviceIdentityRegistry::in_memory();
+        let management = Arc::new(ManagementStore::in_memory());
+        let backend = RecoveringBackend::new_unavailable(identities.clone(), management.clone());
+        let mut changes = backend.subscribe_changes();
+        let pairing = PairingBroker::new(identities);
+        for error in [
+            backend.snapshot().await.unwrap_err(),
+            backend.set_powered(None, true).await.unwrap_err(),
+            backend
+                .update_management(&serde_json::json!({"trust_after_pair": false}))
+                .await
+                .unwrap_err(),
+            backend
+                .remember_audio_profile("device", "profile")
+                .unwrap_err(),
+        ] {
+            assert_eq!(
+                error.downcast_ref::<BackendError>().unwrap().kind,
+                BackendErrorKind::Unavailable
+            );
+        }
+        assert!(management.policy().trust_after_pair);
+        backend.invalidate(&pairing);
+        changes.recv().await.unwrap();
+        backend.stop_generation().await;
+        assert!(backend.current().is_err());
+    }
 }
 
 impl_recovering_backend! {

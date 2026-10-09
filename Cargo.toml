@@ -31,6 +31,10 @@ uuid = { version = "1", features = ["v4"] }
 zbus = { version = "5", features = ["tokio"] }
 zvariant = "5"
 
+[[test]]
+name = "session_recovery"
+path = "test_support/session_recovery.rs"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

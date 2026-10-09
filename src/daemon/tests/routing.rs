@@ -194,6 +194,104 @@ async fn routed_operations_and_scans_keep_cancellation_scoped_to_the_caller_and_
     assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
 }
 
+#[tokio::test]
+async fn scan_disable_only_cancels_callers_leases() {
+    let (mut daemon, _, _) = daemon(true);
+    let scanning = Arc::new(std::sync::Mutex::new(Vec::new()));
+    daemon.scans = super::ScanCoordinator::new(super::test_backend(true, false, scanning.clone()));
+    let mut events = daemon.scans.subscribe();
+    let mut ids = Vec::new();
+    for owner in [":other", ":owner", ":owner", ":owner"] {
+        let response = daemon
+            .dispatch_call(
+                "bluetooth.scan",
+                json!({"timeout_ms": 60_000}),
+                Some(owner),
+                None,
+            )
+            .await;
+        assert_eq!(response["ok"], true);
+        ids.push(
+            response["data"]["scan"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        assert_eq!(events.recv().await.unwrap().state, "running");
+    }
+    for (owner, params) in [
+        (":owner", json!({"enabled": false, "request_id": ids[0]})),
+        (":stranger", json!({"enabled": false})),
+    ] {
+        let response = daemon
+            .dispatch_call("bluetooth.scan", params, Some(owner), None)
+            .await;
+        assert_eq!(response["error"]["code"], "request-not-found");
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            daemon.scans.snapshot().await["active"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+    let response = daemon
+        .dispatch_call(
+            "bluetooth.scan",
+            json!({"enabled": false, "request_id": ids[1]}),
+            Some(":owner"),
+            None,
+        )
+        .await;
+    assert_eq!(response["ok"], true);
+    assert_eq!(events.recv().await.unwrap().request_id, ids[1]);
+    assert!(daemon.scans.contains(&ids[2]).await);
+    assert!(daemon.scans.contains(&ids[3]).await);
+
+    let response = daemon
+        .dispatch_call(
+            "bluetooth.scan",
+            json!({"enabled": false}),
+            Some(":owner"),
+            None,
+        )
+        .await;
+    assert_eq!(response["ok"], true);
+    for _ in 0..2 {
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.state, "cancelled");
+        assert!(ids[2..].contains(&event.request_id));
+    }
+    assert_eq!(
+        daemon.scans.snapshot().await["active"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(daemon.scans.contains(&ids[0]).await);
+    assert!(super::stopped_calls(&scanning).is_empty());
+
+    let response = daemon
+        .dispatch_call(
+            "bluetooth.scan",
+            json!({"enabled": false}),
+            Some(":other"),
+            None,
+        )
+        .await;
+    assert_eq!(response["ok"], true);
+    assert_eq!(
+        super::stopped_calls(&scanning),
+        vec![
+            (Some("adapter-1".into()), false),
+            (Some("adapter-2".into()), false),
+        ]
+    );
+    assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
+}
+
 async fn assert_owned_cancellation(daemon: &crate::daemon::BluetoothDaemon, id: &str) -> Value {
     let denied: Value =
         serde_json::from_str(&daemon.cancel_owned(id, Some(":other")).await).unwrap();

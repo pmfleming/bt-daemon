@@ -5,14 +5,18 @@ use std::future::Future;
 
 type Change = (String, String, String);
 
-pub(super) async fn drive<S, F, R>(events: S, mut replace: F) -> Result<()>
+pub(super) async fn drive<S, F, R>(
+    events: S,
+    initial_owner: Option<String>,
+    mut replace: F,
+) -> Result<()>
 where
     S: Stream<Item = Result<Change>>,
     F: FnMut(String) -> R,
     R: Future<Output = ()>,
 {
     futures::pin_mut!(events);
-    let mut replacement: Option<std::pin::Pin<Box<R>>> = None;
+    let mut replacement = initial_owner.map(|owner| Box::pin(replace(owner)));
     loop {
         tokio::select! {
             biased;
@@ -48,13 +52,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn startup_observes_current_owner_without_waiting_for_a_change() {
+        for initial in ["", "already-running"] {
+            let (events, stream) = mpsc::unbounded();
+            let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+            let worker = tokio::spawn(drive(stream, Some(initial.into()), move |owner| {
+                observed.send(owner).unwrap();
+                std::future::ready(())
+            }));
+            assert_eq!(observations.recv().await.unwrap(), initial);
+            events
+                .unbounded_send(Ok(("org.bluez".into(), initial.into(), "new".into())))
+                .unwrap();
+            assert_eq!(observations.recv().await.unwrap(), "new");
+            drop(events);
+            assert!(worker.await.unwrap().is_err());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn owner_changes_and_stream_loss_discard_stale_candidates() {
         for stream_error in [false, true] {
             let (events, stream) = mpsc::unbounded();
             let log = Arc::new(Mutex::new(Vec::new()));
             let changes = log.clone();
-            let worker = tokio::spawn(drive(stream, move |owner| {
+            let worker = tokio::spawn(drive(stream, None, move |owner| {
                 let log = changes.clone();
                 async move {
                     if owner.is_empty() {

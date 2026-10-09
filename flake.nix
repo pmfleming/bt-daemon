@@ -44,6 +44,7 @@
               llvmPackages.libclang
               pkg-config
             ];
+            nativeCheckInputs = [ pkgs.dbus ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
             buildInputs = with pkgs; [
