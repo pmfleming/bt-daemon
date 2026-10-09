@@ -1,7 +1,7 @@
 //! Optional connected-link telemetry. This never starts discovery or connects a
 //! device. Hardware I/O stays off snapshot paths and is bounded/cancellable.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +38,8 @@ struct Entry {
 pub(super) struct Signals {
     entries: HashMap<Key, Entry>,
     epoch: u64,
+    invalidated_devices: HashSet<Key>,
+    invalidated_adapters: HashSet<String>,
     denied: bool,
 }
 
@@ -53,8 +55,12 @@ impl Signals {
     }
 
     pub fn invalidate(&mut self, adapter: &str, address: Option<Address>) {
-        // Fence in-flight reads on disconnect/reconnect, removal and adapter loss.
-        self.epoch = self.epoch.wrapping_add(1);
+        // Fence only affected reads, including first reads without a cached entry.
+        if let Some(address) = address {
+            self.invalidated_devices.insert((adapter.into(), address));
+        } else {
+            self.invalidated_adapters.insert(adapter.into());
+        }
         for ((name, peer), entry) in &mut self.entries {
             if name == adapter && address.is_none_or(|address| address == *peer) {
                 entry.succeeded = false;
@@ -71,6 +77,21 @@ impl Signals {
         }
     }
 
+    fn begin_poll(&mut self) -> u64 {
+        // Polls are serialized. Retire the previous poll's tokens before clearing
+        // its scoped fences, so discovery churn cannot grow them indefinitely.
+        self.epoch = self.epoch.wrapping_add(1);
+        self.invalidated_devices.clear();
+        self.invalidated_adapters.clear();
+        self.epoch
+    }
+
+    fn current(&self, key: &Key, epoch: u64) -> bool {
+        epoch == self.epoch
+            && !self.invalidated_devices.contains(key)
+            && !self.invalidated_adapters.contains(&key.0)
+    }
+
     fn due(&self, key: &Key) -> bool {
         !self.denied
             && self.entries.get(key).is_none_or(|entry| {
@@ -82,7 +103,7 @@ impl Signals {
     }
 
     fn accept(&mut self, key: Key, epoch: u64, reading: Option<(i16, RssiKind)>) {
-        if epoch != self.epoch {
+        if !self.current(&key, epoch) {
             return;
         }
         let now = Instant::now();
@@ -143,7 +164,7 @@ pub(super) async fn run(backend: &BluezBackend) {
 }
 
 async fn poll(backend: &BluezBackend) {
-    let epoch = backend.link_signals.lock().await.epoch;
+    let epoch = backend.link_signals.lock().await.begin_poll();
     let Ok(names) = backend.session.adapter_names().await else {
         return;
     };
@@ -178,7 +199,10 @@ async fn poll(backend: &BluezBackend) {
         }
     }
     stream::iter(peers).for_each_concurrent(4, |(key, index, random)| async move {
-        if backend.link_signals.lock().await.denied { return; }
+        {
+            let signals = backend.link_signals.lock().await;
+            if signals.denied || !signals.current(&key, epoch) { return; }
+        }
         let result = mgmt::read(index, key.1, random).await;
         let denied = matches!(&result, Ok((mgmt::Reply::Denied, _)))
             || result.as_ref().err().is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
@@ -198,6 +222,46 @@ async fn poll(backend: &BluezBackend) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalidation_is_scoped_even_before_the_first_read_completes() {
+        let mut signals = Signals::default();
+        let address = Address::default();
+        let other_address = "01:23:45:67:89:AB".parse().unwrap();
+        let removed = ("hci0".into(), address);
+        let same_adapter = ("hci0".into(), other_address);
+        let other_adapter = ("hci1".into(), address);
+        let sample = Some((-60, RssiKind::Dbm));
+        let epoch = signals.begin_poll();
+
+        signals.invalidate("hci0", Some(address));
+        signals.accept(removed.clone(), epoch, sample);
+        signals.accept(same_adapter.clone(), epoch, sample);
+        signals.accept(other_adapter.clone(), epoch, sample);
+        assert!(signals.get("hci0", address, true).is_none());
+        assert!(signals.get("hci0", other_address, true).unwrap().live);
+        assert!(signals.get("hci1", address, true).unwrap().live);
+
+        signals.invalidate("hci0", None);
+        signals.accept(same_adapter.clone(), epoch, sample);
+        signals.accept(other_adapter.clone(), epoch, Some((-42, RssiKind::Dbm)));
+        assert!(!signals.get("hci0", other_address, true).unwrap().live);
+        assert_eq!(signals.get("hci1", address, true).unwrap().rssi, -42);
+
+        let next_epoch = signals.begin_poll();
+        assert!(signals.invalidated_devices.is_empty());
+        assert!(signals.invalidated_adapters.is_empty());
+        signals.accept(removed.clone(), epoch, sample);
+        assert!(signals.get("hci0", address, true).is_none());
+        signals.accept(removed, next_epoch, sample);
+        assert!(signals.get("hci0", address, true).unwrap().live);
+
+        signals.suspend();
+        for key in [same_adapter, other_adapter] {
+            signals.accept(key.clone(), next_epoch, sample);
+            assert!(!signals.get(&key.0, key.1, true).unwrap().live);
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn failures_disconnects_expiry_and_late_replies_preserve_only_cached_samples() {
@@ -228,7 +292,8 @@ mod tests {
         signals.accept(key.clone(), 0, Some((-20, RssiKind::Dbm)));
         assert_eq!(signals.get("hci0", address, true).unwrap().rssi, 0);
         assert!(!signals.get("hci0", address, true).unwrap().live);
-        signals.accept(key.clone(), signals.epoch, Some((-42, RssiKind::Dbm)));
+        let epoch = signals.begin_poll();
+        signals.accept(key.clone(), epoch, Some((-42, RssiKind::Dbm)));
         tokio::time::advance(LIVE_TTL + Duration::from_millis(1)).await;
         assert!(!signals.get("hci0", address, true).unwrap().live);
         tokio::time::advance(DISCOVERED_DEVICE_CACHE_TTL).await;
