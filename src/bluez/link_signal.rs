@@ -17,7 +17,7 @@ use tokio::{
 use super::{BluezBackend, DISCOVERED_DEVICE_CACHE_TTL};
 use crate::model::RssiKind;
 
-mod mgmt;
+use crate::rssi_helper::client as mgmt;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
@@ -46,7 +46,6 @@ pub(super) struct Signals {
     epoch: u64,
     invalidated_devices: HashSet<Key>,
     invalidated_adapters: HashSet<String>,
-    denied: bool,
 }
 
 impl Signals {
@@ -99,13 +98,12 @@ impl Signals {
     }
 
     fn due(&self, key: &Key) -> bool {
-        !self.denied
-            && self.entries.get(key).is_none_or(|entry| {
-                // The monitor already schedules successful reads once per tick.
-                // Comparing completion time with that tick would skip every other
-                // poll due to the request's own latency.
-                entry.succeeded || entry.attempted.elapsed() >= FAILURE_BACKOFF
-            })
+        self.entries.get(key).is_none_or(|entry| {
+            // The monitor already schedules successful reads once per tick.
+            // Comparing completion time with that tick would skip every other
+            // poll due to the request's own latency.
+            entry.succeeded || entry.attempted.elapsed() >= FAILURE_BACKOFF
+        })
     }
 
     fn accept(&mut self, key: Key, epoch: u64, reading: Option<(i16, RssiKind)>) {
@@ -152,7 +150,7 @@ pub(super) async fn run(backend: &BluezBackend) {
         if *backend.sleeping.borrow() {
             continue;
         }
-        let (denied, had_entries) = {
+        let had_entries = {
             let mut signals = backend.link_signals.lock().await;
             let had_entries = !signals.entries.is_empty();
             signals.entries.retain(|_, entry| {
@@ -161,11 +159,14 @@ pub(super) async fn run(backend: &BluezBackend) {
                 }
                 entry.attempted.elapsed() <= DISCOVERED_DEVICE_CACHE_TTL
             });
-            (signals.denied, had_entries)
+            had_entries
         };
-        if !denied {
-            poll(&backend.link_signals, connected_peers(backend), mgmt::read).await;
-        }
+        poll(
+            &backend.link_signals,
+            connected_peers(backend),
+            |index, address, _| mgmt::read(&backend.system_bus, index, address),
+        )
+        .await;
         // Publish ageing too, but do not rebuild snapshots forever with no peers.
         if had_entries || !backend.link_signals.lock().await.entries.is_empty() {
             let _ = backend.changes.send(());
@@ -230,20 +231,17 @@ async fn poll<F>(
     stream::iter(peers).for_each_concurrent(4, |(key, index, random)| async move {
         {
             let signals = signals.lock().await;
-            if signals.denied || !signals.current(&key, epoch) { return; }
+            if !signals.current(&key, epoch) { return; }
         }
         let result = read(index, key.1, random).await;
-        let denied = matches!(&result, Ok((mgmt::Reply::Denied, _)))
-            || result.as_ref().err().is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+        if let Err(error) = &result {
+            tracing::debug!(%error, "connected RSSI helper read failed; retaining cached readings");
+        }
         let reading = match result {
             Ok((mgmt::Reply::Reading(rssi), relative)) => Some((rssi, if relative { RssiKind::BrEdrRelative } else { RssiKind::Dbm })),
             _ => None,
         };
         let mut signals = signals.lock().await;
-        if denied && !signals.denied {
-            signals.denied = true;
-            tracing::info!("connected Bluetooth RSSI unavailable: CAP_NET_ADMIN required; retaining discovery/cached signal readings");
-        }
         signals.accept(key, epoch, reading);
     }).await;
 }
@@ -410,7 +408,11 @@ mod tests {
         assert!(!signals.get("hci0", address, true).unwrap().live);
         tokio::time::advance(DISCOVERED_DEVICE_CACHE_TTL).await;
         assert!(signals.get("hci0", address, true).is_none());
-        signals.denied = true;
+        // Helper/authorization failures back off, but must recover without a
+        // session daemon restart after installation or an active-session change.
+        signals.accept(key.clone(), epoch, None);
         assert!(!signals.due(&key));
+        tokio::time::advance(FAILURE_BACKOFF).await;
+        assert!(signals.due(&key));
     }
 }

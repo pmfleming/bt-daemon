@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.laufan.BluetoothRssiHelper
+Exec=@out@/bin/bt-rssi-helper
+User=bt-rssi-helper
+SystemdService=bt-rssi-helper.service

@@ -16,13 +16,7 @@ const COMMAND_STATUS: u16 = 0x0002;
 const NOT_CONNECTED: u8 = 0x02;
 const PERMISSION_DENIED: u8 = 0x14;
 
-#[derive(Debug, PartialEq)]
-pub(super) enum Reply {
-    Reading(i16),
-    NotConnected,
-    Unavailable,
-    Denied,
-}
+use super::Reply;
 
 #[repr(C)]
 struct SockAddrHci {
@@ -112,6 +106,19 @@ fn reply(packet: &[u8], index: u16, peer: &[u8; 7]) -> Option<Reply> {
     })
 }
 
+fn sent_request(sent: isize, length: usize) -> io::Result<()> {
+    if sent < 0 {
+        Err(io::Error::last_os_error())
+    } else if sent == 0 || sent as usize == length {
+        // Linux's management dispatcher can return zero after queuing a Command
+        // Status error (e.g. permission denied). The reply, not send's byte count,
+        // is authoritative. Still reject a genuinely partial positive write.
+        Ok(())
+    } else {
+        Err(io::ErrorKind::WriteZero.into())
+    }
+}
+
 async fn exchange(socket: &AsyncFd<OwnedFd>, index: u16, peer: &[u8; 7]) -> io::Result<Reply> {
     let packet = request(index, peer);
     socket
@@ -125,13 +132,7 @@ async fn exchange(socket: &AsyncFd<OwnedFd>, index: u16, peer: &[u8; 7]) -> io::
                     libc::MSG_NOSIGNAL,
                 )
             };
-            if sent < 0 {
-                Err(io::Error::last_os_error())
-            } else if sent as usize != packet.len() {
-                Err(io::ErrorKind::WriteZero.into())
-            } else {
-                Ok(())
-            }
+            sent_request(sent, packet.len())
         })
         .await?;
     let mut buffer = [0_u8; 1024];
@@ -311,6 +312,20 @@ mod tests {
         assert_eq!(
             server.try_recv(&mut buffer).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn zero_byte_management_send_must_still_read_the_error_reply() {
+        assert!(sent_request(0, 13).is_ok());
+        assert!(sent_request(13, 13).is_ok());
+        assert_eq!(
+            sent_request(12, 13).unwrap_err().kind(),
+            io::ErrorKind::WriteZero
+        );
+        assert_eq!(
+            reply(&[2, 0, 0, 0, 3, 0, 0x31, 0, PERMISSION_DENIED], 0, &[0; 7]),
+            Some(Reply::Denied)
         );
     }
 

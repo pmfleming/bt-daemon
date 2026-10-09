@@ -71,12 +71,14 @@ Hardware acceptance is **pending**; synthetic socket and virtual-time tests do
 not establish controller support. Do not automatically grant capabilities or
 restart the user's Bluetooth service to run these checks.
 
-1. With the ordinary unprivileged user service and an already-connected device,
-   verify that permission denial is logged once, no repeated management reads
-   occur, and discovery/cached readings plus other device operations still work.
-2. In an explicitly approved CAP_NET_ADMIN-capable test deployment, keep a known
-   device connected and discovery stopped. Within a polling interval, check
-   `rssi`, `rssi_kind`, `signal_live` and `signal_strength` in snapshots.
+1. With the ordinary unprivileged user service and no RSSI helper, verify bounded
+   read failures/backoff and unchanged discovery/cached readings and operations.
+2. In an explicitly approved [RSSI helper deployment](rssi-helper.md), verify the
+   helper alone has CAP_NET_ADMIN and the session daemon still has no effective
+   capabilities. Keep a known device connected and discovery stopped. Within a
+   polling interval (or the thirty-second recovery backoff), check `rssi`,
+   `rssi_kind`, `signal_live` and `signal_strength` in snapshots. Check active-local
+   versus inactive/remote Polkit authorization, with no authentication prompts.
 3. Exercise classic BR/EDR, LE public and LE random connections where hardware is
    available. BR/EDR zero is relative to the golden receive range and must not
    become 100%; LE retains the existing dBm percentage heuristic. Verify that
@@ -88,6 +90,11 @@ restart the user's Bluetooth service to run these checks.
    reads, thirty-second failure backoff, and cached fallback without UI errors.
 6. Edit a Bluetooth name while readings update. Selection and the native draft
    remain intact; Escape still discards, with no unsolicited save.
+7. Stop/restart the helper in an approved session. Readings become cached and
+   recover without restarting the user daemon. Test missing Polkit and helper
+   capability denial: the latter must decode the queued `0x14` management reply,
+   not become a silent WriteZero error. No deployment/privilege change is part
+   of the automated test suite.
 
 ## Interactive Rofi-replacement gate
 

@@ -20,6 +20,8 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
     in
     {
+      nixosModules.rssi-helper = import ./nix/rssi-helper.nix self;
+
       packages = forAllSystems (
         system: pkgs:
         let
@@ -56,9 +58,19 @@
               install -Dm644 ${./packaging/systemd/bt-daemon.service} $out/share/systemd/user/bt-daemon.service
               install -Dm644 ${./packaging/dbus/org.laufan.BluetoothDaemon.service} \
                 $out/share/dbus-1/services/org.laufan.BluetoothDaemon.service
+              install -Dm644 ${./packaging/systemd/bt-rssi-helper.service} \
+                $out/lib/systemd/system/bt-rssi-helper.service
+              install -Dm644 ${./packaging/dbus/org.laufan.BluetoothRssiHelper.conf} \
+                $out/share/dbus-1/system.d/org.laufan.BluetoothRssiHelper.conf
+              install -Dm644 ${./packaging/dbus/org.laufan.BluetoothRssiHelper.service} \
+                $out/share/dbus-1/system-services/org.laufan.BluetoothRssiHelper.service
+              install -Dm644 ${./packaging/polkit/org.laufan.bt-daemon.rssi.policy} \
+                $out/share/polkit-1/actions/org.laufan.bt-daemon.rssi.policy
               substituteInPlace \
                 $out/share/systemd/user/bt-daemon.service \
                 $out/share/dbus-1/services/org.laufan.BluetoothDaemon.service \
+                $out/lib/systemd/system/bt-rssi-helper.service \
+                $out/share/dbus-1/system-services/org.laufan.BluetoothRssiHelper.service \
                 --replace-fail @out@ $out
             '';
             meta = {

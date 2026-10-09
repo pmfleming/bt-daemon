@@ -1,0 +1,39 @@
+[Unit]
+Description=Read-only Bluetooth connected RSSI helper
+Documentation=https://github.com/pmfleming/bt-daemon
+After=dbus.service bluetooth.service
+Requires=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.laufan.BluetoothRssiHelper
+User=bt-rssi-helper
+Group=bt-rssi-helper
+ExecStart=@out@/bin/bt-rssi-helper
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
+SystemCallArchitectures=native
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=5s
+TasksMax=32
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

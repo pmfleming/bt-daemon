@@ -70,23 +70,32 @@ The implementation follows Google's public [Fast Pair BLE Device](https://develo
 
 ## Connected-link signal readings
 
-The daemon optionally reads Linux Bluetooth management **Get Connection
-Information** (`0x0031`) for already-connected devices, without starting discovery
-or changing their connections. Reads run in a separate cancellable monitor every
-five seconds (four concurrent requests maximum, two-second request deadline).
-BlueZ enumeration has a separate four-second deadline; request batches finish
-before the next poll, skipping missed ticks rather than overlapping polls.
-Transient/unsupported reads back off for thirty seconds. Snapshot requests never
-wait for this hardware I/O.
+The unprivileged daemon polls the optional **`bt-rssi-helper`** system service
+for already-connected devices. Only that small, separately confined service gets
+**CAP_NET_ADMIN**. It sends Linux Bluetooth management **Get Connection
+Information** (`0x0031`), never discovery, connection or mutation commands. The
+session daemon has no direct management-socket fallback.
 
-This command requires **CAP_NET_ADMIN** on Linux. The normal unprivileged user
-service may not have it: denial disables these reads until backend/daemon restart
-and is logged once, while discovery and cached RSSI continue working. Installation does
-**not** grant capabilities or run the daemon as root. Enabling privileged access
-requires an explicit deployment/security decision; granting CAP_NET_ADMIN to the
-whole user daemon is broader than read-only Bluetooth telemetry. A separately
-confined read-only broker is preferable for deployments requiring privilege
-separation (not included here).
+Polling runs every five seconds, with four concurrent calls maximum. BlueZ
+enumeration has a separate four-second deadline; helper requests are bounded to
+four seconds including authorization, with a two-second kernel deadline and a
+five-second client deadline. Batches finish before the next poll, skipping missed
+ticks rather than overlapping. Missing helper, authorization, transport and
+unsupported-controller failures back off for thirty seconds and preserve cached
+readings. Installation, helper restart or session authorization changes recover
+without restarting bt-daemon. Snapshot requests never wait for hardware I/O.
+
+The helper accepts only typed adapter/address reads, verifies that BlueZ reports
+the target connected, and derives transport type itself. Polkit authenticates the
+unique D-Bus caller; the default policy permits active local sessions only, with
+no password prompts. It enforces global admission/concurrency and per-target rate
+limits. It does not persist or return cached readings. Framework reuse is limited
+to generic lifecycle support; the privileged executable, authorization policy and
+Bluetooth protocol stay in this repository.
+
+Installation of the user daemon alone grants no capabilities. See
+[RSSI helper deployment and security](docs/rssi-helper.md) for the opt-in NixOS
+module and non-Nix deployment requirements.
 
 Fresh connected readings take priority; fresh discovery readings are the next
 choice, then the most recent available cached sample. Failed reads never clear

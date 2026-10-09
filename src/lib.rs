@@ -26,5 +26,7 @@ pub mod pairing;
 /// Stable method, stream and schema registry for bt-api clients.
 pub mod protocol;
 mod rfkill;
+/// Capability-scoped connected-link RSSI broker; deployed as a separate service.
+pub mod rssi_helper;
 mod state;
 mod task;
