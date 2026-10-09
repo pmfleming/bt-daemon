@@ -185,6 +185,7 @@ fn cached_device_views_expire_and_never_claim_live_state() {
             model_id: None,
             fast_pair: Some(features()),
             rssi: Some(-40),
+            rssi_kind: Some(crate::model::RssiKind::Dbm),
             signal_strength: Some(100),
             signal_live: true,
             present: true,

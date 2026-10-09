@@ -111,6 +111,16 @@ pub struct DeviceServices {
     pub services: Vec<Service>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// RSSI units: classic connected RSSI is relative to the golden receive range,
+/// not absolute dBm and therefore cannot be converted to a strength percentage.
+pub enum RssiKind {
+    #[serde(rename = "dbm")]
+    Dbm,
+    #[serde(rename = "bredr-relative")]
+    BrEdrRelative,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// UI metadata with freshness flags so remembered batteries and RSSI are not presented as live.
 pub struct DevicePresentation {
@@ -123,6 +133,8 @@ pub struct DevicePresentation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast_pair: Option<FastPairFeatures>,
     pub rssi: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rssi_kind: Option<RssiKind>,
     pub signal_strength: Option<u8>,
     pub signal_live: bool,
     pub present: bool,

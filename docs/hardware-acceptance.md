@@ -65,6 +65,30 @@ virtual-time tests cover the bounded retry budget, error classification, deadlin
 ordering/consumption, and preservation of live streams after late failures;
 post-fix hardware timing is not yet measured.
 
+## Connected-link RSSI
+
+Hardware acceptance is **pending**; synthetic socket and virtual-time tests do
+not establish controller support. Do not automatically grant capabilities or
+restart the user's Bluetooth service to run these checks.
+
+1. With the ordinary unprivileged user service and an already-connected device,
+   verify that permission denial is logged once, no repeated management reads
+   occur, and discovery/cached readings plus other device operations still work.
+2. In an explicitly approved CAP_NET_ADMIN-capable test deployment, keep a known
+   device connected and discovery stopped. Within a polling interval, check
+   `rssi`, `rssi_kind`, `signal_live` and `signal_strength` in snapshots.
+3. Exercise classic BR/EDR, LE public and LE random connections where hardware is
+   available. BR/EDR zero is relative to the golden receive range and must not
+   become 100%; LE retains the existing dBm percentage heuristic. Verify that
+   raw unavailable value 127 is never rendered.
+4. Disconnect, suspend/resume, remove the adapter, and restart BlueZ in an
+   approved session. Cached values retain their units and become non-live;
+   retired/in-flight reads cannot relabel them live. Reconnect gets new readings.
+5. With a controller that rejects/does not implement the command, verify bounded
+   reads, thirty-second failure backoff, and cached fallback without UI errors.
+6. Edit a Bluetooth name while readings update. Selection and the native draft
+   remain intact; Escape still discards, with no unsolicited save.
+
 ## Interactive Rofi-replacement gate
 
 Record a date, device, and result for every row before moving `SUPER+B`.

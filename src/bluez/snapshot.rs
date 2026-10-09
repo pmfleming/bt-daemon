@@ -252,6 +252,11 @@ async fn device_snapshot(
             assembly::Signal::resolve(observation.as_ref(), cached, signal_live),
         )
     };
+    let signal = signal.with_link(backend.link_signals.lock().await.get(
+        adapter.name(),
+        identity,
+        state.connected,
+    ));
     if !should_include_device(state.paired, present, cached) {
         tracing::trace!(device_key = %key, paired = state.paired, present, "device omitted from snapshot");
         return Ok(None);

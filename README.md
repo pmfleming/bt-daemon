@@ -68,6 +68,49 @@ The implementation follows Google's public [Fast Pair BLE Device](https://develo
 
 `bt-daemon daemon` owns `org.laufan.BluetoothDaemon` on the session bus. `bt-daemon client` bridges newline-delimited frontend JSON through that service and does not bypass daemon policy with direct BlueZ mutations. Device and scan operations receive opaque request IDs and publish lifecycle events; active operations can be cancelled through the transport. Lifecycle streams emit a `lagged` event with a `skipped` count if a slow subscriber misses events. Consumers can then call `bluetooth.requests.snapshot` to reconcile active scans, operations, pairing prompts, and recently completed device operations instead of silently retaining stale state. Dropping BlueR's Pair future invokes BlueZ `CancelPairing`. Errors distinguish timeout, unavailable-device, rejected, BlueZ-unavailable, validation, and generic failures. If BlueZ disappears, the session API remains owned, publishes unavailable snapshots, and rebuilds its BlueZ session, monitors, Fast Pair provider, and pairing agent when BlueZ returns instead of restarting the daemon and discarding subscriptions. The application-specific BlueR pairing agent covers PIN input/display, passkey input/display, numeric confirmation, pairing authorization, service authorization, BlueZ cancellation, and a 60-second prompt timeout without requesting default-agent ownership from Blueman.
 
+## Connected-link signal readings
+
+The daemon optionally reads Linux Bluetooth management **Get Connection
+Information** (`0x0031`) for already-connected devices, without starting discovery
+or changing their connections. Reads run in a separate cancellable monitor every
+five seconds (four concurrent requests maximum, two-second request deadline).
+Transient/unsupported reads back off for thirty seconds. Snapshot requests never
+wait for this hardware I/O.
+
+This command requires **CAP_NET_ADMIN** on Linux. The normal unprivileged user
+service may not have it: denial disables these reads until backend/daemon restart
+and is logged once, while discovery and cached RSSI continue working. Installation does
+**not** grant capabilities or run the daemon as root. Enabling privileged access
+requires an explicit deployment/security decision; granting CAP_NET_ADMIN to the
+whole user daemon is broader than read-only Bluetooth telemetry. A separately
+confined read-only broker is preferable for deployments requiring privilege
+separation (not included here).
+
+Fresh connected readings take priority; fresh discovery readings are the next
+choice, then the most recent available cached sample. Failed reads never clear
+or refresh the last successful number. Connected samples become non-live on read
+failure, disconnect/removal/suspend, or after twelve seconds without a successful
+read. The optional sampler retains samples in memory for up to five minutes;
+the ordinary device snapshot cache remains the fallback (including its existing
+connected-device retention). No RSSI is persisted across daemon/BlueZ restarts.
+
+`rssi_kind` is an optional, additive bt-api v1 field:
+
+- `dbm`: discovery or connected LE RSSI. `signal_strength` retains the existing
+  clamped -100..-40 dBm → 0..100 heuristic; it is not a calibrated link-quality
+  percentage.
+- `bredr-relative`: connected classic Bluetooth RSSI, in dB relative to the
+  controller's golden receive-power range. Zero is a valid reading, not unknown
+  or 100%. `signal_strength` is null because an absolute percentage cannot be
+  inferred. Shelllist shows relative dB without absolute-strength bars.
+
+An unavailable controller value (127) is never shown as a reading. Cached
+fallback preserves the original units and `signal_live=false`; lack of RSSI
+never means that an otherwise connected device has disconnected.
+
+See [hardware acceptance](docs/hardware-acceptance.md#connected-link-rssi) for the
+remaining privileged/hardware checks.
+
 ## Operational logs
 
 The daemon writes structured lifecycle, operation, transfer, subscription, and error-chain logs to stderr at `debug` level by default. The systemd user service captures them in the journal:

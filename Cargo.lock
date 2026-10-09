@@ -330,6 +330,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "libc",
  "p256",
  "pipewire",
  "rand",

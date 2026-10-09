@@ -26,6 +26,7 @@ use crate::{
     rfkill,
 };
 
+mod link_signal;
 mod monitor;
 mod observations;
 mod operations;
@@ -51,6 +52,7 @@ pub struct BluezBackend {
     identities: Arc<DeviceIdentityRegistry>,
     device_cache: Mutex<HashMap<String, CachedDevice>>,
     observations: Mutex<observations::Observations>,
+    link_signals: Mutex<link_signal::Signals>,
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
     management: Arc<ManagementStore>,
@@ -113,6 +115,7 @@ impl BluezBackend {
             identities,
             device_cache: Mutex::new(HashMap::new()),
             observations: Mutex::new(observations::Observations::default()),
+            link_signals: Mutex::new(link_signal::Signals::default()),
             system_bus,
             fast_pair,
             management,
@@ -185,6 +188,7 @@ impl BluezBackend {
                 .context("decode logind sleep event")?;
             self.sleeping.send_replace(sleeping);
             if sleeping {
+                self.link_signals.lock().await.suspend();
                 self.remember_runtime_state().await;
             } else if let Err(error) = self.restore_runtime_state().await {
                 tracing::warn!(%error, "could not restore Bluetooth state after resume");
@@ -351,6 +355,10 @@ impl BluezBackend {
 
     pub fn start_monitoring(self: &Arc<Self>) {
         tracing::info!("BlueZ event monitor started");
+        let backend = Arc::clone(self);
+        self.tasks.spawn("bluez-link-rssi", async move {
+            link_signal::run(&backend).await;
+        });
         let backend = Arc::clone(self);
         self.tasks.spawn("bluez-monitor", async move {
             loop {

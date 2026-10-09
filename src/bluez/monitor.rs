@@ -129,7 +129,10 @@ pub(super) async fn run(backend: &BluezBackend) -> Result<()> {
 async fn handle_event(backend: &BluezBackend, watches: &mut Watches, event: Event) -> Result<()> {
     match event {
         Event::Session(SessionEvent::AdapterAdded(name)) => watches.adapter(backend, &name).await?,
-        Event::Session(SessionEvent::AdapterRemoved(name)) => watches.remove_adapter(&name),
+        Event::Session(SessionEvent::AdapterRemoved(name)) => {
+            backend.link_signals.lock().await.invalidate(&name, None);
+            watches.remove_adapter(&name);
+        }
         Event::Adapter(name, AdapterEvent::DeviceAdded(address)) => {
             record_discovered_device(backend, &name, address).await;
             if let Err(error) = watches.device(backend, &name, address).await {
@@ -137,6 +140,11 @@ async fn handle_event(backend: &BluezBackend, watches: &mut Watches, event: Even
             }
         }
         Event::Adapter(name, AdapterEvent::DeviceRemoved(address)) => {
+            backend
+                .link_signals
+                .lock()
+                .await
+                .invalidate(&name, Some(address));
             watches.remove(&format!("{name}/{address}"));
         }
         Event::Device(adapter, address, DeviceEvent::PropertyChanged(property)) => {
@@ -192,6 +200,11 @@ async fn handle_property(
             }
         }
         DeviceProperty::Connected(connected) => {
+            backend
+                .link_signals
+                .lock()
+                .await
+                .invalidate(adapter, Some(address));
             if let Some(provider) = &backend.fast_pair {
                 provider.note_connection_change(address).await;
             }

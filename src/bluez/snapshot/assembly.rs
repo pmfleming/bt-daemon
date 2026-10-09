@@ -4,11 +4,11 @@ use super::{
     has_fast_pair_service, service_label, signal_strength,
 };
 use crate::{
-    bluez::{CachedDevice, observations::Observation},
+    bluez::{CachedDevice, link_signal, observations::Observation},
     management::DevicePolicy,
     model::{
         Device, DeviceIdentity, DevicePresentation, DeviceServices, DeviceState, FastPairFeatures,
-        Service,
+        RssiKind, Service,
     },
 };
 
@@ -28,8 +28,10 @@ pub(super) struct Reading {
 
 pub(super) struct Signal {
     pub rssi: Option<i16>,
+    pub kind: Option<RssiKind>,
     pub last_seen_ms: Option<u64>,
     pub live: bool,
+    pub present: bool,
 }
 
 impl Signal {
@@ -38,15 +40,42 @@ impl Signal {
         cached: Option<&CachedDevice>,
         live: bool,
     ) -> Self {
+        let measured = observed.filter(|seen| {
+            seen.rssi.is_some()
+                && (live
+                    || cached.is_none_or(|cache| {
+                        cache.device.presentation.rssi.is_none()
+                            || Some(seen.last_seen_ms) >= cache.device.presentation.last_seen_ms
+                    }))
+        });
         Self {
-            rssi: observed
+            rssi: measured
                 .and_then(|seen| seen.rssi)
                 .or_else(|| cached.and_then(|cache| cache.device.presentation.rssi)),
-            last_seen_ms: observed
+            kind: measured
+                .map(|_| RssiKind::Dbm)
+                .or_else(|| cached.and_then(|cache| cache.device.presentation.rssi_kind)),
+            last_seen_ms: measured
                 .map(|seen| seen.last_seen_ms)
-                .or_else(|| cached.and_then(|cache| cache.device.presentation.last_seen_ms)),
-            live,
+                .or_else(|| cached.and_then(|cache| cache.device.presentation.last_seen_ms))
+                .or_else(|| observed.map(|seen| seen.last_seen_ms)),
+            live: live && measured.is_some(),
+            present: live,
         }
+    }
+
+    pub fn with_link(mut self, link: Option<link_signal::Reading>) -> Self {
+        if let Some(link) = link
+            && (link.live
+                || (!self.live
+                    && (self.rssi.is_none() || Some(link.last_seen_ms) >= self.last_seen_ms)))
+        {
+            self.rssi = Some(link.rssi);
+            self.kind = Some(link.kind);
+            self.last_seen_ms = Some(link.last_seen_ms);
+            self.live = link.live;
+        }
+        self
     }
 }
 
@@ -114,9 +143,13 @@ pub(super) fn build(
             model_id: presentation.model_id,
             fast_pair: features,
             rssi: signal.rssi,
-            signal_strength: signal.rssi.map(signal_strength),
+            rssi_kind: signal.kind,
+            signal_strength: signal
+                .rssi
+                .filter(|_| signal.kind != Some(RssiKind::BrEdrRelative))
+                .map(signal_strength),
             signal_live: signal.live,
-            present: state.connected || signal.live,
+            present: state.connected || signal.present,
             last_seen_ms: signal.last_seen_ms,
         },
         policy: context.policy,
@@ -192,6 +225,66 @@ mod tests {
     }
 
     #[test]
+    fn connected_signal_precedes_discovery_and_failed_reads_retain_honest_units() {
+        use crate::{bluez::link_signal, model::RssiKind};
+        let mut observations = Observations::default();
+        let peer = bluer::Address::default();
+        observations.record("hci0", peer, Some(-70));
+        let seen = observations.get("hci0", peer).unwrap();
+        let link = link_signal::Reading {
+            rssi: 0,
+            kind: RssiKind::BrEdrRelative,
+            live: true,
+            last_seen_ms: seen.last_seen_ms + 10,
+        };
+        let signal = Signal::resolve(Some(&seen), None, true).with_link(Some(link));
+        let mut connected = reading();
+        connected.state.connected = true;
+        let device = assemble(connected, signal);
+        assert_eq!(device.presentation.rssi, Some(0));
+        assert_eq!(device.presentation.rssi_kind, Some(RssiKind::BrEdrRelative));
+        assert_eq!(device.presentation.signal_strength, None);
+        assert!(device.presentation.signal_live);
+        let json = serde_json::to_value(&device).unwrap();
+        assert_eq!(json["rssi_kind"], "bredr-relative");
+        let cached = cache_entry(&device, link.last_seen_ms).unwrap();
+        // A stale discovery must not replace a newer cached connected reading,
+        // even after the optional sampler no longer holds that sample.
+        let fallback = Signal::resolve(Some(&seen), Some(&cached), false).with_link(None);
+        assert_eq!(fallback.rssi, Some(0));
+        assert_eq!(fallback.kind, Some(RssiKind::BrEdrRelative));
+        assert!(!fallback.live);
+        // A fresh discovery beats a failed/stale link sample, regardless of its timestamp.
+        let stale = link_signal::Reading {
+            live: false,
+            ..link
+        };
+        let discovery = Signal::resolve(Some(&seen), Some(&cached), true).with_link(Some(stale));
+        assert_eq!(discovery.rssi, Some(-70));
+        assert_eq!(discovery.kind, Some(RssiKind::Dbm));
+        let le = link_signal::Reading {
+            rssi: -58,
+            kind: RssiKind::Dbm,
+            ..link
+        };
+        let mut connected = reading();
+        connected.state.connected = true;
+        let device = assemble(
+            connected,
+            Signal::resolve(None, None, false).with_link(Some(le)),
+        );
+        assert_eq!(device.presentation.signal_strength, Some(70));
+        assert!(device.presentation.signal_live && device.presentation.present);
+        // An observation without RSSI cannot relabel a cached number as live.
+        observations.record("hci0", peer, None);
+        let missing = observations.get("hci0", peer).unwrap();
+        let unknown = Signal::resolve(Some(&missing), Some(&cached), true);
+        assert!(unknown.present);
+        assert!(!unknown.live);
+        assert_eq!(unknown.rssi, Some(0));
+    }
+
+    #[test]
     fn snapshots_preserve_unknown_fields_and_distinguish_observed_cached_and_connected_state() {
         let device = assemble(reading(), Signal::resolve(None, None, false));
         assert_eq!(device.identity.name, "Buds");
@@ -214,8 +307,10 @@ mod tests {
         ] {
             let signal = Signal {
                 rssi: Some(rssi),
+                kind: Some(crate::model::RssiKind::Dbm),
                 last_seen_ms: None,
                 live: false,
+                present: false,
             };
             assert_eq!(
                 assemble(reading(), signal).presentation.signal_strength,
@@ -236,8 +331,10 @@ mod tests {
             reading(),
             Signal {
                 rssi: Some(-70),
+                kind: Some(crate::model::RssiKind::Dbm),
                 last_seen_ms: Some(10),
                 live: true,
+                present: true,
             },
         );
         assert_eq!(device.presentation.signal_strength, Some(50));
