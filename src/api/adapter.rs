@@ -25,6 +25,12 @@ struct Setting {
     params: Value,
 }
 
+impl Setting {
+    fn outcome(&self, state: &str) -> Value {
+        json!({"field": self.field, "value": self.value, "state": state})
+    }
+}
+
 fn parse(params: &Value) -> Result<(String, Vec<Setting>)> {
     let key = params.require_string("key")?.to_owned();
     let object = params
@@ -48,22 +54,23 @@ fn parse(params: &Value) -> Result<(String, Vec<Setting>)> {
         "unknown adapter setting"
     );
     let mut settings = Vec::new();
-    for &(field, operation) in FIELDS {
-        if fields.contains_key(field) {
-            let (value, params) = if operation == AdapterOperation::SetAlias {
-                let value = changes.require_string(field)?;
-                (json!(value), json!({"alias": value}))
-            } else {
-                let value = changes.require_u32(field)?;
-                (json!(value), json!({"timeout": value}))
-            };
-            settings.push(Setting {
-                field,
-                operation,
-                value,
-                params,
-            });
-        }
+    for &(field, operation) in FIELDS
+        .iter()
+        .filter(|(field, _)| fields.contains_key(*field))
+    {
+        let (value, params) = if operation == AdapterOperation::SetAlias {
+            let value = changes.require_string(field)?;
+            (json!(value), json!({"alias": value}))
+        } else {
+            let value = changes.require_u32(field)?;
+            (json!(value), json!({"timeout": value}))
+        };
+        settings.push(Setting {
+            field,
+            operation,
+            value,
+            params,
+        });
     }
     Ok((key, settings))
 }
@@ -79,30 +86,23 @@ pub(super) async fn submit(backend: Arc<dyn BluetoothBackend>, params: Value) ->
     match tokio::spawn(async move {
         let gate = crate::task::adapter_gate(&key);
         let _exclusive = gate.lock().await;
-        let mut stopped = false;
         let mut outcomes = Vec::new();
-        for setting in settings {
-            let mut outcome =
-                json!({"field": setting.field, "value": setting.value, "state": "not-attempted"});
-            if !stopped {
-                match backend
-                    .adapter_operation(&key, setting.operation, &setting.params)
-                    .await
-                {
-                    Ok(()) => outcome["state"] = json!("applied"),
-                    Err(error) => {
-                        tracing::warn!(adapter_key = %key, field = setting.field, %error, "adapter batch stopped with an uncertain write outcome");
-                        // A timeout/disconnection can happen after dispatch. Even
-                        // an early backend failure is conservatively uncertain;
-                        // we cannot infer that a setter had no effect from Err.
-                        outcome["state"] = json!("unknown");
-                        outcome["error"] = super::error_value(&error);
-                        stopped = true;
-                    }
-                }
+        let mut settings = settings.into_iter();
+        for setting in settings.by_ref() {
+            let result = backend.adapter_operation(&key, setting.operation, &setting.params).await;
+            let mut outcome = setting.outcome("applied");
+            if let Err(error) = result {
+                tracing::warn!(adapter_key = %key, field = setting.field, %error, "adapter batch stopped with an uncertain write outcome");
+                // Even an early failure is uncertain: Err does not prove that a
+                // dispatched setter had no effect. Never retry or roll back.
+                outcome["state"] = json!("unknown");
+                outcome["error"] = super::error_value(&error);
+                outcomes.push(outcome);
+                break;
             }
             outcomes.push(outcome);
         }
+        outcomes.extend(settings.map(|setting| setting.outcome("not-attempted")));
         let mut data = json!({"adapter_batch": {"key": key, "outcomes": outcomes}});
         match backend.snapshot().await {
             Ok(snapshot) => data["snapshot"] = json!(snapshot),

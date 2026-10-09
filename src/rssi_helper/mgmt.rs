@@ -76,10 +76,8 @@ fn request(index: u16, peer: &[u8; 7]) -> [u8; 13] {
 }
 
 fn reply(packet: &[u8], index: u16, peer: &[u8; 7]) -> Option<Reply> {
-    if packet.len() < 9 {
-        return None;
-    }
-    let word = |i| u16::from_le_bytes([packet[i], packet[i + 1]]);
+    let header = packet.get(..9)?;
+    let word = |i| u16::from_le_bytes([header[i], header[i + 1]]);
     let event = word(0);
     if word(2) != index
         || usize::from(word(4)) != packet.len() - 6
@@ -148,18 +146,15 @@ async fn exchange(socket: &AsyncFd<OwnedFd>, index: u16, peer: &[u8; 7]) -> io::
                         libc::MSG_TRUNC,
                     )
                 };
-                if count < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(count as usize)
-                }
+                usize::try_from(count).map_err(|_| io::Error::last_os_error())
             })
             .await?;
         if count == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        if count <= buffer.len()
-            && let Some(reply) = reply(&buffer[..count], index, peer)
+        if let Some(reply) = buffer
+            .get(..count)
+            .and_then(|packet| reply(packet, index, peer))
         {
             return Ok(reply);
         }
@@ -195,7 +190,12 @@ async fn read_from(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        NOT_CONNECTED, PERMISSION_DENIED, Reply, peer, read_from, reply, request, sent_request,
+    };
+    use bluer::Address;
+    use std::{io, os::fd::OwnedFd, time::Duration};
+    use tokio::io::unix::AsyncFd;
 
     fn complete(index: u16, peer: &[u8; 7], rssi: u8) -> Vec<u8> {
         let mut packet = vec![1, 0, 0, 0, 13, 0, 0x31, 0, 0];
@@ -273,7 +273,8 @@ mod tests {
             } else {
                 1
             };
-            // An unrelated event must not complete the request.
+            // Oversized datagrams and unrelated events must not complete the request.
+            server.send(&[0; 2048]).await.unwrap();
             server
                 .send(&complete(5, &peer(address, kind), 20))
                 .await

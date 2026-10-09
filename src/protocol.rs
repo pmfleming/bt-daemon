@@ -166,36 +166,37 @@ fn inferred_schema(value: &Value) -> Value {
 }
 
 fn apply_constraints(method: &str, property: &str, schema: &mut Value) {
-    if method == "bluetooth.adapter.update" && property == "changes" {
-        *schema = json!({
-            "type": "object", "minProperties": 1, "additionalProperties": false,
-            "properties": {
-                "alias": {"type": "string", "minLength": 1},
-                "discoverable_timeout": {"type": "integer", "minimum": 0, "maximum": u32::MAX},
-                "pairable_timeout": {"type": "integer", "minimum": 0, "maximum": u32::MAX}
-            }
-        });
-    }
-    let enum_values = match (method, property) {
-        ("bluetooth.adapter.operation", "operation") => Some(AdapterOperation::VALUES),
-        ("bluetooth.device.operation", "operation") => Some(DeviceOperation::VALUES),
+    match (method, property) {
+        ("bluetooth.adapter.update", "changes") => {
+            *schema = json!({
+                "type": "object", "minProperties": 1, "additionalProperties": false,
+                "properties": {
+                    "alias": {"type": "string", "minLength": 1},
+                    "discoverable_timeout": {"type": "integer", "minimum": 0, "maximum": u32::MAX},
+                    "pairable_timeout": {"type": "integer", "minimum": 0, "maximum": u32::MAX}
+                }
+            });
+        }
+        ("bluetooth.adapter.operation", "operation") => {
+            schema["enum"] = json!(AdapterOperation::VALUES)
+        }
+        ("bluetooth.device.operation", "operation") => {
+            schema["enum"] = json!(DeviceOperation::VALUES)
+        }
         ("bluetooth.management.update", "launch_state") => {
-            Some(&["remember", "enable", "disable"] as &[&str])
+            schema["enum"] = json!(["remember", "enable", "disable"])
         }
         ("bluetooth.device.policy.update", "audio_route_on_connect") => {
-            Some(&["keep", "switch"] as &[&str])
+            schema["enum"] = json!(["keep", "switch"])
         }
-        _ => None,
-    };
-    if let Some(values) = enum_values {
-        schema["enum"] = json!(values);
-    }
-    if method == "bluetooth.device.policy.update" && property == "fast_pair_controls_enabled" {
-        schema["type"] = json!(["boolean", "null"]);
-    }
-    if method == "bluetooth.scan" && property == "timeout_ms" {
-        schema["minimum"] = json!(1_000);
-        schema["maximum"] = json!(60_000);
+        ("bluetooth.device.policy.update", "fast_pair_controls_enabled") => {
+            schema["type"] = json!(["boolean", "null"])
+        }
+        ("bluetooth.scan", "timeout_ms") => {
+            schema["minimum"] = json!(1_000);
+            schema["maximum"] = json!(60_000);
+        }
+        _ => {}
     }
 }
 

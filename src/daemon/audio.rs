@@ -33,9 +33,11 @@ async fn devices() -> Result<Vec<audio::AudioDevice>> {
         .context("PipeWire audio probe task failed")?
 }
 
-fn device_address(device: &audio::AudioDevice) -> Option<bluer::Address> {
+fn resolved_device_key(pairing: &PairingBroker, device: &audio::AudioDevice) -> Option<String> {
     match device.address.parse() {
-        Ok(address) => Some(address),
+        Ok(address) => {
+            (!device.adapter.is_empty()).then(|| pairing.device_key(&device.adapter, address))
+        }
         Err(error) => {
             tracing::warn!(pipewire_id = device.pipewire_id, %error, "PipeWire Bluetooth device has an invalid address");
             None
@@ -133,8 +135,7 @@ pub(super) async fn apply_change(
         Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
     };
     let operation = devices.into_iter().find_map(|device| {
-        let address = device_address(&device)?;
-        if device.adapter.is_empty() || pairing.device_key(&device.adapter, address) != device_key {
+        if resolved_device_key(pairing, &device).as_deref() != Some(device_key) {
             return None;
         }
         (change.select)(device_key, requested_key, device)
@@ -201,11 +202,7 @@ pub(super) async fn snapshot(pairing: &PairingBroker) -> Value {
 }
 
 fn device_snapshot(pairing: &PairingBroker, device: audio::AudioDevice) -> Option<Value> {
-    let address = device_address(&device)?;
-    if device.adapter.is_empty() {
-        return None;
-    }
-    let device_key = pairing.device_key(&device.adapter, address);
+    let device_key = resolved_device_key(pairing, &device)?;
     let active_profile_key = device
         .active_profile
         .and_then(|active| {

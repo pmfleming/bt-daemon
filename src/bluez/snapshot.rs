@@ -1,4 +1,4 @@
-use std::{collections::HashSet, time::SystemTime};
+use std::collections::HashSet;
 
 use anyhow::Result;
 use bluer::{Adapter as BluezAdapter, Device as BluezDevice};
@@ -12,6 +12,8 @@ use crate::{
         presentation_type,
     },
 };
+
+use crate::time::unix_time_ms;
 
 use super::{
     BluezBackend, BluezResultExt, CachedDevice, DISCOVERED_DEVICE_CACHE_TTL, bluez_result,
@@ -383,13 +385,6 @@ fn cached_device_view(cached: &CachedDevice) -> Device {
         device.presentation.fast_pair.as_ref(),
     );
     device
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn cache_entry_is_fresh(observed_at_ms: u64, now_ms: u64) -> bool {

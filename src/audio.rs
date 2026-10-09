@@ -262,10 +262,7 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
     let objects_for_registry = Rc::clone(&objects);
     let relevant_ids = Rc::new(RefCell::new(HashSet::new()));
     let relevant_for_global = Rc::clone(&relevant_ids);
-    let relevant_for_remove = Rc::clone(&relevant_ids);
-    let objects_for_remove = Rc::clone(&objects);
     let changes_for_global = std::sync::Arc::clone(&on_change);
-    let changes_for_remove = std::sync::Arc::clone(&on_change);
     let _listener = registry
         .add_listener_local()
         .global(move |global| {
@@ -289,10 +286,10 @@ pub fn monitor(on_change: ChangeCallback) -> Result<()> {
             }
         })
         .global_remove(move |id| {
-            if relevant_for_remove.borrow_mut().remove(&id) {
-                objects_for_remove.borrow_mut().remove(id);
+            if relevant_ids.borrow_mut().remove(&id) {
+                objects.borrow_mut().remove(id);
                 tracing::debug!(id, "PipeWire Bluetooth object removed");
-                changes_for_remove();
+                on_change();
             }
         })
         .register();

@@ -4,10 +4,10 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use bluer::{Address, AddressType};
+use bluer::Address;
 use futures::{StreamExt, stream};
 use tokio::{
     sync::{Mutex, broadcast},
@@ -23,7 +23,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const LIVE_TTL: Duration = Duration::from_secs(12);
 type Key = (String, Address);
-type Peer = (Key, u16, bool);
+type Peer = (Key, u16);
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Reading {
@@ -125,10 +125,7 @@ impl Signals {
                 rssi,
                 kind,
                 live: true,
-                last_seen_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                last_seen_ms: crate::time::unix_time_ms(),
             });
         }
         // A failed read does not refresh or destroy the last successful sample.
@@ -164,7 +161,7 @@ pub(super) async fn run(backend: &BluezBackend) {
         poll(
             &backend.link_signals,
             connected_peers(backend),
-            |index, address, _| mgmt::read(&backend.system_bus, index, address),
+            |index, address| mgmt::read(&backend.system_bus, index, address),
         )
         .await;
         // Publish ageing too, but do not rebuild snapshots forever with no peers.
@@ -199,12 +196,10 @@ async fn connected_peers(backend: &BluezBackend) -> Vec<Peer> {
             if !device.is_connected().await.unwrap_or(false) {
                 continue;
             }
-            let Ok(address_type) = device.address_type().await else {
-                continue;
-            };
+            // The privileged helper resolves and validates the address type.
             let key = (name.clone(), address);
             if backend.link_signals.lock().await.due(&key) {
-                peers.push((key, index, address_type == AddressType::LeRandom));
+                peers.push((key, index));
             }
         }
     }
@@ -214,7 +209,7 @@ async fn connected_peers(backend: &BluezBackend) -> Vec<Peer> {
 async fn poll<F>(
     signals: &Mutex<Signals>,
     peers: impl Future<Output = Vec<Peer>>,
-    read: impl Fn(u16, Address, bool) -> F + Copy,
+    read: impl Fn(u16, Address) -> F + Copy,
 ) where
     F: Future<Output = io::Result<(mgmt::Reply, bool)>>,
 {
@@ -228,12 +223,12 @@ async fn poll<F>(
             return;
         }
     };
-    stream::iter(peers).for_each_concurrent(4, |(key, index, random)| async move {
+    stream::iter(peers).for_each_concurrent(4, |(key, index)| async move {
         {
             let signals = signals.lock().await;
             if !signals.current(&key, epoch) { return; }
         }
-        let result = read(index, key.1, random).await;
+        let result = read(index, key.1).await;
         if let Err(error) = &result {
             tracing::debug!(%error, "connected RSSI helper read failed; retaining cached readings");
         }
@@ -248,7 +243,17 @@ async fn poll<F>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DISCOVERED_DEVICE_CACHE_TTL, FAILURE_BACKOFF, LIVE_TTL, POLL_INTERVAL, Peer, Signals, poll,
+        suspend,
+    };
+    use crate::model::RssiKind;
+    use bluer::Address;
+    use std::{io, time::Duration};
+    use tokio::{
+        sync::{Mutex, broadcast},
+        time::Instant,
+    };
 
     #[tokio::test(start_paused = true)]
     async fn suspend_publishes_cached_freshness_without_a_poll_or_bluez_event() {
@@ -282,9 +287,9 @@ mod tests {
 
         let mut signals = Signals::default();
         let peers: Vec<Peer> = (0..9)
-            .map(|index| ((format!("hci{index}"), Address::default()), index, false))
+            .map(|index| ((format!("hci{index}"), Address::default()), index))
             .collect();
-        for (key, _, _) in &peers {
+        for (key, _) in &peers {
             signals.accept(key.clone(), 0, Some((-60, RssiKind::Dbm)));
         }
         let signals = Mutex::new(signals);
@@ -297,7 +302,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 peers.clone()
             },
-            |_, _, _| async move {
+            |_, _| async move {
                 assert!(active.fetch_add(1, Ordering::SeqCst) < 4);
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -309,14 +314,14 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(9));
         assert_eq!(completed.load(Ordering::SeqCst), peers.len());
         let signals = signals.lock().await;
-        for (key, _, _) in &peers {
+        for (key, _) in &peers {
             let reading = signals.get(&key.0, key.1, true).unwrap();
             assert_eq!(reading.rssi, -60);
             assert!(!reading.live);
             assert!(!signals.due(key));
         }
         tokio::time::advance(FAILURE_BACKOFF).await;
-        for (key, _, _) in &peers {
+        for (key, _) in &peers {
             assert!(signals.due(key));
         }
     }
@@ -325,7 +330,7 @@ mod tests {
     async fn stalled_enumeration_is_bounded_without_starting_reads() {
         let signals = Mutex::new(Signals::default());
         let started = Instant::now();
-        poll(&signals, std::future::pending(), |_, _, _| async {
+        poll(&signals, std::future::pending(), |_, _| async {
             panic!("enumeration did not supply any peers");
         })
         .await;

@@ -1,7 +1,7 @@
 use bluer::Address;
 use std::{
     collections::HashMap,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 #[derive(Clone)]
@@ -27,10 +27,7 @@ impl Observations {
             (adapter.into(), address),
             Observation {
                 rssi,
-                last_seen_ms: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                last_seen_ms: crate::time::unix_time_ms(),
                 observed: Instant::now(),
             },
         );

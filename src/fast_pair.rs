@@ -469,7 +469,7 @@ pub struct FastPairBatteryProvider {
 }
 
 async fn run_message_stream<S>(
-    provider: Arc<FastPairBatteryProvider>,
+    provider: &Arc<FastPairBatteryProvider>,
     address: Address,
     stream: S,
 ) -> Result<()>
@@ -492,7 +492,7 @@ where
     let reads = async {
         tokio::try_join!(
             read_transport(reader, frames_tx),
-            apply_frames(Arc::clone(&provider), address, frames_rx),
+            apply_frames(provider, address, frames_rx),
         )?;
         Ok::<_, anyhow::Error>(())
     };
@@ -551,14 +551,14 @@ where
 }
 
 async fn apply_frames(
-    provider: Arc<FastPairBatteryProvider>,
+    provider: &Arc<FastPairBatteryProvider>,
     address: Address,
     mut frames: mpsc::Receiver<Frame>,
 ) -> Result<()> {
     while let Some(frame) = frames.recv().await {
         // An unsupported/malformed extension message must not tear down an
         // otherwise healthy battery stream and trigger reconnect churn.
-        if let Err(error) = apply_frame(&provider, address, frame).await {
+        if let Err(error) = apply_frame(provider, address, frame).await {
             tracing::warn!(%address, %error, "ignored invalid Fast Pair message");
         }
     }
@@ -572,7 +572,7 @@ async fn apply_frame(
 ) -> Result<()> {
     match (frame.group, frame.code) {
         (DEVICE_INFORMATION_GROUP, _) => {
-            apply_device_information(provider, address, frame.code, &frame.payload).await
+            apply_device_information(provider, address, frame.code, &frame.payload).await?;
         }
         (AUDIO_SWITCH_GROUP, GET_AUDIO_SWITCH_CAPABILITY_CODE) => {
             let worker = Arc::clone(provider);
@@ -582,19 +582,14 @@ async fn apply_frame(
                     tracing::debug!(%address, %error, "Audio Switch seeker capability unavailable");
                 }
             });
-            Ok(())
         }
         (AUDIO_SWITCH_GROUP, 0x32) => {
             let mut event = audio_switch::decode_switch(&frame.payload)?;
-            event.observed_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            event.observed_at_ms = crate::time::unix_time_ms();
             tracing::info!(%address, reason = %event.reason, target = %event.target, "Fast Pair audio switched");
             provider
                 .update_runtime(address, event, |state| &mut state.last_switch)
                 .await;
-            Ok(())
         }
         (AUDIO_SWITCH_GROUP, AUDIO_SWITCH_CAPABILITY_CODE) => {
             let capability = decode_audio_switch_capability(&frame.payload)?;
@@ -613,24 +608,21 @@ async fn apply_frame(
             provider
                 .update_runtime(address, capability, |state| &mut state.multipoint)
                 .await;
-            Ok(())
         }
         (HEARABLE_CONTROLS_GROUP, ANC_STATE_CODE) => {
             let noise_control = decode_anc_state(&frame.payload)?;
             provider
                 .update_runtime(address, noise_control, |state| &mut state.noise_control)
                 .await;
-            Ok(())
         }
         (ACKNOWLEDGEMENT_GROUP, _) => {
             apply_acknowledgement(provider, address, frame.code, &frame.payload).await;
-            Ok(())
         }
         _ => {
             tracing::trace!(%address, group = frame.group, code = frame.code, "ignored Fast Pair frame");
-            Ok(())
         }
     }
+    Ok(())
 }
 
 async fn apply_device_information(
@@ -1015,10 +1007,10 @@ impl FastPairBatteryProvider {
     }
 
     pub async fn provision_from_catalog(&self, adapter: &Adapter, device: &Device) -> Result<()> {
-        let runtime = self
+        let (model_id, _) = self
             .wait_for_provisioning_metadata(device.address())
             .await?;
-        let model = runtime.model_id.as_ref().and_then(|id| self.catalog.get(id))
+        let model = self.catalog.get(&model_id)
             .context("trusted Fast Pair model metadata is missing; configure /etc/bluetooth/fast-pair-models.json")?;
         self.provision_account_key(adapter, device, &model.anti_spoofing_public_key)
             .await
@@ -1038,14 +1030,10 @@ impl FastPairBatteryProvider {
         if !uuids.contains(&self.uuids.message_stream) && !uuids.contains(&self.uuids.service) {
             return Ok(());
         }
-        let runtime = self
+        let (model_id, _) = self
             .wait_for_provisioning_metadata(device.address())
             .await?;
-        if let Some(model) = runtime
-            .model_id
-            .as_ref()
-            .and_then(|id| self.catalog.get(id))
-        {
+        if let Some(model) = self.catalog.get(&model_id) {
             self.provision_account_key(adapter, device, &model.anti_spoofing_public_key)
                 .await?;
         }
@@ -1138,10 +1126,10 @@ impl FastPairBatteryProvider {
                 .is_some_and(|start| start.elapsed() < Duration::from_secs(60)),
             "Fast Pair retroactive provisioning requires pairing within the last minute; re-pair the device"
         );
-        let runtime = self
+        let (model_id, ble_address) = self
             .wait_for_provisioning_metadata(device.address())
             .await?;
-        let ble_address = runtime.ble_address.unwrap_or_else(|| device.address());
+        let ble_address = ble_address.unwrap_or_else(|| device.address());
         let ble_device = resolve_ble_device(adapter, ble_address).await?;
         let (pairing, account_key_characteristic) =
             provisioning_characteristics(&ble_device, self.uuids).await?;
@@ -1161,24 +1149,27 @@ impl FastPairBatteryProvider {
         self.account_keys.insert(device_key, account_key)?;
         tracing::info!(
             address = %device.address(),
-            model_id = %runtime.model_id.map(hex::encode).unwrap_or_default(),
+            model_id = %hex::encode(model_id),
             "Fast Pair account key provisioned"
         );
         let _ = self.changes.send(());
         Ok(())
     }
 
-    async fn wait_for_provisioning_metadata(&self, address: Address) -> Result<RuntimeReport> {
+    async fn wait_for_provisioning_metadata(
+        &self,
+        address: Address,
+    ) -> Result<([u8; 3], Option<Address>)> {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                if let Some(runtime) = self
+                if let Some(metadata) = self
                     .runtime
                     .read()
                     .await
                     .get(&address)
-                    .filter(|runtime| runtime.model_id.is_some())
+                    .and_then(|runtime| Some((runtime.model_id?, runtime.ble_address)))
                 {
-                    return runtime.clone();
+                    return metadata;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1271,7 +1262,7 @@ impl FastPairBatteryProvider {
             tracing::info!(%address, %transport, "Fast Pair battery stream started");
             let result = crate::task::catch(
                 "Fast Pair message stream",
-                run_message_stream(Arc::clone(&provider), address, stream),
+                run_message_stream(&provider, address, stream),
             )
             .await;
             if let Err(error) = result {
