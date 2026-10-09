@@ -9,7 +9,10 @@ use std::{
 
 use bluer::{Address, AddressType};
 use futures::{StreamExt, stream};
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::{Mutex, broadcast},
+    time::Instant,
+};
 
 use super::{BluezBackend, DISCOVERED_DEVICE_CACHE_TTL};
 use crate::model::RssiKind;
@@ -72,7 +75,7 @@ impl Signals {
         }
     }
 
-    pub fn suspend(&mut self) {
+    fn suspend(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         for entry in self.entries.values_mut() {
             entry.succeeded = false;
@@ -132,6 +135,13 @@ impl Signals {
         }
         // A failed read does not refresh or destroy the last successful sample.
     }
+}
+
+pub(super) async fn suspend(signals: &Mutex<Signals>, changes: &broadcast::Sender<()>) {
+    signals.lock().await.suspend();
+    // The polling monitor pauses during sleep. Publish invalidation now, without
+    // waiting for a BlueZ event or runtime-state persistence to trigger a refresh.
+    let _ = changes.send(());
 }
 
 pub(super) async fn run(backend: &BluezBackend) {
@@ -241,6 +251,32 @@ async fn poll<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn suspend_publishes_cached_freshness_without_a_poll_or_bluez_event() {
+        let key = ("hci0".into(), Address::default());
+        let mut signals = Signals::default();
+        let epoch = signals.begin_poll();
+        signals.accept(key.clone(), epoch, Some((0, RssiKind::BrEdrRelative)));
+        let before = signals.get(&key.0, key.1, true).unwrap();
+        assert!(before.live);
+        let signals = Mutex::new(signals);
+        let (changes, mut events) = broadcast::channel(4);
+        let started = Instant::now();
+
+        suspend(&signals, &changes).await;
+
+        // No timer, hardware event or snapshot request drives this notification.
+        assert_eq!(events.try_recv(), Ok(()));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let mut signals = signals.lock().await;
+        signals.accept(key.clone(), epoch, Some((-42, RssiKind::Dbm)));
+        let after = signals.get(&key.0, key.1, true).unwrap();
+        assert!(!after.live);
+        assert_eq!(after.rssi, before.rssi);
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.last_seen_ms, before.last_seen_ms);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn slow_enumeration_and_multiple_batches_record_every_failure() {

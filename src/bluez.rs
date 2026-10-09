@@ -188,7 +188,7 @@ impl BluezBackend {
                 .context("decode logind sleep event")?;
             self.sleeping.send_replace(sleeping);
             if sleeping {
-                self.link_signals.lock().await.suspend();
+                link_signal::suspend(&self.link_signals, &self.changes).await;
                 self.remember_runtime_state().await;
             } else if let Err(error) = self.restore_runtime_state().await {
                 tracing::warn!(%error, "could not restore Bluetooth state after resume");
