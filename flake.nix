@@ -16,10 +16,7 @@
       daemonFramework,
     }:
     let
-      systems = [
-        "x86_64-linux"
-        "aarch64-linux"
-      ];
+      systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
     in
     {
@@ -79,7 +76,7 @@
             meta = {
               description = "BlueZ policy and bt-api daemon for Shelllist";
               mainProgram = "bt-daemon";
-              platforms = pkgs.lib.platforms.linux;
+              platforms = systems;
             };
           };
         in
