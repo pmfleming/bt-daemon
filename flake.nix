@@ -16,7 +16,10 @@
       daemonFramework,
     }:
     let
-      systems = [ "x86_64-linux" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
     in
     {
@@ -104,28 +107,26 @@
       devShells = forAllSystems (
         system: pkgs: {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              bluez
-              cargo
-              cargo-audit
-              cargo-llvm-cov
-              cargo-mutants
-              clippy
-              dbus
-              gcc
-              jq
-              just
-              llvmPackages.libclang
-              llvmPackages.llvm
-              pkg-config
-              pipewire
-              python3
-              rust-analyzer
-              rustc
-              rustfmt
-              systemd
-              wireplumber
-            ];
+            packages =
+              (daemonFramework.lib.toolchain pkgs).packages
+              ++ (with pkgs; [
+                bluez
+                cargo-audit
+                cargo-llvm-cov
+                cargo-mutants
+                dbus
+                gcc
+                jq
+                just
+                llvmPackages.libclang
+                llvmPackages.llvm
+                pkg-config
+                pipewire
+                python3
+                rust-analyzer
+                systemd
+                wireplumber
+              ]);
 
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";

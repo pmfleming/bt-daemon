@@ -29,8 +29,8 @@ tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-m
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-zbus = { version = "5", features = ["tokio"] }
-zvariant = "5"
+zbus = { version = "5.18", features = ["tokio"] }
+zvariant = "5.13.1"
 
 [[test]]
 name = "session_recovery"
