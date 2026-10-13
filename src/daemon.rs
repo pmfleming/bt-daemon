@@ -37,6 +37,7 @@ pub(super) enum SharedSnapshot {
 
 /// Owns request coordinators and cached snapshots shared by session-bus clients.
 pub struct BluetoothDaemon {
+    boundary: shelllist_daemon_tokio::ServiceBoundary,
     backend: Arc<dyn BluetoothBackend>,
     pairing: Arc<PairingBroker>,
     subscriptions: Arc<OwnedTaskRegistry>,
@@ -188,6 +189,14 @@ impl BluetoothDaemon {
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> String {
+        let admitted =
+            match self
+                .boundary
+                .call(header.sender().map(|s| s.as_str()), method, params_json)
+            {
+                Ok(admitted) => admitted,
+                Err(response) => return response,
+            };
         tracing::info!(%method, "D-Bus request received");
         let params = match serde_json::from_str(params_json) {
             Ok(params) => params,
@@ -204,7 +213,7 @@ impl BluetoothDaemon {
             .dispatch_call(method, params, owner, Some(connection))
             .await;
         api::log_response(method, &response);
-        response.to_string()
+        admitted.encode(&response)
     }
 
     async fn subscribe(
@@ -213,6 +222,13 @@ impl BluetoothDaemon {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> String {
+        let admitted = match self
+            .boundary
+            .subscribe(header.sender().map(|s| s.as_str()), &streams)
+        {
+            Ok(admitted) => admitted,
+            Err(response) => return response,
+        };
         let Some(sender) = header.sender().map(|sender| sender.to_owned()) else {
             return api::error(
                 "subscription-unavailable",
@@ -220,12 +236,19 @@ impl BluetoothDaemon {
             )
             .to_string();
         };
-        subscription::start(self, streams, sender, emitter).await
+        admitted.encoded(subscription::start(self, streams, sender, emitter).await)
     }
 
     async fn cancel(&self, request_id: &str, #[zbus(header)] header: Header<'_>) -> String {
+        let admitted = match self
+            .boundary
+            .cancel(header.sender().map(|s| s.as_str()), request_id)
+        {
+            Ok(admitted) => admitted,
+            Err(response) => return response,
+        };
         let owner = header.sender().map(ToString::to_string);
-        self.cancel_owned(request_id, owner.as_deref()).await
+        admitted.encoded(self.cancel_owned(request_id, owner.as_deref()).await)
     }
 
     #[zbus(signal)]
@@ -258,6 +281,12 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         .serve_at(
             OBJECT_PATH,
             BluetoothDaemon {
+                boundary: shelllist_daemon_tokio::ServiceBoundary::new(
+                    shelllist_daemon_core::ApiIdentity::new(
+                        protocol::NAME,
+                        protocol::VERSION as u32,
+                    ),
+                ),
                 backend: Arc::clone(&backend),
                 pairing: Arc::clone(&pairing),
                 subscriptions: Arc::clone(&subscriptions),

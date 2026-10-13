@@ -175,6 +175,12 @@ fn daemon(
         watch::channel(json!({ "ok": true, "data": { "audio_devices": [] } }));
     (
         BluetoothDaemon {
+            boundary: shelllist_daemon_tokio::ServiceBoundary::new(
+                shelllist_daemon_core::ApiIdentity::new(
+                    crate::protocol::NAME,
+                    crate::protocol::VERSION as u32,
+                ),
+            ),
             backend,
             pairing: PairingBroker::new(DeviceIdentityRegistry::in_memory()),
             subscriptions: Arc::new(shelllist_daemon_tokio::OwnedTaskRegistry::default()),
