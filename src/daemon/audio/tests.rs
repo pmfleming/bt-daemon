@@ -1,9 +1,10 @@
-use super::{device_snapshot, select_default, select_profile};
+use super::{device_snapshot, select_default};
 use crate::{
     audio::{self, AudioDevice, AudioEndpoint, AudioProfile},
     identity::DeviceIdentityRegistry,
     pairing::PairingBroker,
 };
+use serde_json::json;
 
 fn device() -> AudioDevice {
     AudioDevice {
@@ -49,6 +50,17 @@ fn snapshots_expose_only_resolvable_opaque_devices_and_endpoint_readiness() {
     assert!(value["source"].is_null());
     assert!(!value.to_string().contains("AA:BB:CC:DD:EE:FF"));
     assert!(!value.to_string().contains("private-pipewire-node"));
+    let profile = value["active_profile_key"].as_str().unwrap();
+    assert!(super::select_profile(&key, profile, device()).is_some());
+    assert!(super::select_profile("other-device", profile, device()).is_none());
+    let sink = value["sink"]["key"].as_str().unwrap();
+    assert!(select_default(&key, sink, device()).is_some());
+    assert!(select_default("other-device", sink, device()).is_none());
+    assert!(select_default(&key, &audio::endpoint_key(&key, "source"), device()).is_none());
+
+    let mut source = device();
+    source.source = source.sink.take();
+    assert!(select_default(&key, &audio::endpoint_key(&key, "source"), source).is_some());
 
     let mut input = device();
     input.address = "not-an-address".into();
@@ -75,76 +87,47 @@ fn snapshots_expose_only_resolvable_opaque_devices_and_endpoint_readiness() {
     }
 }
 
-#[tokio::test]
-async fn audio_changes_validate_their_own_parameter_before_probing() {
-    let pairing = PairingBroker::new(DeviceIdentityRegistry::in_memory());
-    for change in [super::DEFAULT, super::PROFILE] {
-        let parameter = change.parameter;
-        let result = super::apply_change(
-            &pairing,
-            &serde_json::json!({"device_key": "peer"}),
-            change,
-            |_, _| Ok(()),
-        )
-        .await;
-        assert_eq!(result["error"]["code"], "validation-error");
-        assert!(
-            result["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(parameter)
-        );
-    }
-}
-
 #[test]
-fn remember_is_validated_before_audio_effects() {
-    use serde_json::json;
-    for change in [super::PROFILE, super::DEFAULT] {
-        let mut params = json!({"device_key": "peer", change.parameter: "selection"});
-        assert_eq!(
-            change.request(&params).unwrap(),
-            ("peer", "selection", false)
+fn applied_profiles_report_effect_persistence_and_refresh_failures_independently() {
+    assert!(
+        super::PROFILE
+            .request(&json!({"device_key": "peer", "profile_key": "selection", "remember": true}))
+            .unwrap()
+            .2
+    );
+    for (apply_ok, persist_ok) in [(false, true), (true, false), (true, true)] {
+        let mut persisted = false;
+        let result = super::apply_then_remember(
+            || {
+                anyhow::ensure!(apply_ok, "unavailable");
+                Ok(())
+            },
+            || {
+                persisted = true;
+                anyhow::ensure!(persist_ok, "disk full");
+                Ok(())
+            },
         );
-        for invalid in [json!(null), json!("true"), json!(1)] {
-            params["remember"] = invalid;
+        assert_eq!(persisted, apply_ok);
+        assert_eq!(result.is_ok(), apply_ok);
+        let Ok(error) = result else {
+            continue;
+        };
+        assert_eq!(error.as_deref(), (!persist_ok).then_some("disk full"));
+        for snapshot in [
+            crate::api::success(json!({"audio_devices": []})),
+            crate::api::error("audio-unavailable", "offline".into()),
+        ] {
             assert_eq!(
-                change.request(&params).unwrap_err().to_string(),
-                "remember must be a boolean on setProfile"
+                super::applied_response(snapshot.clone(), false, None),
+                snapshot
             );
-        }
-        for remember in [false, true] {
-            params["remember"] = json!(remember);
-            if change.parameter == "profile_key" {
-                assert_eq!(
-                    change.request(&params).unwrap(),
-                    ("peer", "selection", remember)
-                );
-            } else {
-                assert!(change.request(&params).is_err());
-            }
-        }
-    }
-}
-
-#[test]
-fn applied_profiles_report_persistence_and_refresh_failures_independently() {
-    use serde_json::json;
-    for snapshot in [
-        crate::api::success(json!({"audio_devices": []})),
-        crate::api::error("audio-unavailable", "offline".into()),
-    ] {
-        assert_eq!(
-            super::applied_response(snapshot.clone(), false, None),
-            snapshot
-        );
-        for error in [None, Some("disk full".to_string())] {
             let response = super::applied_response(snapshot.clone(), true, error.clone());
             assert_eq!(response["ok"], true);
             assert_eq!(
                 response["data"]["profile_outcome"],
                 json!({
-                    "applied": true, "remembered": error.is_none(), "persistence_error": error
+                    "applied": true, "remembered": persist_ok, "persistence_error": error
                 })
             );
             if snapshot["ok"] == true {
@@ -155,42 +138,4 @@ fn applied_profiles_report_persistence_and_refresh_failures_independently() {
             }
         }
     }
-}
-
-#[test]
-fn apply_and_remember_preserves_partial_outcomes() {
-    assert!(
-        super::apply_then_remember(
-            || anyhow::bail!("unavailable"),
-            || panic!("must not persist")
-        )
-        .is_err()
-    );
-    assert_eq!(
-        super::apply_then_remember(|| Ok(()), || anyhow::bail!("disk full"))
-            .unwrap()
-            .as_deref(),
-        Some("disk full")
-    );
-    assert_eq!(
-        super::apply_then_remember(|| Ok(()), || Ok(())).unwrap(),
-        None
-    );
-}
-
-#[test]
-fn selection_checks_availability_and_device_scoped_keys_without_running_hardware_operations() {
-    let key = "device-key";
-    let profile = audio::profile_key(key, "a2dp-sink");
-    assert!(select_profile(key, &profile, device()).is_some());
-    assert!(select_profile("other-device", &profile, device()).is_none());
-    let mut unavailable = device();
-    unavailable.profiles[0].available = false;
-    assert!(select_profile(key, &profile, unavailable).is_none());
-    assert!(select_default(key, &audio::endpoint_key(key, "sink"), device()).is_some());
-    assert!(select_default(key, &audio::endpoint_key(key, "source"), device()).is_none());
-    assert!(select_default("other-device", &audio::endpoint_key(key, "sink"), device()).is_none());
-    let mut source = device();
-    source.source = source.sink.take();
-    assert!(select_default(key, &audio::endpoint_key(key, "source"), source).is_some());
 }

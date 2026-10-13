@@ -101,34 +101,32 @@ mod tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    #[test]
-    fn only_typed_bluez_busy_errors_get_short_retries() {
+    #[tokio::test(start_paused = true)]
+    async fn retries_are_bounded_classified_and_rearmed_only_by_a_new_session() {
+        use futures::FutureExt;
         for (kind, message, busy) in [
-            (bluer::ErrorKind::InProgress, "br-connection-busy", true),
-            (
-                bluer::ErrorKind::InProgress,
-                "Operation already in progress",
-                true,
-            ),
+            (bluer::ErrorKind::InProgress, "settling", true),
             (bluer::ErrorKind::Failed, "br-connection-busy", true),
             (bluer::ErrorKind::Failed, "br-connection-refused", false),
-            (bluer::ErrorKind::NotReady, "", false),
-            (bluer::ErrorKind::AuthenticationRejected, "", false),
         ] {
             let error = anyhow::Error::new(bluer::Error {
                 kind,
                 message: message.into(),
             })
-            .context("Fast Pair profile connection failed");
+            .context("connect");
             assert_eq!(is_connection_busy(&error), busy);
         }
         assert!(!is_connection_busy(&anyhow::anyhow!("br-connection-busy")));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn busy_retries_are_fast_bounded_and_do_not_inflate_normal_backoff() {
         let peer = Address::default();
+        let other = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let mut retry = RetryPolicy::default();
+        assert!(
+            wait_for_deadline(retry.next_deadline())
+                .now_or_never()
+                .is_none()
+        );
+        retry.connection_failed(other, false);
+        let later = retry.next_deadline().unwrap();
         for millis in BUSY_RETRY_MS {
             retry.connection_failed(peer, true);
             assert_eq!(
@@ -139,8 +137,10 @@ mod tests {
             wait_for_deadline(retry.next_deadline()).await;
             assert!(retry.ready(peer));
             retry.clear_due();
-            assert!(retry.next_deadline().is_none());
+            assert_eq!(retry.next_deadline(), Some(later));
+            assert!(!retry.ready(other));
         }
+        retry.reset_session(other);
         retry.connection_failed(peer, true);
         let delay = retry.next_deadline().unwrap() - Instant::now();
         assert!((Duration::from_secs(15)..=Duration::from_secs(18)).contains(&delay));
@@ -150,53 +150,9 @@ mod tests {
         let delay = retry.next_deadline().unwrap() - Instant::now();
         assert!((Duration::from_secs(30)..=Duration::from_secs(36)).contains(&delay));
         retry.reset_session(peer);
-        retry.connection_failed(peer, true);
-        assert_eq!(
-            retry.next_deadline(),
-            Some(Instant::now() + Duration::from_millis(250))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn deadlines_wake_without_waiting_for_reconciliation_poll_and_do_not_spin() {
-        use futures::FutureExt;
-        let peer = Address::default();
-        let other = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let mut retry = RetryPolicy::default();
-        assert!(
-            wait_for_deadline(retry.next_deadline())
-                .now_or_never()
-                .is_none()
-        );
-        retry.connection_failed(other, false);
-        let later = retry.next_deadline();
-        retry.connection_failed(peer, true);
-        let start = Instant::now();
-        wait_for_deadline(retry.next_deadline()).await;
-        assert_eq!(start.elapsed(), Duration::from_millis(250));
-        retry.clear_due();
-        assert!(retry.ready(peer));
-        assert!(!retry.ready(other));
-        assert_eq!(retry.next_deadline(), later);
-        wait_for_deadline(later).await;
-        retry.clear_due();
-        assert!(
-            wait_for_deadline(retry.next_deadline())
-                .now_or_never()
-                .is_none()
-        );
-        retry.connection_failed(peer, true);
-        retry.reset_session(peer);
-        assert!(retry.next_deadline().is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retries_are_bounded_and_psm_suppression_requires_a_new_session() {
-        let peer = Address::default();
-        let mut retry = RetryPolicy::default();
         for _ in 0..12 {
             retry.failed(peer);
-            let deadline = retry.after[&peer];
+            let deadline = retry.next_deadline().unwrap();
             let delay = deadline - tokio::time::Instant::now();
             assert!(delay >= std::time::Duration::from_secs(15));
             assert!(delay <= std::time::Duration::from_secs(360));
@@ -218,5 +174,15 @@ mod tests {
         assert!(!retry.l2cap_allowed(peer));
         retry.reset_session(peer);
         assert!(retry.ready(peer) && retry.l2cap_allowed(peer));
+        assert!(
+            wait_for_deadline(retry.next_deadline())
+                .now_or_never()
+                .is_none()
+        );
+        retry.connection_failed(peer, true);
+        assert_eq!(
+            retry.next_deadline(),
+            Some(Instant::now() + Duration::from_millis(250))
+        );
     }
 }

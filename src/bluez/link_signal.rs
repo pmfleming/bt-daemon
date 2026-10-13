@@ -14,7 +14,7 @@ use tokio::{
     time::Instant,
 };
 
-use super::{BluezBackend, DISCOVERED_DEVICE_CACHE_TTL};
+use super::{BluezBackend, CACHE_TTL};
 use crate::model::RssiKind;
 
 use crate::rssi_helper::client as mgmt;
@@ -52,7 +52,7 @@ impl Signals {
     pub fn get(&self, adapter: &str, address: Address, connected: bool) -> Option<Reading> {
         let entry = self.entries.get(&(adapter.into(), address))?;
         let mut reading = entry.reading?;
-        if entry.observed.elapsed() > DISCOVERED_DEVICE_CACHE_TTL {
+        if entry.observed.elapsed() > CACHE_TTL {
             return None;
         }
         reading.live = connected && entry.succeeded && entry.observed.elapsed() <= LIVE_TTL;
@@ -151,10 +151,10 @@ pub(super) async fn run(backend: &BluezBackend) {
             let mut signals = backend.link_signals.lock().await;
             let had_entries = !signals.entries.is_empty();
             signals.entries.retain(|_, entry| {
-                if entry.observed.elapsed() > DISCOVERED_DEVICE_CACHE_TTL {
+                if entry.observed.elapsed() > CACHE_TTL {
                     entry.reading = None;
                 }
-                entry.attempted.elapsed() <= DISCOVERED_DEVICE_CACHE_TTL
+                entry.attempted.elapsed() <= CACHE_TTL
             });
             had_entries
         };
@@ -223,29 +223,38 @@ async fn poll<F>(
             return;
         }
     };
-    stream::iter(peers).for_each_concurrent(4, |(key, index)| async move {
-        {
-            let signals = signals.lock().await;
-            if !signals.current(&key, epoch) { return; }
-        }
-        let result = read(index, key.1).await;
-        if let Err(error) = &result {
+    stream::iter(peers)
+        .for_each_concurrent(4, |peer| poll_peer(signals, epoch, peer, read))
+        .await;
+}
+
+async fn poll_peer<F>(
+    signals: &Mutex<Signals>,
+    epoch: u64,
+    (key, index): Peer,
+    read: impl FnOnce(u16, Address) -> F,
+) where
+    F: Future<Output = io::Result<(mgmt::Reply, bool)>>,
+{
+    if !signals.lock().await.current(&key, epoch) {
+        return;
+    }
+    let reading = match read(index, key.1).await {
+        Ok((mgmt::Reply::Reading(rssi), true)) => Some((rssi, RssiKind::BrEdrRelative)),
+        Ok((mgmt::Reply::Reading(rssi), false)) => Some((rssi, RssiKind::Dbm)),
+        Ok(_) => None,
+        Err(error) => {
             tracing::debug!(%error, "connected RSSI helper read failed; retaining cached readings");
+            None
         }
-        let reading = match result {
-            Ok((mgmt::Reply::Reading(rssi), relative)) => Some((rssi, if relative { RssiKind::BrEdrRelative } else { RssiKind::Dbm })),
-            _ => None,
-        };
-        let mut signals = signals.lock().await;
-        signals.accept(key, epoch, reading);
-    }).await;
+    };
+    signals.lock().await.accept(key, epoch, reading);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DISCOVERED_DEVICE_CACHE_TTL, FAILURE_BACKOFF, LIVE_TTL, POLL_INTERVAL, Peer, Signals, poll,
-        suspend,
+        CACHE_TTL, FAILURE_BACKOFF, LIVE_TTL, POLL_INTERVAL, Peer, Signals, poll, suspend,
     };
     use crate::model::RssiKind;
     use bluer::Address;
@@ -282,8 +291,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slow_enumeration_and_multiple_batches_record_every_failure() {
+    async fn enumeration_is_bounded_and_multiple_batches_record_every_failure() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let empty = Mutex::new(Signals::default());
+        let start = Instant::now();
+        poll(&empty, std::future::pending(), |_, _| async {
+            panic!("enumeration did not supply any peers");
+        })
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(4));
 
         let mut signals = Signals::default();
         let peers: Vec<Peer> = (0..9)
@@ -324,18 +341,6 @@ mod tests {
         for (key, _) in &peers {
             assert!(signals.due(key));
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stalled_enumeration_is_bounded_without_starting_reads() {
-        let signals = Mutex::new(Signals::default());
-        let started = Instant::now();
-        poll(&signals, std::future::pending(), |_, _| async {
-            panic!("enumeration did not supply any peers");
-        })
-        .await;
-        assert_eq!(started.elapsed(), Duration::from_secs(4));
-        assert!(signals.lock().await.entries.is_empty());
     }
 
     #[tokio::test]
@@ -411,7 +416,7 @@ mod tests {
         signals.accept(key.clone(), epoch, Some((-42, RssiKind::Dbm)));
         tokio::time::advance(LIVE_TTL + Duration::from_millis(1)).await;
         assert!(!signals.get("hci0", address, true).unwrap().live);
-        tokio::time::advance(DISCOVERED_DEVICE_CACHE_TTL).await;
+        tokio::time::advance(CACHE_TTL).await;
         assert!(signals.get("hci0", address, true).is_none());
         // Helper/authorization failures back off, but must recover without a
         // session daemon restart after installation or an active-session change.

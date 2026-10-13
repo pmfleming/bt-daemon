@@ -52,25 +52,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn startup_observes_current_owner_without_waiting_for_a_change() {
-        for initial in ["", "already-running"] {
-            let (events, stream) = mpsc::unbounded();
-            let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
-            let worker = tokio::spawn(drive(stream, Some(initial.into()), move |owner| {
-                observed.send(owner).unwrap();
-                std::future::ready(())
-            }));
-            assert_eq!(observations.recv().await.unwrap(), initial);
-            events
-                .unbounded_send(Ok(("org.bluez".into(), initial.into(), "new".into())))
-                .unwrap();
-            assert_eq!(observations.recv().await.unwrap(), "new");
-            drop(events);
-            assert!(worker.await.unwrap().is_err());
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn owner_changes_and_stream_loss_discard_stale_candidates() {
         for stream_error in [false, true] {

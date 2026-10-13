@@ -195,35 +195,62 @@ mod tests {
             self.call("audio").await
         }
     }
-    fn plan(operation: DeviceOperation) -> Plan {
-        let store = ManagementStore::in_memory();
-        let policy = store
-            .update_device_policy("peer", &json!({"audio_route_on_connect":"switch"}))
-            .unwrap();
-        Plan::new(operation, &json!({}), &policy).unwrap()
-    }
-
     #[tokio::test]
     async fn effects_follow_policy_and_stop_on_failure_or_cancellation() {
-        for (op, expected) in [
-            (DeviceOperation::Pair, vec!["power", "operation", "audio"]),
+        let store = ManagementStore::in_memory();
+        assert!(
+            Plan::new(
+                DeviceOperation::Pair,
+                &json!({"power_on":"yes"}),
+                &store.device_policy("peer")
+            )
+            .is_err()
+        );
+        for (op, params, policy, expected) in [
             (
-                DeviceOperation::Connect,
+                DeviceOperation::Pair,
+                json!({}),
+                json!({"audio_route_on_connect":"switch"}),
                 vec!["power", "operation", "audio"],
             ),
-            (DeviceOperation::Remove, vec!["revoke", "operation"]),
-            (DeviceOperation::Disconnect, vec!["operation"]),
-            (DeviceOperation::SetTrusted, vec!["operation"]),
+            (
+                DeviceOperation::Connect,
+                json!({"power_on":false}),
+                json!({}),
+                vec!["check-power", "operation"],
+            ),
+            (
+                DeviceOperation::Connect,
+                json!({}),
+                json!({"preferred_audio_profile_key":"opaque-profile"}),
+                vec!["power", "operation", "audio"],
+            ),
+            (
+                DeviceOperation::Remove,
+                json!({}),
+                json!({"audio_route_on_connect":"switch"}),
+                vec!["revoke", "operation"],
+            ),
+            (
+                DeviceOperation::Disconnect,
+                json!({}),
+                json!({}),
+                vec!["operation"],
+            ),
         ] {
+            let policy = ManagementStore::in_memory()
+                .update_device_policy("peer", &policy)
+                .unwrap();
+            let plan = || Plan::new(op, &params, &policy).unwrap();
             let successful = Fake::default();
-            execute(&successful, plan(op)).await.unwrap();
+            execute(&successful, plan()).await.unwrap();
             assert_eq!(*successful.calls.lock().unwrap(), expected);
             for (i, stage) in expected.iter().enumerate() {
                 let fake = Fake {
                     fail: Some(stage),
                     ..Fake::default()
                 };
-                let error = execute(&fake, plan(op)).await.unwrap_err();
+                let error = execute(&fake, plan()).await.unwrap_err();
                 assert_eq!(
                     error.downcast_ref::<BackendError>().unwrap().kind,
                     BackendErrorKind::DeviceUnavailable
@@ -233,53 +260,8 @@ mod tests {
                     block: Some(stage),
                     ..Fake::default()
                 };
-                assert!(execute(&cancelled, plan(op)).now_or_never().is_none());
+                assert!(execute(&cancelled, plan()).now_or_never().is_none());
                 assert_eq!(*cancelled.calls.lock().unwrap(), expected[..=i]);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn connection_policy_honors_audio_preferences_and_power_overrides() {
-        let policy = ManagementStore::in_memory().device_policy("peer");
-        let fake = Fake::default();
-        execute(
-            &fake,
-            Plan::new(
-                DeviceOperation::Connect,
-                &json!({"power_on":false}),
-                &policy,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(*fake.calls.lock().unwrap(), ["check-power", "operation"]);
-        assert!(Plan::new(DeviceOperation::Pair, &json!({"power_on":"yes"}), &policy).is_err());
-        for route in ["keep", "switch"] {
-            for profile in [None, Some("opaque-profile")] {
-                let store = ManagementStore::in_memory();
-                let policy = store
-                    .update_device_policy(
-                        "peer",
-                        &json!({
-                            "audio_route_on_connect": route,
-                            "preferred_audio_profile_key": profile,
-                        }),
-                    )
-                    .unwrap();
-                let expected = route == "switch" || profile.is_some();
-                for op in [DeviceOperation::Connect, DeviceOperation::Pair] {
-                    assert_eq!(
-                        Plan::new(op, &json!({}), &policy).unwrap().route_audio,
-                        expected
-                    );
-                }
-                assert!(
-                    !Plan::new(DeviceOperation::Remove, &json!({}), &policy)
-                        .unwrap()
-                        .route_audio
-                );
             }
         }
     }

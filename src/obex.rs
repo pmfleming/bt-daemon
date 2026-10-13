@@ -82,14 +82,18 @@ impl ObexEvent {
         }
     }
 
-    pub(crate) fn updated(&self, update: &TransferUpdate) -> Self {
-        Self {
-            event: lifecycle_event(&update.status).into(),
-            status: update.status.clone(),
-            transferred: update.transferred,
-            size: update.size,
-            ..self.clone()
-        }
+    fn updated(&self, update: &TransferUpdate) -> Self {
+        let mut event = self.clone();
+        lifecycle_event(&update.status).clone_into(&mut event.event);
+        event.status.clone_from(&update.status);
+        event.transferred = update.transferred;
+        event.size = update.size;
+        event
+    }
+
+    pub(crate) fn publish(&self, update: &TransferUpdate, events: &broadcast::Sender<Self>) {
+        tracing::debug!(request_id = %self.request_id, status = %update.status, transferred = update.transferred, size = update.size, "OBEX transfer status changed");
+        let _ = events.send(self.updated(update));
     }
 
     pub(crate) fn failed(mut self, error: JsonValue) -> Self {
@@ -165,10 +169,6 @@ enum AuthorizationDecision {
     Cancel,
 }
 
-struct PendingAuthorization {
-    sender: oneshot::Sender<AuthorizationDecision>,
-}
-
 struct IncomingAuthorization {
     connection: zbus::Connection,
     transfer_path: OwnedObjectPath,
@@ -205,7 +205,7 @@ pub struct IncomingBroker {
     sequence: AtomicU64,
     available: AtomicBool,
     connection: OnceLock<zbus::Connection>,
-    pending: StdMutex<HashMap<String, PendingAuthorization>>,
+    pending: StdMutex<HashMap<String, oneshot::Sender<AuthorizationDecision>>>,
     cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
 }
 
@@ -246,7 +246,7 @@ impl IncomingBroker {
         } else {
             AuthorizationDecision::Reject
         };
-        let _ = pending.sender.send(decision);
+        let _ = pending.send(decision);
         Ok(())
     }
 
@@ -258,7 +258,7 @@ impl IncomingBroker {
             .remove(request_id)
         {
             tracing::info!(%request_id, "cancelling pending incoming OBEX authorization");
-            let _ = pending.sender.send(AuthorizationDecision::Cancel);
+            let _ = pending.send(AuthorizationDecision::Cancel);
             return true;
         }
         if let Some(cancel) = self.cancellations.lock().await.remove(request_id) {
@@ -276,18 +276,13 @@ impl IncomingBroker {
             .unwrap_or_else(|p| p.into_inner())
             .drain()
         {
-            let _ = pending.sender.send(AuthorizationDecision::Cancel);
+            let _ = pending.send(AuthorizationDecision::Cancel);
         }
     }
 
     async fn authorize(&self, transfer_path: OwnedObjectPath) -> Result<String, ObexAgentError> {
         let authorization = self.prepare_authorization(transfer_path).await?;
-        let decision = match self.request_decision(&authorization).await {
-            Ok(decision) => decision,
-            Err(error) => {
-                return Err(error);
-            }
-        };
+        let decision = self.request_decision(&authorization).await?;
         match decision {
             AuthorizationDecision::Accept => Ok(self.start_incoming(authorization).await),
             AuthorizationDecision::Reject => Err(self.reject_authorization(
@@ -344,10 +339,7 @@ impl IncomingBroker {
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                authorization.request_id.clone(),
-                PendingAuthorization { sender },
-            );
+            .insert(authorization.request_id.clone(), sender);
         tracing::info!(request_id = %authorization.request_id, device_key = %authorization.remote.device_key, file_name = %authorization.file_name, size = authorization.details.size, "incoming OBEX authorization requested");
         let requested = authorization.event(
             "authorization-requested",
@@ -413,16 +405,21 @@ impl IncomingBroker {
         authorization.destination.accepted = true;
         tracing::info!(request_id = %authorization.request_id, device_key = %authorization.remote.device_key, file_name = %authorization.file_name, "incoming OBEX transfer queued");
         crate::task::spawn("incoming-obex-transfer", async move {
-            let result = crate::task::catch(
-                "incoming OBEX transfer",
-                monitor_incoming(
+            let result = crate::task::catch("incoming OBEX transfer", async {
+                monitor_transfer(
                     &authorization.connection,
-                    authorization.transfer_path,
+                    &authorization.transfer_path,
+                    TransferUpdate {
+                        status: "queued".into(),
+                        transferred: 0,
+                        size: event.size,
+                    },
                     cancel_receiver,
-                    event.clone(),
-                    &events,
-                ),
-            )
+                    |update| event.publish(update, &events),
+                )
+                .await
+                .context("monitor incoming OBEX transfer")
+            })
             .await;
             cancellations.lock().await.remove(&task_id);
             if let Err(error) = result {
@@ -755,25 +752,6 @@ async fn incoming_details(
     })
 }
 
-async fn monitor_incoming(
-    connection: &zbus::Connection,
-    transfer_path: OwnedObjectPath,
-    cancel: oneshot::Receiver<()>,
-    mut event: ObexEvent,
-    events: &broadcast::Sender<ObexEvent>,
-) -> Result<()> {
-    let current = TransferUpdate {
-        status: "queued".into(),
-        transferred: 0,
-        size: event.size,
-    };
-    monitor_transfer(connection, &transfer_path, current, cancel, |current| {
-        publish_transfer_update(&mut event, current, events);
-    })
-    .await
-    .context("monitor incoming OBEX transfer")
-}
-
 // Both directions subscribe before refreshing: completion can occur between the
 // initial request/authorization and the start of monitoring. Cancellation must
 // be acknowledged by obexd before publishing a terminal event.
@@ -814,19 +792,6 @@ async fn monitor_transfer(
     }
     anyhow::ensure!(current.status != "error", "OBEX transfer failed");
     Ok(())
-}
-
-fn publish_transfer_update(
-    event: &mut ObexEvent,
-    update: &TransferUpdate,
-    events: &broadcast::Sender<ObexEvent>,
-) {
-    event.status.clone_from(&update.status);
-    event.transferred = update.transferred;
-    event.size = update.size;
-    event.event = lifecycle_event(&event.status).into();
-    tracing::debug!(request_id = %event.request_id, status = %event.status, transferred = event.transferred, size = event.size, "incoming OBEX transfer status changed");
-    let _ = events.send(event.clone());
 }
 
 pub(crate) fn lifecycle_event(status: &str) -> &'static str {
@@ -959,10 +924,7 @@ mod tests {
 
     #[test]
     fn refreshed_and_incremental_transfer_states_publish_consistent_events() {
-        use super::{
-            HashMap, ObexEvent, OwnedValue, TransferUpdate, Value, broadcast,
-            publish_transfer_update,
-        };
+        use super::{HashMap, ObexEvent, OwnedValue, TransferUpdate, Value, broadcast};
         let mut current = TransferUpdate {
             status: "queued".into(),
             transferred: 0,
@@ -972,7 +934,7 @@ mod tests {
             ("Status".into(), Value::from("active").try_into().unwrap()),
             ("Size".into(), OwnedValue::from(100_u64)),
         ]));
-        let mut event = ObexEvent::outgoing("request", "peer", "file", 1);
+        let event = ObexEvent::outgoing("request", "peer", "file", 1);
         let (events, mut received) = broadcast::channel(1);
         for (status, expected, terminal) in [
             ("active", "progress", false),
@@ -985,17 +947,17 @@ mod tests {
                 ("Transferred", Value::from(42_u64)),
             ]));
             assert_eq!(current.terminal(), terminal);
-            publish_transfer_update(&mut event, &current, &events);
+            event.publish(&current, &events);
             let published = received.try_recv().unwrap();
             assert_eq!(
                 (published.event.as_str(), published.status.as_str()),
                 (expected, status)
             );
             assert_eq!((published.transferred, published.size), (42, 100));
-            assert_eq!(
-                serde_json::to_value(event.updated(&current)).unwrap(),
-                serde_json::to_value(&published).unwrap()
-            );
+            assert_eq!(published.request_id, "request");
+            assert_eq!(published.device_key, "peer");
+            assert_eq!(published.file_name, "file");
+            assert_eq!(event.status, "queued");
         }
     }
 
@@ -1031,6 +993,14 @@ mod tests {
             fs::read(directory.join("example.txt")).unwrap(),
             b"existing"
         );
+        for accepted in [false, true] {
+            let path = reserve_incoming_destination_in(&directory, "reservation.txt").unwrap();
+            drop(super::authorization::Destination {
+                path: path.clone(),
+                accepted,
+            });
+            assert_eq!(path.exists(), accepted);
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 }

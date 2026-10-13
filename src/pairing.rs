@@ -64,15 +64,23 @@ enum PendingResponse {
 impl PendingResponse {
     fn validate(&self, params: &Value) -> Result<()> {
         match self {
-            Self::Pin(_) => pin_value(params).map(drop),
+            Self::Pin(_) => pin_value(params).map(|_| ()),
             Self::Passkey(_) => passkey_value(params).map(drop),
             Self::Unit(_) => Ok(()),
         }
     }
 
+    fn finish(self, error: ReqError) {
+        match self {
+            Self::Pin(sender) => drop(sender.send(Err(error))),
+            Self::Passkey(sender) => drop(sender.send(Err(error))),
+            Self::Unit(sender) => drop(sender.send(Err(error))),
+        }
+    }
+
     fn accept(self, params: &Value) -> Result<()> {
         match self {
-            Self::Pin(sender) => send_response(sender, Ok(pin_value(params)?)),
+            Self::Pin(sender) => send_response(sender, Ok(pin_value(params)?.to_owned())),
             Self::Passkey(sender) => send_response(sender, Ok(passkey_value(params)?)),
             Self::Unit(sender) => send_response(sender, Ok(())),
         }
@@ -85,7 +93,7 @@ fn send_response<T>(sender: oneshot::Sender<ReqResult<T>>, response: ReqResult<T
         .map_err(|_| anyhow::anyhow!("pairing request was cancelled"))
 }
 
-fn pin_value(params: &Value) -> Result<String> {
+fn pin_value(params: &Value) -> Result<&str> {
     let value = params
         .get("value")
         .and_then(Value::as_str)
@@ -93,7 +101,7 @@ fn pin_value(params: &Value) -> Result<String> {
     if value.is_empty() || value.chars().count() > 16 {
         bail!("PIN must contain 1 to 16 characters");
     }
-    Ok(value.to_string())
+    Ok(value)
 }
 
 fn passkey_value(params: &Value) -> Result<u32> {
@@ -198,7 +206,7 @@ impl PairingBroker {
         let displays =
             std::mem::take(&mut *self.displays.lock().unwrap_or_else(|p| p.into_inner()));
         for request in requests.into_values() {
-            cancel(request.response);
+            request.response.finish(ReqError::Canceled);
             self.emit(request.event.cancelled(reason));
         }
         for display in displays.into_values() {
@@ -245,7 +253,7 @@ impl PairingBroker {
         if accept {
             request.response.accept(params)?;
         } else {
-            reject(request.response);
+            request.response.finish(ReqError::Rejected);
         }
         let mut answered = request
             .event
@@ -340,7 +348,7 @@ impl PairingBroker {
             .remove(request_id);
         if let Some(request) = request {
             tracing::warn!(%request_id, kind = %request.event.kind, device_key = %request.event.device_key, %reason, "pairing request cancelled");
-            cancel(request.response);
+            request.response.finish(ReqError::Canceled);
             self.emit(request.event.cancelled(reason));
         }
     }
@@ -416,22 +424,6 @@ impl PairingBroker {
 
     fn emit(&self, event: PairingEvent) {
         let _ = self.events.send(event);
-    }
-}
-
-fn reject(pending: PendingResponse) {
-    finish(pending, ReqError::Rejected);
-}
-
-fn cancel(pending: PendingResponse) {
-    finish(pending, ReqError::Canceled);
-}
-
-fn finish(pending: PendingResponse, error: ReqError) {
-    match pending {
-        PendingResponse::Pin(sender) => drop(sender.send(Err(error))),
-        PendingResponse::Passkey(sender) => drop(sender.send(Err(error))),
-        PendingResponse::Unit(sender) => drop(sender.send(Err(error))),
     }
 }
 
@@ -566,6 +558,11 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_responses_preserve_identity_validate_passkeys_and_answer_bluez() {
+        for invalid in [String::new(), "1".repeat(17)] {
+            assert!(super::pin_value(&json!({"value": invalid})).is_err());
+        }
+        let unicode = json!({"value": "é".repeat(16)});
+        assert_eq!(super::pin_value(&unicode).unwrap(), "é".repeat(16));
         let identities = DeviceIdentityRegistry::in_memory();
         let expected_key = identities.device_key("hci0", "AA:BB:CC:DD:EE:FF".parse().unwrap());
         let broker = PairingBroker::new(identities);

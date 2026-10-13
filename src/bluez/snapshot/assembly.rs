@@ -1,10 +1,10 @@
 //! Snapshot construction from captured evidence; no clocks, locks or hardware I/O.
 use super::{
-    BluezDeviceState, DeviceMetadata, ResolvedPresentation, device_capabilities,
+    BluezDeviceState, CachedDevice, DeviceMetadata, ResolvedPresentation, device_capabilities,
     has_fast_pair_service, service_label, signal_strength,
 };
 use crate::{
-    bluez::{CachedDevice, link_signal, observations::Observation},
+    bluez::{link_signal, observations::Observation},
     management::DevicePolicy,
     model::{
         Device, DeviceIdentity, DevicePresentation, DeviceServices, DeviceState, FastPairFeatures,

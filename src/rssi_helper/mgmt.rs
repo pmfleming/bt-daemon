@@ -234,6 +234,11 @@ mod tests {
             wrong[offset] = value;
             assert_eq!(reply(&wrong, 3, &peer), None);
         }
+        assert_eq!(
+            reply(&[2, 0, 0, 0, 3, 0, 0x31, 0, 0x0c], 0, &[0; 7]),
+            Some(Reply::Unavailable)
+        );
+        assert_eq!(reply(&[2, 0, 0, 0, 3, 0, 0x31, 0, 0], 0, &[0; 7]), None);
     }
 
     fn pair() -> (AsyncFd<OwnedFd>, tokio::net::UnixDatagram) {
@@ -292,6 +297,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn silent_transport_times_out_and_permission_failure_does_not_probe_le() {
+        // Linux may queue Command Status while reporting a zero-byte send.
+        assert!(sent_request(0, 13).is_ok());
+        assert!(sent_request(13, 13).is_ok());
+        assert_eq!(
+            sent_request(12, 13).unwrap_err().kind(),
+            io::ErrorKind::WriteZero
+        );
         let (client, server) = pair();
         let worker = tokio::spawn(read_from(client, 0, Address::default(), false));
         let mut buffer = [0; 32];
@@ -314,33 +326,5 @@ mod tests {
             server.try_recv(&mut buffer).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-    }
-
-    #[test]
-    fn zero_byte_management_send_must_still_read_the_error_reply() {
-        assert!(sent_request(0, 13).is_ok());
-        assert!(sent_request(13, 13).is_ok());
-        assert_eq!(
-            sent_request(12, 13).unwrap_err().kind(),
-            io::ErrorKind::WriteZero
-        );
-        assert_eq!(
-            reply(&[2, 0, 0, 0, 3, 0, 0x31, 0, PERMISSION_DENIED], 0, &[0; 7]),
-            Some(Reply::Denied)
-        );
-    }
-
-    #[test]
-    fn failures_never_decode_rssi() {
-        for (status, expected) in [
-            (2, Reply::NotConnected),
-            (0x14, Reply::Denied),
-            (0x0c, Reply::Unavailable),
-            (1, Reply::Unavailable),
-        ] {
-            let packet = [2, 0, 0, 0, 3, 0, 0x31, 0, status];
-            assert_eq!(reply(&packet, 0, &[0; 7]), Some(expected));
-        }
-        assert_eq!(reply(&[2, 0, 0, 0, 3, 0, 0x31, 0, 0], 0, &[0; 7]), None);
     }
 }

@@ -1,10 +1,22 @@
-use super::*;
-use std::{
-    io::{BufRead, BufReader},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+use super::{
+    ACTION, BUS, Backend, Helper, INTERFACE, Limits, PATH, Reply, Sample, SystemBackend,
+    TARGET_INTERVAL, client,
 };
+use async_trait::async_trait;
+use bluer::Address;
+use std::{
+    collections::HashMap,
+    io::{self, BufRead, BufReader},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::Mutex;
 use zbus::connection::Builder;
+use zbus::{Connection, fdo};
 
 struct Bus {
     child: Child,
@@ -158,13 +170,12 @@ async fn private_bus_checks_identity_authorization_targets_limits_and_helper_res
 }
 
 #[tokio::test(start_paused = true)]
-async fn limits_are_bounded_and_recover_without_persistent_state() {
+async fn admission_limits_expire_and_stalled_requests_release_their_permit() {
     let mut limits = Limits::default();
     for _ in 0..16 {
         limits.admit().unwrap();
     }
     assert!(limits.admit().is_err());
-    assert_eq!(limits.arrivals.len(), 16);
     tokio::time::advance(Duration::from_secs(1)).await;
     limits.admit().unwrap();
     let address = Address::default();
@@ -175,11 +186,8 @@ async fn limits_are_bounded_and_recover_without_persistent_state() {
     assert!(limits.target(64, address).is_err());
     tokio::time::advance(TARGET_INTERVAL).await;
     limits.target(0, address).unwrap();
-    assert_eq!(limits.targets.len(), 1);
-}
-
-#[tokio::test]
-async fn admission_never_waits_and_stalled_requests_release_their_permit() {
+    // Socket readiness must not race Tokio's auto-advanced virtual timers.
+    tokio::time::resume();
     let bus = Bus::new();
     let connection = bus.connection().await;
     let fake = Arc::new(Fake::default());

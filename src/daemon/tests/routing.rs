@@ -1,71 +1,30 @@
 use super::daemon;
-use crate::daemon::{SharedSnapshot, load_snapshot, receive_refresh, send_changed};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::broadcast;
 
 #[tokio::test]
-async fn dispatch_routes_cached_snapshots_registry_and_request_recovery() {
+async fn dispatch_validates_commands_and_routes_supported_methods() {
     let (daemon, _, _) = daemon(true);
-    let registry = daemon
-        .dispatch_call("bluetooth.protocol.describe", json!({}), None, None)
-        .await;
-    assert_eq!(registry["ok"], true);
-    assert!(registry["data"]["registry"].is_object());
-    let snapshot = daemon
+    for (method, field) in [
+        ("bluetooth.protocol.describe", "registry"),
+        ("bluetooth.snapshot", "snapshot"),
+        ("bluetooth.audio.snapshot", "audio_devices"),
+        ("bluetooth.requests.snapshot", "requests"),
+    ] {
+        let response = daemon.dispatch_call(method, json!({}), None, None).await;
+        assert_eq!(response["ok"], true, "{method}: {response}");
+        assert!(
+            response["data"].get(field).is_some(),
+            "{method}: {response}"
+        );
+    }
+    daemon
+        .snapshots
+        .send_replace(crate::daemon::SharedSnapshot::Loading);
+    let loading = daemon
         .dispatch_call("bluetooth.snapshot", json!({}), None, None)
         .await;
-    assert!(snapshot["data"]["snapshot"]["devices"].is_array());
-    let audio = daemon
-        .dispatch_call("bluetooth.audio.snapshot", json!({}), None, None)
-        .await;
-    assert_eq!(audio["data"]["audio_devices"], json!([]));
-    let requests = daemon
-        .dispatch_call("bluetooth.requests.snapshot", json!({}), None, None)
-        .await;
-    assert_eq!(requests["data"]["requests"]["pairing"]["active"], json!([]));
-    assert_eq!(
-        requests["data"]["requests"]["operations"]["active"],
-        json!([])
-    );
-    assert_eq!(requests["data"]["requests"]["scans"]["active"], json!([]));
-    let mut watched = daemon.snapshots.subscribe();
-    for (state, code) in [
-        (SharedSnapshot::Loading, "snapshot-loading"),
-        (
-            SharedSnapshot::Unavailable(Arc::new("offline".into())),
-            "bluez-unavailable",
-        ),
-    ] {
-        send_changed(&daemon.snapshots, state.clone());
-        assert!(watched.has_changed().unwrap());
-        watched.borrow_and_update();
-        send_changed(&daemon.snapshots, state);
-        assert!(!watched.has_changed().unwrap());
-        let response = daemon
-            .dispatch_call("bluetooth.snapshot", json!({}), None, None)
-            .await;
-        assert_eq!(response["error"]["code"], code);
-    }
-    assert!(matches!(
-        load_snapshot(&daemon.backend).await,
-        SharedSnapshot::Available(_)
-    ));
-    let (sender, mut receiver) = broadcast::channel(1);
-    sender.send(()).unwrap();
-    sender.send(()).unwrap();
-    assert!(receive_refresh(&mut receiver, Duration::ZERO).await);
-    assert!(matches!(
-        receiver.try_recv(),
-        Err(broadcast::error::TryRecvError::Empty)
-    ));
-    drop(sender);
-    assert!(!receive_refresh(&mut receiver, Duration::ZERO).await);
-}
-
-#[tokio::test]
-async fn dispatch_validates_commands_and_routes_supported_backend_mutations() {
-    let (daemon, _, _) = daemon(true);
+    assert_eq!(loading["error"]["code"], "snapshot-loading");
     for method in [
         "bluetooth.scan",
         "bluetooth.obex.send",
@@ -93,6 +52,14 @@ async fn dispatch_validates_commands_and_routes_supported_backend_mutations() {
         (
             "bluetooth.scan",
             json!({"adapter_key": 42, "enabled": true}),
+        ),
+        (
+            "bluetooth.audio.setProfile",
+            json!({"device_key": "peer", "profile_key": "selection", "remember": "true"}),
+        ),
+        (
+            "bluetooth.audio.setDefault",
+            json!({"device_key": "peer", "endpoint_key": "selection", "remember": true}),
         ),
     ] {
         let response = daemon.dispatch_call(method, params, None, None).await;

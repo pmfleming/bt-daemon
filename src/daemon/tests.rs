@@ -95,7 +95,9 @@ impl BluetoothBackend for TestBackend {
         self.snapshot().await
     }
 
-    async fn update_device_policy(&self, _: &str, _: &Value) -> Result<Snapshot> {
+    async fn update_device_policy(&self, key: &str, params: &Value) -> Result<Snapshot> {
+        // Exercise routing-key removal through the real settings validator.
+        crate::management::ManagementStore::in_memory().update_device_policy(key, params)?;
         self.snapshot().await
     }
 
@@ -278,7 +280,10 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
             expected
         );
         assert!(!daemon.operations.cancel_owned(id, None).await);
-        let recovered = daemon.operations.snapshot().await;
+        let response = daemon
+            .dispatch_call("bluetooth.requests.snapshot", json!({}), None, None)
+            .await;
+        let recovered = &response["data"]["requests"]["operations"];
         assert_eq!(recovered["active"], json!([]));
         assert_eq!(recovered["recent"].as_array().unwrap().len(), 1);
         assert_eq!(recovered["recent"][0]["request_id"], id);
@@ -290,77 +295,54 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
     }
 }
 
-#[tokio::test]
-async fn owner_loss_releases_global_scan_without_stopping_another_owners_lease() {
-    let scanning = Arc::new(StdMutex::new(Vec::new()));
-    let backend = test_backend(true, false, Arc::clone(&scanning));
-    let scans = ScanCoordinator::new(backend);
-    let global = scans
-        .start(
-            &json!({ "enabled": true, "timeout_ms": 60_000 }),
-            ":global-owner",
-        )
-        .await;
-    let global_id = global["data"]["scan"]["request_id"].as_str().unwrap();
-    let targeted = start_scan(&scans, "adapter-1", 60_000).await;
-    let targeted_id = targeted["data"]["scan"]["request_id"].as_str().unwrap();
-
-    scans.stop_owner(":global-owner").await;
-    assert!(!scans.contains(global_id).await);
-    assert!(scans.contains(targeted_id).await);
-    assert_eq!(
-        stopped_calls(&scanning),
-        vec![(Some("adapter-2".into()), false)]
-    );
-
-    scans.stop(Some(targeted_id), "cancelled").await;
-    let stopped = stopped_calls(&scanning);
-    assert_eq!(
-        stopped,
-        vec![
-            (Some("adapter-2".into()), false),
-            (Some("adapter-1".into()), false)
-        ]
-    );
-}
-
 #[tokio::test(start_paused = true)]
-async fn timeout_preserves_shared_adapters_and_stop_all_deduplicates_them() {
-    let scanning = Arc::new(StdMutex::new(Vec::new()));
-    let scans = ScanCoordinator::new(test_backend(true, false, Arc::clone(&scanning)));
-    let global = scans.start(&json!({"timeout_ms": 1_000}), ":global").await;
-    let targeted = start_scan(&scans, "adapter-1", 60_000).await;
-    let mut events = scans.subscribe();
-    tokio::task::yield_now().await;
-    tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
-    let completed = events.recv().await.unwrap();
-    assert_eq!(completed.event, "completed");
-    assert_eq!(completed.request_id, global["data"]["scan"]["request_id"]);
-    assert!(
-        scans
-            .contains(targeted["data"]["scan"]["request_id"].as_str().unwrap())
-            .await
-    );
-    assert_eq!(
-        stopped_calls(&scanning),
-        [(Some("adapter-2".into()), false)]
-    );
-    scanning.lock().unwrap().clear();
-    scans.start(&json!({"timeout_ms": 60_000}), ":global").await;
-    assert_eq!(
-        scans.stop(Some("missing"), "cancelled").await["error"]["code"],
-        "request-not-found"
-    );
-    assert!(stopped_calls(&scanning).is_empty());
-    assert_eq!(scans.stop(None, "cancelled").await["ok"], true);
-    assert_eq!(
-        stopped_calls(&scanning),
-        [
-            (Some("adapter-1".into()), false),
-            (Some("adapter-2".into()), false)
-        ]
-    );
-    assert_eq!(scans.snapshot().await["active"], json!([]));
+async fn lease_expiry_and_owner_loss_preserve_shared_adapters_until_the_last_stop() {
+    for owner_lost in [false, true] {
+        let scanning = Arc::new(StdMutex::new(Vec::new()));
+        let scans = ScanCoordinator::new(test_backend(true, false, Arc::clone(&scanning)));
+        let global = scans.start(&json!({"timeout_ms": 1_000}), ":global").await;
+        let targeted = start_scan(&scans, "adapter-1", 60_000).await;
+        let mut events = scans.subscribe();
+        if owner_lost {
+            scans.stop_owner(":global").await;
+        } else {
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+        }
+        let terminal = events.recv().await.unwrap();
+        assert_eq!(
+            terminal.event,
+            if owner_lost { "cancelled" } else { "completed" }
+        );
+        assert_eq!(terminal.request_id, global["data"]["scan"]["request_id"]);
+        assert!(!scans.contains(&terminal.request_id).await);
+        assert!(
+            scans
+                .contains(targeted["data"]["scan"]["request_id"].as_str().unwrap())
+                .await
+        );
+        assert_eq!(
+            stopped_calls(&scanning),
+            [(Some("adapter-2".into()), false)]
+        );
+
+        scanning.lock().unwrap().clear();
+        scans.start(&json!({"timeout_ms": 60_000}), ":global").await;
+        assert_eq!(
+            scans.stop(Some("missing"), "cancelled").await["error"]["code"],
+            "request-not-found"
+        );
+        assert!(stopped_calls(&scanning).is_empty());
+        assert_eq!(scans.stop(None, "cancelled").await["ok"], true);
+        assert_eq!(
+            stopped_calls(&scanning),
+            [
+                (Some("adapter-1".into()), false),
+                (Some("adapter-2".into()), false),
+            ]
+        );
+        assert_eq!(scans.snapshot().await["active"], json!([]));
+    }
 }
 
 #[tokio::test]

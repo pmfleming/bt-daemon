@@ -355,8 +355,7 @@ fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
     let registry_weak = registry.downgrade();
     let applied = Rc::new(Cell::new(false));
     let applied_for_registry = Rc::clone(&applied);
-    let retained = Rc::new(RefCell::new(None::<Metadata>));
-    let retained_for_registry = Rc::clone(&retained);
+    let retained = RefCell::new(None::<Metadata>);
     // Match wpctl set-default: effective default.audio.* belongs to policy;
     // configured defaults express a user choice and are persisted by WirePlumber.
     let key = configured_default_key(kind);
@@ -375,7 +374,7 @@ fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
             match registry.bind::<Metadata, _>(global) {
                 Ok(metadata) => {
                     metadata.set_property(0, key, Some("Spa:String:JSON"), Some(&value));
-                    *retained_for_registry.borrow_mut() = Some(metadata);
+                    *retained.borrow_mut() = Some(metadata);
                     applied_for_registry.set(true);
                 }
                 Err(error) => tracing::warn!(%error, "could not bind PipeWire default metadata"),
@@ -399,8 +398,7 @@ pub fn set_profile(address: &str, index: u32) -> Result<()> {
     let expected_name = format!("bluez_card.{}", address.replace(':', "_"));
     let confirmed = Rc::new(Cell::new(false));
     let confirmed_for_registry = Rc::clone(&confirmed);
-    let objects = Rc::new(RefCell::new(Objects::default()));
-    let objects_for_registry = Rc::clone(&objects);
+    let objects = RefCell::new(Objects::default());
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
@@ -419,7 +417,7 @@ pub fn set_profile(address: &str, index: u32) -> Result<()> {
                 &bytes,
                 index,
                 Rc::clone(&confirmed_for_registry),
-                &objects_for_registry,
+                &objects,
             ) {
                 tracing::warn!(id = global.id, %error, "could not apply PipeWire Bluetooth profile");
             }
@@ -456,7 +454,7 @@ fn apply_profile(
     bytes: &[u8],
     requested_index: u32,
     confirmed: Rc<Cell<bool>>,
-    objects: &Rc<RefCell<Objects>>,
+    objects: &RefCell<Objects>,
 ) -> Result<()> {
     let device = registry
         .bind::<Device, _>(global)

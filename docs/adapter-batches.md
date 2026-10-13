@@ -49,7 +49,7 @@ adapters, legacy serialization and waiter cancellation. Regenerate the checked
 partial-outcome fixture with:
 
 ```
-BT_DAEMON_UPDATE_CONTRACT_FIXTURE=1 cargo test --lib adapter_batch_fixture_is_current
+BT_DAEMON_UPDATE_CONTRACT_FIXTURE=1 cargo test --lib outcomes_preserve_applied_unknown_and_unattempted_fields
 ```
 
 Then run the normal tests/build and copy the fixture/generate bindings in Shelllist.

@@ -134,7 +134,8 @@ mod tests {
     use bluer::Address;
 
     #[tokio::test(start_paused = true)]
-    async fn backpressure_and_missing_ack_share_a_bounded_deadline_and_release_reservations() {
+    async fn command_lifecycle_bounds_waits_and_releases_only_the_matching_reservation() {
+        use futures::FutureExt;
         let pending = PendingCommands::default();
         let key = (Address::default(), 8, 0x12);
         for stalled_writer in [false, true] {
@@ -150,15 +151,8 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("timed out"));
             assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
-            assert!(pending.reserve(key).is_ok());
         }
-    }
-
-    #[tokio::test]
-    async fn command_outcomes_release_only_the_matching_reservation() {
-        use futures::FutureExt;
-        let pending = PendingCommands::default();
-        let key = (Address::default(), 8, 0x12);
+        // Reuse the same key after timeouts, cancellation and each terminal outcome.
         assert!(
             pending
                 .execute(key, std::future::pending())

@@ -1,6 +1,109 @@
 # Test-suite reduction
 
-## Current pass: 84 → 56 tests
+## Current pass: 98 → 66 tests
+
+Baseline is the working tree after the [ownership/locality refactor](reviews/rqlens-ownership-refactor.md),
+not the older counts below. Cargo discovery confirmed 95 unit tests and one
+integration test; Python discovery confirmed two tests.
+
+| Suite | Baseline | Final |
+| --- | ---: | ---: |
+| Rust unit tests | 95 | 63 |
+| Rust integration tests | 1 | 1 |
+| Python quality tooling | 2 | 2 |
+| **Total** | **98** | **66** |
+
+`98 × 0.67 = 65.66`, rounded to **66**: 32 fewer tests, **32.65% removed**.
+Considering Rust alone, **96 → 64** removes **33.33%** and also gives the nearest
+whole-test target to 67%. Counts are runnable test functions, not table rows.
+No tests were ignored, feature-gated away or removed from discovery configuration.
+
+### Selection and retained protection
+
+- **Identity:** delete legacy migration/serialization-only tests and assertions
+  about shared battery allocation addresses. Retain discovery-address privacy,
+  identity promotion, adapter renaming, presentation recovery and current-format
+  persistence. The writer now has one lifecycle test covering concurrent flushes,
+  failed saves, recovery and shutdown draining instead of separate fixtures.
+- **API and recovery:** remove duplicate error-envelope and routing-key helper
+  tests. Exercise contextual error codes/retryability through BlueZ-to-API error
+  conversion and validate routed policy updates with the real management store.
+  The private-bus integration test retains both initially absent and already
+  running BlueZ, failed agent registration, owner replacement, policy persistence
+  and existing-client recovery; remove the overlapping startup/unavailable unit
+  tests, but retain cancellation of in-flight stale recovery candidates.
+- **Daemon:** fold read-only method routing into command dispatch, and recover
+  operation terminal results through the public requests route. Drop private
+  watch-deduplication/burst-drain assertions and repeated empty-field checks.
+  Share scan-lease setup for timeout and owner-loss cases, preserving other owners'
+  adapters, terminal events, final-stop deduplication and failed-stop retryability.
+  Preserve caller-scoped cancellation tests separately.
+- **Adapter contracts:** check the exact batch fixture in the existing failure
+  matrix rather than dispatching the same failing batch in a standalone test.
+  Keep full validation-before-effects and submitted-worker cancellation/serialization
+  tests. Move the device/adapter gate namespace check there and remove the duplicate
+  mutation-gate mechanics test. The fixture regeneration command is updated in
+  [adapter batches](adapter-batches.md).
+- **Audio:** remove duplicate missing-parameter, exact-error-wording and selector
+  fixtures. Keep invalid `remember` requests at daemon dispatch; test emitted opaque
+  keys against selectors in the snapshot test. Combine apply/persistence/refresh
+  failures into one outcome test driven by actual helper results. Retain typed POD
+  parsing, profile availability/identity checks and default-route projection.
+- **Connection policy and Fast Pair:** replace the private policy-flag truth table with observed ordered
+  effects, including power overrides, preferred profiles and failure/cancellation
+  at each stage. Consolidate retry classification, bounds, earliest deadlines and
+  session-scoped suppression; consolidate command deadlines with reservation
+  lifecycle outcomes. Remove repeated fixed-length decoder matrices, keeping
+  representative truncation/trailing-byte and invalid-mode cases. Delete the
+  display-only Audio Switch label test. Independent crypto/MAC vectors, malformed
+  transport frames, PSM validation and trusted provisioning prerequisites remain.
+  Key-store rollback/reload now also checks generated keys and secure permissions.
+- **OBEX and pairing:** test destination cleanup alongside confined, non-overwriting
+  file reservation; test abandoned prompts alongside scoped authorization/transfer
+  cancellation. Remove the PIN channel-plumbing test, preserving PIN length/Unicode
+  validation in the existing response test. Keep secret clearing, display progress,
+  timeouts, owner loss, late-answer rejection and exactly one terminal event.
+- **RSSI:** consolidate stalled enumeration with bounded multi-batch polling, pure
+  admission limits with stalled-request cleanup, and send/status cases with the
+  existing decoder/transport tests. Remove private container-size assertions and
+  repeated status mappings. Preserve first-read invalidation, suspend notification,
+  freshness/backoff, address-type fallback, signed/unknown values, zero-byte sends,
+  permissions and real private-bus Polkit caller-identity checks.
+
+This is selective removal plus consolidation, not a claim that one third of
+behavioral scenarios disappeared. Compared with the starting working tree,
+`src/` loses **472 lines** and **74 assertion sites**. Production source text is
+unchanged apart from blank lines; the integration fixture and Python tests are
+unchanged. Shared setup and retained assertions execute directly in the remaining
+tests, rather than hiding removed tests behind ignored attributes or a runner.
+
+### Validation and trade-offs
+
+- All **64 Rust tests** pass in parallel and sequentially; both Python tests pass.
+- Formatting, diff whitespace checks, strict Clippy (`--all-targets --all-features
+  --locked -- -D warnings`), RQLens `measure all` and `verify` pass.
+- RQLens line coverage: **60.66% → 58.39%**; function coverage:
+  **54.65% → 51.98%**; region coverage: **59.65% → 57.21%**. Aggregate coverage
+  includes changes to inline tests; it is not claimed unchanged. Branch coverage
+  is unavailable. No coverage threshold was changed.
+- Legacy migration/layout and Audio Switch display-label parsing lose their direct
+  tests intentionally. Recovery still executes in the retained daemon-subprocess
+  integration test; the coverage artifact no longer attributes hits to
+  `src/bluez/recovery.rs` after removing its direct unit test. Passing integration
+  behavior is not a claim of complete subprocess coverage accounting.
+- Consolidation reduces independent failure isolation and lengthens some tests.
+  Existing incomplete macro/type/dependency evidence still prevents strict quality
+  policy acceptance; four repository-documentation warnings remain. Hardware was
+  not exercised and no service was restarted.
+
+Inventories, the starting source snapshot, source-only audit, logs and RQLens
+artifacts are under `target/test-reduction-current/`. Baseline artifacts match the
+previously measured 96-test source. Final scans use a frozen dependency checkout
+at `aa831877d49247c88fba6ead149d5aacea713b27`, matching that baseline rather than the
+concurrently edited live sibling. `audit.json` records the before/after test names
+and verifies unchanged non-test source text.
+
+## Previous pass: 84 → 56 tests
 
 Baseline: commit `54f7b5b`, after the previous reduction. Counts are runnable test
 functions, not table rows or Python subtests.

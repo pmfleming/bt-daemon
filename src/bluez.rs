@@ -22,7 +22,7 @@ use crate::{
     fast_pair::FastPairBatteryProvider,
     identity::DeviceIdentityRegistry,
     management::{DevicePolicy, ManagementStore},
-    model::{Device, Snapshot},
+    model::Snapshot,
     rfkill,
 };
 
@@ -36,12 +36,7 @@ mod snapshot;
 /// Backend wrapper that restores BlueZ state after service-owner changes.
 pub use recovery::RecoveringBackend;
 
-const DISCOVERED_DEVICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-
-struct CachedDevice {
-    device: Device,
-    observed_at_ms: u64,
-}
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Live BlueZ session with identity, management policy and observation caches.
 /// Use `RecoveringBackend` when the session must survive BlueZ restarts.
@@ -50,7 +45,7 @@ pub struct BluezBackend {
     discovery_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     changes: broadcast::Sender<()>,
     identities: Arc<DeviceIdentityRegistry>,
-    device_cache: Mutex<HashMap<String, CachedDevice>>,
+    device_cache: Mutex<HashMap<String, snapshot::CachedDevice>>,
     observations: Mutex<observations::Observations>,
     link_signals: Mutex<link_signal::Signals>,
     system_bus: zbus::Connection,
@@ -464,7 +459,7 @@ impl BluezBackend {
         if stopped {
             let changes = self.changes.clone();
             self.tasks.spawn("bluetooth-cache-expiry", async move {
-                tokio::time::sleep(DISCOVERED_DEVICE_CACHE_TTL).await;
+                tokio::time::sleep(CACHE_TTL).await;
                 let _ = changes.send(());
             });
         }
@@ -1144,14 +1139,10 @@ async fn operation_timeout<T>(
     operation: &'static str,
     future: impl std::future::Future<Output = bluer::Result<T>>,
 ) -> Result<T> {
-    match tokio::time::timeout(duration, future).await {
-        Ok(result) => bluez_result(result, operation),
-        Err(_) => Err(BackendError::new(
-            BackendErrorKind::Timeout,
-            format!("{operation} timed out"),
-        )
-        .into()),
-    }
+    let result = tokio::time::timeout(duration, future).await.map_err(|_| {
+        BackendError::new(BackendErrorKind::Timeout, format!("{operation} timed out"))
+    })?;
+    bluez_result(result, operation)
 }
 
 #[cfg(test)]
@@ -1211,16 +1202,28 @@ mod tests {
     #[test]
     fn false_properties_are_values_but_unavailable_properties_are_errors() {
         assert!(!bluez_result(Ok(false), "read paired state").unwrap());
-        for (kind, expected, code) in [
+        assert_eq!(
+            crate::api::backend_error(&anyhow::anyhow!("untyped"))["error"]["code"],
+            "operation-failed"
+        );
+        for (kind, expected, code, retryable) in [
             (
                 bluer::ErrorKind::NotReady,
                 BackendErrorKind::Unavailable,
                 "bluez-unavailable",
+                true,
             ),
             (
                 bluer::ErrorKind::AuthenticationTimeout,
                 BackendErrorKind::Timeout,
                 "timeout",
+                true,
+            ),
+            (
+                bluer::ErrorKind::AuthenticationRejected,
+                BackendErrorKind::Rejected,
+                "rejected",
+                false,
             ),
         ] {
             let error = bluez_result::<bool>(
@@ -1233,9 +1236,16 @@ mod tests {
             .unwrap_err()
             .context("Bluetooth operation");
             assert_eq!(error.downcast_ref::<BackendError>().unwrap().kind, expected);
-            let envelope = crate::api::error_value(&error);
-            assert_eq!(envelope["code"], code);
-            assert_eq!(envelope["retryable"], true);
+            let envelope = crate::api::backend_error(&error);
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error"]["code"], code);
+            assert_eq!(envelope["error"]["retryable"], retryable);
+            assert!(
+                envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Bluetooth operation")
+            );
         }
     }
 }

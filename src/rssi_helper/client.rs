@@ -48,7 +48,8 @@ fn decode(sample: Sample) -> io::Result<(Reply, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Reply, Sample, decode};
+    use std::io;
     #[test]
     fn validates_samples_without_inventing_values_for_failures() {
         for (value, relative) in [(0, true), (-42, false)] {

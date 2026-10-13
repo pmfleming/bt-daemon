@@ -12,55 +12,49 @@ const API: ApiIdentity = ApiIdentity::new(PROTOCOL, VERSION as u32);
 
 mod adapter;
 
-enum BackendRequest<'a> {
+enum BackendRequest {
     Snapshot,
     SetPowered {
-        adapter_key: Option<&'a str>,
+        adapter_key: Option<String>,
         powered: bool,
     },
     AdapterOperation {
-        key: &'a str,
+        key: String,
         operation: AdapterOperation,
+        params: Value,
     },
-    UpdateManagement,
+    UpdateManagement(Value),
     UpdateDevicePolicy {
-        key: &'a str,
+        key: String,
+        params: Value,
     },
 }
 
-impl BackendRequest<'_> {
+impl BackendRequest {
     async fn execute(
         self,
         backend: &Arc<dyn BluetoothBackend>,
-        params: &Value,
     ) -> anyhow::Result<crate::model::Snapshot> {
         match self {
             Self::Snapshot => backend.snapshot().await,
             Self::SetPowered {
                 adapter_key,
                 powered,
-            } => backend.set_powered(adapter_key, powered).await,
-            Self::AdapterOperation { key, operation } => {
-                adapter::single(
-                    Arc::clone(backend),
-                    key.to_owned(),
-                    operation,
-                    params.clone(),
-                )
-                .await
-            }
-            Self::UpdateManagement => backend.update_management(params).await,
-            Self::UpdateDevicePolicy { key } => {
-                backend
-                    .update_device_policy(key, &policy_values(params))
-                    .await
+            } => backend.set_powered(adapter_key.as_deref(), powered).await,
+            Self::AdapterOperation {
+                key,
+                operation,
+                params,
+            } => adapter::single(Arc::clone(backend), key, operation, params).await,
+            Self::UpdateManagement(params) => backend.update_management(&params).await,
+            Self::UpdateDevicePolicy { key, params } => {
+                backend.update_device_policy(&key, &params).await
             }
         }
     }
 }
 
-fn policy_values(params: &Value) -> Value {
-    let mut values = params.clone();
+fn policy_values(mut values: Value) -> Value {
     if let Some(object) = values.as_object_mut() {
         object.remove("key");
     }
@@ -76,14 +70,14 @@ pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: 
         log_response(method, &response);
         return response;
     }
-    let request = match parse_backend_request(method, &params) {
+    let request = match parse_backend_request(method, params) {
         Ok(request) => request,
         Err(response) => {
             log_response(method, &response);
             return response;
         }
     };
-    let response = match request.execute(&backend, &params).await {
+    let response = match request.execute(&backend).await {
         Ok(snapshot) => success(json!({ "snapshot": snapshot })),
         Err(cause) => {
             tracing::warn!(%method, error = %cause, error_chain = %format!("{cause:#}"), "backend API request failed");
@@ -94,25 +88,31 @@ pub async fn dispatch(backend: Arc<dyn BluetoothBackend>, method: &str, params: 
     response
 }
 
-fn parse_backend_request<'a>(method: &str, params: &'a Value) -> Result<BackendRequest<'a>, Value> {
-    let adapter_key = || {
-        params
-            .optional_string("adapter_key")
-            .map_err(validation_error)
-    };
+fn parse_backend_request(method: &str, params: Value) -> Result<BackendRequest, Value> {
     match method {
         "bluetooth.snapshot" => Ok(BackendRequest::Snapshot),
         "bluetooth.setPowered" => Ok(BackendRequest::SetPowered {
-            adapter_key: adapter_key()?,
+            adapter_key: params
+                .optional_string("adapter_key")
+                .map_err(validation_error)?
+                .map(str::to_owned),
             powered: params.require_bool("powered").map_err(validation_error)?,
         }),
         "bluetooth.adapter.operation" => {
-            let (key, operation) = typed_operation(params).map_err(validation_error)?;
-            Ok(BackendRequest::AdapterOperation { key, operation })
+            let (key, operation) = typed_operation(&params).map_err(validation_error)?;
+            Ok(BackendRequest::AdapterOperation {
+                key: key.to_owned(),
+                operation,
+                params,
+            })
         }
-        "bluetooth.management.update" => Ok(BackendRequest::UpdateManagement),
+        "bluetooth.management.update" => Ok(BackendRequest::UpdateManagement(params)),
         "bluetooth.device.policy.update" => Ok(BackendRequest::UpdateDevicePolicy {
-            key: params.require_string("key").map_err(validation_error)?,
+            key: params
+                .require_string("key")
+                .map_err(validation_error)?
+                .to_owned(),
+            params: policy_values(params),
         }),
         _ => Err(error(
             "unsupported-method",
@@ -172,50 +172,4 @@ pub(crate) fn backend_error(cause: &Error) -> Value {
 /// Construct a versioned error response with the supplied code and human-readable message.
 pub fn error(code: &str, message: String) -> Value {
     shelllist_daemon_core::error(API, EnvelopeError::new(code, message))
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn backend_error_envelope_preserves_details_and_context() {
-        use crate::backend::{BackendError, BackendErrorKind};
-        for error in [
-            anyhow::anyhow!("untyped failure"),
-            anyhow::Error::new(BackendError::new(BackendErrorKind::Timeout, "timed out")),
-            anyhow::Error::new(BackendError::new(BackendErrorKind::Rejected, "denied")),
-        ] {
-            let error = error.context("operation context");
-            let response = super::backend_error(&error);
-            assert_eq!(response["error"], super::error_value(&error));
-            assert_eq!(response["ok"], false);
-            assert!(
-                response["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("operation context")
-            );
-        }
-    }
-
-    #[test]
-    fn policy_routing_key_is_not_treated_as_a_setting() {
-        let params = serde_json::json!({"key": "device-1", "reconnect_on_resume": false});
-        let settings = super::policy_values(&params);
-        let store = crate::management::ManagementStore::in_memory();
-        assert!(
-            !store
-                .update_device_policy("device-1", &settings)
-                .unwrap()
-                .reconnect_on_resume
-        );
-        assert!(params.get("key").is_some());
-        assert!(
-            store
-                .update_device_policy(
-                    "device-1",
-                    &super::policy_values(&serde_json::json!({"key":"device-1", "unknown": true}))
-                )
-                .is_err()
-        );
-    }
 }

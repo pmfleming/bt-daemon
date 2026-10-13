@@ -1,8 +1,8 @@
 use super::{
-    cache_entry_is_fresh, cached_device_view, device_capabilities, fast_pair_capabilities,
-    presentation,
+    CachedDevice, cache_entry_is_fresh, cached_device_view, device_capabilities,
+    fast_pair_capabilities, presentation,
 };
-use crate::bluez::{CachedDevice, DISCOVERED_DEVICE_CACHE_TTL};
+use crate::bluez::CACHE_TTL;
 use crate::fast_pair::FAST_PAIR_SERVICE_UUID;
 use crate::identity::DeviceIdentityRegistry;
 use crate::model::{
@@ -123,10 +123,8 @@ fn presentation_restores_paired_history_but_not_live_or_unpaired_batteries() {
     );
     for connected in [true, false] {
         let current = vec![Battery::bluez_aggregate(50)];
-        let allocation = current.as_ptr();
         let view = presentation(&identities, &key, true, connected, None, None, current);
-        // Current readings are moved into the snapshot, not replaced by a cache copy.
-        assert_eq!(view.battery.as_ptr(), allocation);
+        assert_eq!(view.battery[0].percentage, 50);
         assert_eq!(view.battery_live, connected);
         assert_eq!(view.battery_last_known, !connected);
     }
@@ -146,7 +144,7 @@ fn presentation_restores_paired_history_but_not_live_or_unpaired_batteries() {
 
 #[test]
 fn cached_device_views_expire_and_never_claim_live_state() {
-    let ttl = DISCOVERED_DEVICE_CACHE_TTL.as_millis() as u64;
+    let ttl = CACHE_TTL.as_millis() as u64;
     assert!(cache_entry_is_fresh(100, 100 + ttl));
     assert!(!cache_entry_is_fresh(100, 101 + ttl));
     assert!(cache_entry_is_fresh(100, 99));

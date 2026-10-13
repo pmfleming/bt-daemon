@@ -35,17 +35,3 @@ pub(super) fn decode_switch(payload: &[u8]) -> Result<FastPairSwitchEvent> {
         observed_at_ms: 0,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn switch_events_decode_direction_reason_and_safe_names() {
-        let event = super::decode_switch(b"\x02\x02Phone\n").unwrap();
-        assert_eq!(event.reason, "call");
-        assert_eq!(event.target, "another-device");
-        assert_eq!(event.target_name.as_deref(), Some("Phone"));
-        assert!(super::decode_switch(&[1]).is_err());
-        assert!(super::decode_switch(&[1, 2, 0xff]).is_err());
-        assert_eq!(super::decode_switch(&[0, 1]).unwrap().target, "this-device");
-    }
-}

@@ -168,7 +168,7 @@ impl OutgoingTransfers {
             let result = crate::task::catch(
                 "outgoing OBEX transfer",
                 transfer.run(cancel_receiver, |update| {
-                    let _ = events.send(queued.updated(update));
+                    queued.publish(update, &events);
                 }),
             )
             .await;

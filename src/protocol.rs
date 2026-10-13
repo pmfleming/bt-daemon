@@ -140,15 +140,13 @@ fn parameter_contract(name: &str, encoded: &str) -> (Value, Value) {
 fn required_parameters(name: &str) -> &'static [&'static str] {
     match name {
         "bluetooth.setPowered" => &["powered"],
-        "bluetooth.adapter.operation" => &["key", "operation"],
+        "bluetooth.adapter.operation" | "bluetooth.device.operation" => &["key", "operation"],
         "bluetooth.adapter.update" => &["key", "changes"],
         "bluetooth.device.policy.update" => &["key"],
         "bluetooth.obex.send" => &["device_key", "path"],
-        "bluetooth.obex.respond" => &["request_id", "accept"],
+        "bluetooth.obex.respond" | "bluetooth.pairing.respond" => &["request_id", "accept"],
         "bluetooth.audio.setProfile" => &["device_key", "profile_key"],
         "bluetooth.audio.setDefault" => &["device_key", "endpoint_key"],
-        "bluetooth.device.operation" => &["key", "operation"],
-        "bluetooth.pairing.respond" => &["request_id", "accept"],
         _ => &[],
     }
 }

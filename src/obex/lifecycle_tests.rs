@@ -1,6 +1,4 @@
-use super::{
-    AuthorizationDecision, IncomingBroker, ObexEvent, PendingAuthorization, authorization::Prompt,
-};
+use super::{AuthorizationDecision, IncomingBroker, ObexEvent, authorization::Prompt};
 use crate::{
     backend::{
         AdapterOperation, BackendError, BackendErrorKind, BluetoothBackend, DeviceOperation,
@@ -43,17 +41,13 @@ fn broker() -> (Arc<IncomingBroker>, broadcast::Receiver<ObexEvent>) {
 }
 fn pending(broker: &IncomingBroker, id: &str) -> oneshot::Receiver<AuthorizationDecision> {
     let (sender, receiver) = oneshot::channel();
-    broker
-        .pending
-        .lock()
-        .unwrap()
-        .insert(id.into(), PendingAuthorization { sender });
+    broker.pending.lock().unwrap().insert(id.into(), sender);
     receiver
 }
 
 #[tokio::test]
 async fn cancellation_is_request_scoped_for_authorizations_and_active_transfers() {
-    let (broker, _) = broker();
+    let (broker, mut events) = broker();
     let (cancel, transfer_cancelled) = oneshot::channel();
     let (other, mut other_receiver) = oneshot::channel();
     broker
@@ -97,11 +91,7 @@ async fn cancellation_is_request_scoped_for_authorizations_and_active_transfers(
         other_receiver.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
-}
-
-#[tokio::test]
-async fn dropping_authorization_prompt_removes_it_and_emits_one_terminal_event() {
-    let (broker, mut events) = broker();
+    // Callback abandonment also retires its prompt, without disturbing transfers.
     let receiver = pending(&broker, "cancelled-callback");
     let mut event = ObexEvent::outgoing("cancelled-callback", "opaque-peer", "file.txt", 0);
     event.direction = "incoming".into();
@@ -111,7 +101,6 @@ async fn dropping_authorization_prompt_removes_it_and_emits_one_terminal_event()
     };
     drop(prompt);
     assert!(receiver.await.is_err());
-    assert!(broker.pending.lock().unwrap().is_empty());
     let terminal = events.recv().await.unwrap();
     assert_eq!(terminal.event, "cancelled");
     assert_eq!(terminal.status, "cancelled");

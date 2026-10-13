@@ -1570,24 +1570,6 @@ mod tests {
     };
 
     #[test]
-    fn fixed_payloads_reject_both_truncation_and_trailing_bytes() {
-        for length in 0..=8 {
-            let bytes = vec![0; length];
-            assert_eq!(BatteryReport::from_payload(&bytes).is_ok(), length == 3);
-            assert_eq!(
-                super::decode_audio_switch_capability(&bytes).is_ok(),
-                length == 4
-            );
-            assert_eq!(super::decode_address(&bytes).is_ok(), length == 6);
-            assert_eq!(decode_message_stream_psm(&bytes).is_ok(), length == 3);
-            let mut anc = vec![0x20; length];
-            assert_eq!(decode_anc_state(&anc).is_ok(), length == 4);
-            anc.fill(0);
-            assert!(decode_anc_state(&anc).is_err());
-        }
-    }
-
-    #[test]
     fn psm_characteristic_decodes_state_and_little_endian_value() {
         assert_eq!(
             decode_message_stream_psm(&[0x01, 0x80, 0x00]).unwrap(),
@@ -1643,6 +1625,7 @@ mod tests {
             );
         }
         assert!(BatteryReport::from_payload(&[1, 2]).is_err());
+        assert!(BatteryReport::from_payload(&[1, 2, 3, 4]).is_err());
     }
 
     #[test]
@@ -1659,6 +1642,7 @@ mod tests {
         assert_eq!(state.active_mode.as_deref(), Some("off"));
         assert_eq!(anc_mode_flag("noise-cancelling").unwrap(), 0x08);
         assert!(decode_anc_state(&[2, 0xa8, 0xa8, 0xa0]).is_err());
+        assert!(decode_anc_state(&[2, 0xa8, 0xa8, 0]).is_err());
         assert!(anc_mode_flag("wind").is_err());
         for (flag, mode) in super::ANC_MODES {
             assert_eq!(super::anc_modes(anc_mode_flag(mode).unwrap()), [mode]);

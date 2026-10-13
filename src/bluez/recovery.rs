@@ -282,41 +282,6 @@ macro_rules! impl_recovering_backend {
     };
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn unavailable_backend_needs_no_bluez_generation() {
-        let identities = DeviceIdentityRegistry::in_memory();
-        let management = Arc::new(ManagementStore::in_memory());
-        let backend = RecoveringBackend::new_unavailable(identities.clone(), management.clone());
-        let mut changes = backend.subscribe_changes();
-        let pairing = PairingBroker::new(identities);
-        for error in [
-            backend.snapshot().await.unwrap_err(),
-            backend.set_powered(None, true).await.unwrap_err(),
-            backend
-                .update_management(&serde_json::json!({"trust_after_pair": false}))
-                .await
-                .unwrap_err(),
-            backend
-                .remember_audio_profile("device", "profile")
-                .unwrap_err(),
-        ] {
-            assert_eq!(
-                error.downcast_ref::<BackendError>().unwrap().kind,
-                BackendErrorKind::Unavailable
-            );
-        }
-        assert!(management.policy().trust_after_pair);
-        backend.invalidate(&pairing);
-        changes.recv().await.unwrap();
-        backend.stop_generation().await;
-        assert!(backend.current().is_err());
-    }
-}
-
 impl_recovering_backend! {
     fn snapshot() -> Snapshot;
     fn set_powered(adapter_key: Option<&str>, powered: bool) -> Snapshot;

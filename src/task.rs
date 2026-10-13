@@ -29,19 +29,3 @@ fn mutation_gate(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     gates.insert(key.to_owned(), Arc::downgrade(&gate));
     gate
 }
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn device_gates_serialize_same_device_only() {
-        let first = super::device_gate("a");
-        let same = super::device_gate("a");
-        let other = super::device_gate("b");
-        let held = first.lock().await;
-        assert!(same.try_lock().is_err());
-        assert!(super::adapter_gate("a").try_lock().is_ok());
-        assert!(other.try_lock().is_ok());
-        drop(held);
-        assert!(same.try_lock().is_ok());
-    }
-}

@@ -15,12 +15,14 @@ use crate::{
 
 use crate::time::unix_time_ms;
 
-use super::{
-    BluezBackend, BluezResultExt, CachedDevice, DISCOVERED_DEVICE_CACHE_TTL, bluez_result,
-    opaque_key,
-};
+use super::{BluezBackend, BluezResultExt, CACHE_TTL, bluez_result, opaque_key};
 
 mod assembly;
+
+pub(super) struct CachedDevice {
+    device: Device,
+    observed_at_ms: u64,
+}
 
 pub(super) async fn build(backend: &BluezBackend) -> Result<Snapshot> {
     let now_ms = unix_time_ms();
@@ -388,7 +390,7 @@ fn cached_device_view(cached: &CachedDevice) -> Device {
 }
 
 fn cache_entry_is_fresh(observed_at_ms: u64, now_ms: u64) -> bool {
-    now_ms.saturating_sub(observed_at_ms) <= DISCOVERED_DEVICE_CACHE_TTL.as_millis() as u64
+    now_ms.saturating_sub(observed_at_ms) <= CACHE_TTL.as_millis() as u64
 }
 
 const fn should_include_device(paired: bool, present: bool, cached: bool) -> bool {

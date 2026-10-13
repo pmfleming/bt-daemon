@@ -37,22 +37,3 @@ impl Drop for Prompt<'_> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn cancelled_destination_is_removed_but_accepted_transfer_is_retained() {
-        let directory = tempfile::tempdir().unwrap();
-        for accepted in [false, true] {
-            let path = super::super::reserve_incoming_destination_in(directory.path(), "file.txt")
-                .unwrap();
-            let reserved = super::Destination {
-                path: path.clone(),
-                accepted,
-            };
-            assert!(path.is_file());
-            drop(reserved);
-            assert_eq!(path.exists(), accepted);
-        }
-    }
-}

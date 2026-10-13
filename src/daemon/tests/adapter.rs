@@ -1,6 +1,12 @@
-use super::*;
+use super::TestBackend;
+use crate::backend::{AdapterOperation, BluetoothBackend};
+use anyhow::Result;
+use serde_json::{Value, json};
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::Notify;
@@ -91,12 +97,12 @@ async fn outcomes_preserve_applied_unknown_and_unattempted_fields() {
             let response = crate::api::dispatch(
                 backend(&effects),
                 "bluetooth.adapter.update",
-                patch("outcomes"),
+                patch("adapter-opaque"),
             )
             .await;
             assert_eq!(response["ok"], true); // terminal result, NOT atomic success
             let batch = &response["data"]["adapter_batch"];
-            assert_eq!(batch["key"], "outcomes");
+            assert_eq!(batch["key"], "adapter-opaque");
             assert_eq!(batch["snapshot_error"].is_object(), fail_snapshot);
             assert_eq!(response["data"]["snapshot"].is_object(), !fail_snapshot);
             let mut stopped = false;
@@ -133,6 +139,9 @@ async fn outcomes_preserve_applied_unknown_and_unattempted_fields() {
                 assert_eq!(outcome["error"].is_object(), state == "unknown");
             }
             assert_eq!(effects.calls.lock().unwrap().len(), attempted);
+            if fail == Some(AdapterOperation::SetDiscoverableTimeout) && fail_snapshot {
+                assert_batch_fixture(&response);
+            }
         }
     }
     // A one-field save stays one field; the daemon never invents other changes.
@@ -153,22 +162,10 @@ async fn outcomes_preserve_applied_unknown_and_unattempted_fields() {
     assert_eq!(effects.calls.lock().unwrap()[0].2["timeout"], u32::MAX);
 }
 
-#[tokio::test]
-async fn adapter_batch_fixture_is_current() {
-    let effects = Arc::new(Effects {
-        fail: Some(AdapterOperation::SetDiscoverableTimeout),
-        fail_snapshot: true,
-        ..Default::default()
-    });
-    let response = crate::api::dispatch(
-        backend(&effects),
-        "bluetooth.adapter.update",
-        patch("adapter-opaque"),
-    )
-    .await;
+fn assert_batch_fixture(response: &Value) {
     let mut fixture = crate::protocol::contract_fixture();
     if std::env::var_os("BT_DAEMON_UPDATE_CONTRACT_FIXTURE").is_some() {
-        fixture["adapter_update"] = response;
+        fixture["adapter_update"] = response.clone();
         fixture["registry"] = crate::protocol::registry();
         std::fs::write(
             concat!(env!("CARGO_MANIFEST_DIR"), "/test_support/bt-api-v1.json"),
@@ -177,7 +174,7 @@ async fn adapter_batch_fixture_is_current() {
         .unwrap();
         return;
     }
-    assert_eq!(fixture["adapter_update"], response);
+    assert_eq!(&fixture["adapter_update"], response);
 }
 
 #[tokio::test]
@@ -194,6 +191,7 @@ async fn submitted_batch_survives_waiter_abort_and_serializes_legacy_settings() 
     tokio::time::timeout(Duration::from_secs(2), effects.started.notified())
         .await
         .unwrap();
+    assert!(crate::task::device_gate("captured").try_lock().is_ok());
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     let legacy = tokio::spawn(crate::api::dispatch(

@@ -457,32 +457,6 @@ mod tests {
     use super::ManagementStore;
 
     #[test]
-    fn failed_forget_retains_policy_until_a_successful_retry() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("device-policy.json");
-        let mut store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
-        let policy = store
-            .update_device_policy("peer", &json!({"trust_after_pair": false}))
-            .unwrap();
-        store
-            .update_device_policy("other", &json!({"trust_after_pair": false}))
-            .unwrap();
-        store.device_policy_path = Some(path.join("blocked.json"));
-        store.forget_device_policy("peer");
-        store.forget_device_policy("missing");
-        assert_eq!(store.device_policy("peer"), policy);
-        let saved = ManagementStore::load(None, None, Some(path.clone())).unwrap();
-        assert_eq!(saved.device_policy("peer"), policy);
-        store.device_policy_path = Some(path.clone());
-        store.forget_device_policy("peer");
-        store.forget_device_policy("peer");
-        assert!(store.device_policy("peer").trust_after_pair);
-        let saved = ManagementStore::load(None, None, Some(path)).unwrap();
-        assert!(saved.device_policy("peer").trust_after_pair);
-        assert_eq!(saved.device_policy("other"), policy);
-    }
-
-    #[test]
     fn policy_updates_are_retained_only_after_complete_validation() {
         let store = ManagementStore::in_memory();
         for invalid in [
@@ -551,16 +525,34 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.device_policy("peer"), defaults);
-        assert!(!store.device_policy_lock().devices.contains_key("peer"));
-        // The existing policy file cannot serve as a parent directory for a new save.
+        let policy = store
+            .update_device_policy("peer", &json!({"trust_after_pair": false}))
+            .unwrap();
+        store
+            .update_device_policy("other", &json!({"trust_after_pair": false}))
+            .unwrap();
+        // Failed updates and Forget must both leave the saved and live policy retryable.
         store.device_policy_path = Some(path.join("blocked.json"));
-        assert!(
-            store
-                .update_device_policy("peer", &json!({"fast_pair_controls_enabled": false}))
-                .is_err()
-        );
+        for key in ["peer", "new"] {
+            assert!(
+                store
+                    .update_device_policy(key, &json!({"fast_pair_controls_enabled": false}))
+                    .is_err()
+            );
+        }
+        store.forget_device_policy("peer");
+        store.forget_device_policy("missing");
+        assert_eq!(store.device_policy("peer"), policy);
+        assert_eq!(store.device_policy("new"), defaults);
+        let saved = ManagementStore::load(None, None, Some(path.clone())).unwrap();
+        assert_eq!(saved.device_policy("peer"), policy);
+        assert_eq!(saved.device_policy("new"), defaults);
+        store.device_policy_path = Some(path.clone());
+        store.forget_device_policy("peer");
+        store.forget_device_policy("peer");
         assert_eq!(store.device_policy("peer"), defaults);
-        let restored = ManagementStore::load(None, None, Some(path)).unwrap();
-        assert_eq!(restored.device_policy("peer"), defaults);
+        let saved = ManagementStore::load(None, None, Some(path)).unwrap();
+        assert_eq!(saved.device_policy("peer"), defaults);
+        assert_eq!(saved.device_policy("other"), policy);
     }
 }
