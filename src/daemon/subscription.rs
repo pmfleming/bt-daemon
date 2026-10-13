@@ -1,5 +1,9 @@
 use serde::Serialize;
 use serde_json::{Value, json};
+use shelllist_daemon_core::{
+    ApiError,
+    wire::{EventBody, Gap},
+};
 use shelllist_daemon_tokio::{BroadcastEvent, WatchPhase, forward_broadcast, forward_watch};
 use tokio::{
     sync::{broadcast, watch},
@@ -125,7 +129,7 @@ async fn forward_events<T>(
                     stream,
                     subscription_id,
                     event_name(&event),
-                    json!({ "data": event }),
+                    EventBody::data(serde_json::to_value(&event).expect("Bluetooth event")),
                 )
                 .await;
             }
@@ -135,8 +139,8 @@ async fn forward_events<T>(
                     emitter,
                     stream,
                     subscription_id,
-                    "lagged",
-                    json!({ "data": { "skipped": skipped } }),
+                    "gap",
+                    EventBody::data(serde_json::to_value(Gap::lagged(skipped)).expect("gap")),
                 )
                 .await;
             }
@@ -150,7 +154,7 @@ async fn forward_snapshots<T: Clone>(
     emitter: SignalEmitter<'static>,
     subscription_id: String,
     stream: &'static str,
-    fields: fn(T, &'static str) -> (&'static str, Value),
+    fields: fn(T, &'static str) -> (&'static str, EventBody),
 ) {
     forward_watch(receiver, |snapshot, phase| {
         let (event, payload) = fields(snapshot, watch_event(phase));
@@ -159,32 +163,30 @@ async fn forward_snapshots<T: Clone>(
     .await;
 }
 
-fn snapshot_fields(snapshot: SharedSnapshot, event: &'static str) -> (&'static str, Value) {
+fn snapshot_fields(snapshot: SharedSnapshot, event: &'static str) -> (&'static str, EventBody) {
     match snapshot {
-        SharedSnapshot::Loading => ("loading", json!({ "data": { "status": "loading" } })),
-        SharedSnapshot::Available(snapshot) => (event, json!({ "data": { "snapshot": snapshot } })),
+        SharedSnapshot::Loading => ("loading", EventBody::data(json!({"status": "loading"}))),
+        SharedSnapshot::Available(snapshot) => {
+            (event, EventBody::data(json!({"snapshot": snapshot})))
+        }
         SharedSnapshot::Unavailable(error) => (
             "unavailable",
-            json!({ "error": { "code": "bluez-unavailable", "message": error } }),
+            EventBody::error(ApiError::new("bluez-unavailable", error.as_str())),
         ),
     }
 }
 
-fn audio_fields(mut envelope: Value, event: &'static str) -> (&'static str, Value) {
+fn audio_fields(mut envelope: Value, event: &'static str) -> (&'static str, EventBody) {
     if envelope["ok"].as_bool() == Some(true) {
-        let mut fields = json!({ "data": {} });
-        fields["data"]["audio_devices"] = envelope
+        let devices = envelope
             .pointer_mut("/data/audio_devices")
             .map(Value::take)
             .unwrap_or_default();
-        (event, fields)
+        (event, EventBody::data(json!({"audio_devices": devices})))
     } else {
-        let mut fields = json!({});
-        fields["error"] = envelope
-            .get_mut("error")
-            .map(Value::take)
-            .unwrap_or_default();
-        ("unavailable", fields)
+        let error = serde_json::from_value(envelope["error"].take())
+            .unwrap_or_else(|_| ApiError::new("audio-unavailable", "Invalid audio response"));
+        ("unavailable", EventBody::error(error))
     }
 }
 
@@ -193,9 +195,9 @@ async fn emit_event(
     stream: &str,
     subscription_id: &str,
     event: &str,
-    fields: Value,
+    fields: EventBody,
 ) {
-    let result = shelllist_daemon_tokio::emit_json_event(
+    let result = shelllist_daemon_tokio::emit_event_body(
         emitter,
         INTERFACE,
         shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
@@ -221,7 +223,21 @@ fn watch_event(phase: WatchPhase) -> &'static str {
 mod tests {
     #[test]
     fn snapshot_payloads_preserve_loading_failure_and_watch_phases() {
-        use super::{SharedSnapshot, audio_fields, snapshot_fields, valid_streams};
+        use super::{SharedSnapshot, valid_streams};
+        fn snapshot_fields(
+            value: SharedSnapshot,
+            event: &'static str,
+        ) -> (&'static str, serde_json::Value) {
+            let (event, body) = super::snapshot_fields(value, event);
+            (event, serde_json::to_value(body).unwrap())
+        }
+        fn audio_fields(
+            value: serde_json::Value,
+            event: &'static str,
+        ) -> (&'static str, serde_json::Value) {
+            let (event, body) = super::audio_fields(value, event);
+            (event, serde_json::to_value(body).unwrap())
+        }
         use serde_json::json;
         use std::sync::Arc;
 
@@ -241,7 +257,7 @@ mod tests {
                 SharedSnapshot::Unavailable(Arc::new("offline".into())),
                 "changed"
             ),
-            ("unavailable", json!({"error": error}))
+            ("unavailable", json!({"data": {}, "error": error}))
         );
         for phase in ["subscribed", "changed"] {
             let snapshot = Arc::default();
@@ -264,13 +280,16 @@ mod tests {
             );
             assert_eq!(
                 audio_fields(json!({"ok": false, "error": error}), phase),
-                ("unavailable", json!({"error": error}))
+                ("unavailable", json!({"data": {}, "error": error}))
             );
         }
         for malformed in [json!(null), json!(false), json!([])] {
             assert_eq!(
                 audio_fields(malformed, "changed"),
-                ("unavailable", json!({"error": null}))
+                (
+                    "unavailable",
+                    json!({"data": {}, "error": {"code":"audio-unavailable", "message":"Invalid audio response"}})
+                )
             );
         }
         for data in [json!(null), json!(false), json!([]), json!({})] {

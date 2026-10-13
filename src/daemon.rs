@@ -13,7 +13,7 @@ pub const BUS_NAME: &str = "org.laufan.BluetoothDaemon";
 /// Object path exporting the bt-api D-Bus interface.
 pub const OBJECT_PATH: &str = "/org/laufan/BluetoothDaemon";
 /// Versioned D-Bus interface for calls, subscriptions and cancellation.
-pub const INTERFACE: &str = "org.laufan.BluetoothDaemon1";
+pub const INTERFACE: &str = "org.laufan.BluetoothDaemon2";
 /// Stream names accepted by the subscription API.
 pub use crate::protocol::stream::{
     AUDIO as AUDIO_STREAM, CHANGED as CHANGED_STREAM, OBEX as OBEX_STREAM,
@@ -179,7 +179,7 @@ impl BluetoothDaemon {
     }
 }
 
-#[zbus::interface(name = "org.laufan.BluetoothDaemon1")]
+#[zbus::interface(name = "org.laufan.BluetoothDaemon2")]
 impl BluetoothDaemon {
     async fn call(
         &self,

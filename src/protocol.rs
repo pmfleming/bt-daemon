@@ -5,7 +5,7 @@ use crate::backend::{AdapterOperation, BackendErrorKind, DeviceOperation};
 /// Stable protocol name included in every bt-api envelope.
 pub const NAME: &str = "bt-api";
 /// Wire-contract version; incompatible schema changes require a new version.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = shelllist_daemon_core::CONTRACT_VERSION as u8;
 /// Event stream identifiers accepted by subscription requests.
 pub mod stream {
     /// Cached Bluetooth snapshot updates.
@@ -58,10 +58,10 @@ macro_rules! stream_registry {
 /// Stream names and supported lifecycle event names.
 pub const STREAMS: &[(&str, &[&str])] = stream_registry! {
     stream::CHANGED => ["subscribed", "changed", "unavailable"];
-    stream::PAIRING => ["requested", "display", "answered", "cancelled", "lagged"];
-    stream::OPERATION => ["started", "progress", "completed", "failed", "cancelled", "lagged"];
-    stream::SCAN => ["started", "completed", "failed", "cancelled", "lagged"];
-    stream::OBEX => ["authorization-requested", "queued", "progress", "completed", "failed", "cancelled", "lagged"];
+    stream::PAIRING => ["requested", "display", "answered", "cancelled", "gap"];
+    stream::OPERATION => ["started", "progress", "completed", "failed", "cancelled", "gap"];
+    stream::SCAN => ["started", "completed", "failed", "cancelled", "gap"];
+    stream::OBEX => ["authorization-requested", "queued", "progress", "completed", "failed", "cancelled", "gap"];
     stream::AUDIO => ["subscribed", "changed", "unavailable"];
 };
 
@@ -301,12 +301,33 @@ pub fn registry() -> Value {
     })
 }
 
-/// Return the checked-in contract used by consumers and compatibility tests.
+/// Fixture payload examples use the same canonical constructors as live signals.
 pub fn contract_fixture() -> Value {
-    match shelllist_daemon_core::load_fixture(include_str!("../test_support/bt-api-v1.json")) {
-        Ok(fixture) => fixture,
-        Err(error) => json!({ "fixture_error": error.to_string() }),
+    use shelllist_daemon_core::{ApiIdentity, Correlation, wire::Event};
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("../test_support/bt-api-v1.json")).expect("fixture data");
+    for example in fixture.as_object_mut().unwrap().values_mut() {
+        if example["ok"] == true {
+            *example = crate::api::success(example["data"].take());
+        } else if let (Some(stream), Some(event), Some(id)) = (
+            example["stream"].as_str(),
+            example["event"].as_str(),
+            example["subscription_id"].as_str(),
+        ) {
+            *example = Event::new(
+                ApiIdentity::new(NAME, VERSION as u32),
+                stream,
+                event,
+                Correlation::Subscription(id),
+                example["data"].clone(),
+            )
+            .into_value()
+            .expect("event fixture");
+        }
     }
+    fixture["version"] = json!(VERSION);
+    fixture["registry"] = registry();
+    fixture
 }
 
 #[cfg(test)]
@@ -332,6 +353,17 @@ mod tests {
         .unwrap();
 
         let fixture = contract_fixture();
+        if std::env::var_os("BT_DAEMON_UPDATE_CONTRACT_FIXTURE").is_some() {
+            std::fs::write(
+                "test_support/bt-api-v1.json",
+                format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap()),
+            )
+            .unwrap();
+            return;
+        }
+        let frozen: serde_json::Value =
+            serde_json::from_str(include_str!("../test_support/bt-api-v1.json")).unwrap();
+        assert_eq!(fixture, frozen);
         assert_eq!(fixture["version"], VERSION);
         let registry = registry();
         assert_eq!(fixture["registry"], registry);
