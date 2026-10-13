@@ -135,7 +135,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
             &client,
             "org.laufan.BluetoothDaemon",
             "/org/laufan/BluetoothDaemon",
-            "org.laufan.BluetoothDaemon1",
+            bt_daemon::daemon::INTERFACE,
         )
         .await
         .unwrap();

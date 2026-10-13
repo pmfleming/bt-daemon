@@ -184,8 +184,13 @@ fn audio_fields(mut envelope: Value, event: &'static str) -> (&'static str, Even
             .unwrap_or_default();
         (event, EventBody::data(json!({"audio_devices": devices})))
     } else {
-        let error = serde_json::from_value(envelope["error"].take())
-            .unwrap_or_else(|_| ApiError::new("audio-unavailable", "Invalid audio response"));
+        let error = serde_json::from_value(
+            envelope
+                .get_mut("error")
+                .map(Value::take)
+                .unwrap_or(Value::Null),
+        )
+        .unwrap_or_else(|_| ApiError::new("audio-unavailable", "Invalid audio response"));
         ("unavailable", EventBody::error(error))
     }
 }

@@ -1,14 +1,9 @@
 use anyhow::Result;
 use serde_json::Value;
 use shelllist_daemon_core::DaemonEndpoint;
-use shelllist_daemon_tokio::{
-    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig, run_jsonl_client,
-};
+use shelllist_daemon_tokio::{CorrelationPolicy, JsonlClientConfig, run_jsonl_client};
 
-use crate::{
-    api,
-    daemon::{BUS_NAME, INTERFACE, OBJECT_PATH},
-};
+use crate::daemon::{BUS_NAME, INTERFACE, OBJECT_PATH};
 
 const ENDPOINT: DaemonEndpoint = DaemonEndpoint::new("bt-daemon", BUS_NAME, OBJECT_PATH, INTERFACE);
 
@@ -53,14 +48,6 @@ impl CorrelationPolicy for BluetoothCorrelation {
     }
 }
 
-fn call_failure(method: &str, error: &anyhow::Error) -> CallFailure {
-    tracing::warn!(%method, error = %error, error_chain = %format!("{error:#}"), "client call to daemon failed");
-    CallFailure::Api(api::error(
-        "daemon-unavailable",
-        "bt-daemon session service is unavailable".to_string(),
-    ))
-}
-
 /// Bridge JSON Lines on standard input/output to the session D-Bus daemon.
 /// Owns subscriptions for this frontend session and releases them on disconnect.
 pub async fn run() -> Result<()> {
@@ -68,8 +55,6 @@ pub async fn run() -> Result<()> {
     run_jsonl_client(JsonlClientConfig {
         endpoint: ENDPOINT,
         correlation: BluetoothCorrelation,
-        cancel_mode: CancelMode::Json,
-        call_failure,
         pending_event_limit: 32,
         max_in_flight_requests: 64,
         shutdown_timeout: Some(std::time::Duration::from_secs(5)),
