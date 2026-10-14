@@ -113,6 +113,7 @@
                 cargo-mutants
                 dbus
                 gcc
+                git
                 jq
                 just
                 llvmPackages.libclang
