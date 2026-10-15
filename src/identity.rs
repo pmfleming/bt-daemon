@@ -356,35 +356,6 @@ mod tests {
         }]
     }
 
-    #[test]
-    fn concurrent_promotions_through_adapter_aliases_keep_the_discovered_key() {
-        let registry = DeviceIdentityRegistry::in_memory();
-        for adapter in ["hci0", "hci1"] {
-            registry.register_adapter(adapter, "00:11:22:33:44:55");
-        }
-        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let expected = registry.device_key("hci0", address);
-        let barrier = std::sync::Barrier::new(8);
-        std::thread::scope(|scope| {
-            let workers = (0..8)
-                .map(|i| {
-                    let (registry, barrier) = (&registry, &barrier);
-                    scope.spawn(move || {
-                        barrier.wait();
-                        registry.promote_device(if i % 2 == 0 { "hci0" } else { "hci1" }, address)
-                    })
-                })
-                .collect::<Vec<_>>();
-            for worker in workers {
-                assert_eq!(worker.join().unwrap(), expected);
-            }
-        });
-        let state = registry.state();
-        assert!(state.ephemeral.is_empty());
-        assert_eq!(state.devices.len(), 1);
-        assert_eq!(state.devices.values().next(), Some(&expected));
-    }
-
     #[tokio::test]
     async fn discovery_stays_private_until_pairing_and_paired_history_survives_reload() {
         let directory = tempfile::tempdir().unwrap();

@@ -168,9 +168,7 @@ async fn read_from(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        NOT_CONNECTED, PERMISSION_DENIED, Reply, peer, read_from, reply, request, sent_request,
-    };
+    use super::{NOT_CONNECTED, PERMISSION_DENIED, Reply, peer, read_from, sent_request};
     use bluer::Address;
     use std::{io, os::fd::OwnedFd, time::Duration};
     use tokio::io::unix::AsyncFd;
@@ -181,42 +179,6 @@ mod tests {
         packet.extend(peer);
         packet.extend([rssi, 127, 127]);
         packet
-    }
-
-    #[test]
-    fn wire_format_correlation_signed_values_and_unknown() {
-        let peer = peer("01:23:45:67:89:AB".parse().unwrap(), 2);
-        assert_eq!(
-            request(0x1234, &peer),
-            [
-                0x31, 0, 0x34, 0x12, 7, 0, 0xab, 0x89, 0x67, 0x45, 0x23, 1, 2
-            ]
-        );
-        let packet = complete(3, &peer, (-63_i8) as u8);
-        assert_eq!(reply(&packet, 3, &peer), Some(Reply::Reading(-63)));
-        for end in 0..packet.len() {
-            assert_eq!(reply(&packet[..end], 3, &peer), None);
-        }
-        assert_eq!(reply(&packet, 2, &peer), None);
-        assert_eq!(reply(&packet, 3, &[0; 7]), None);
-        assert_eq!(
-            reply(&complete(3, &peer, 0), 3, &peer),
-            Some(Reply::Reading(0))
-        );
-        assert_eq!(
-            reply(&complete(3, &peer, 127), 3, &peer),
-            Some(Reply::Unavailable)
-        );
-        for (offset, value) in [(0, 3), (4, 12), (6, 0x32)] {
-            let mut wrong = packet.clone();
-            wrong[offset] = value;
-            assert_eq!(reply(&wrong, 3, &peer), None);
-        }
-        assert_eq!(
-            reply(&[2, 0, 0, 0, 3, 0, 0x31, 0, 0x0c], 0, &[0; 7]),
-            Some(Reply::Unavailable)
-        );
-        assert_eq!(reply(&[2, 0, 0, 0, 3, 0, 0x31, 0, 0], 0, &[0; 7]), None);
     }
 
     fn pair() -> (AsyncFd<OwnedFd>, tokio::net::UnixDatagram) {
@@ -230,24 +192,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_reads_classic_and_both_le_address_types() {
-        for (random, classic) in [(false, true), (false, false), (true, false)] {
+    async fn transport_correlates_wire_replies_for_classic_and_both_le_address_types() {
+        for (random, classic, rssi, expected) in [
+            (false, true, 0, Reply::Reading(0)),
+            (false, false, (-42_i8) as u8, Reply::Reading(-42)),
+            (true, false, 127, Reply::Unavailable),
+        ] {
             let (client, server) = pair();
-            let address = Address::default();
-            let worker = tokio::spawn(read_from(client, 4, address, random));
+            let address = "01:23:45:67:89:AB".parse().unwrap();
+            let worker = tokio::spawn(read_from(client, 0x1234, address, random));
             let mut buffer = [0; 32];
             let count = server.recv(&mut buffer).await.unwrap();
+            // Independent wire expectation, not the same request encoder as production.
             assert_eq!(
                 &buffer[..count],
-                &request(4, &peer(address, if random { 2 } else { 0 }))
+                &[
+                    0x31,
+                    0,
+                    0x34,
+                    0x12,
+                    7,
+                    0,
+                    0xab,
+                    0x89,
+                    0x67,
+                    0x45,
+                    0x23,
+                    1,
+                    if random { 2 } else { 0 }
+                ]
             );
             if !random && !classic {
                 server
-                    .send(&[1, 0, 4, 0, 3, 0, 0x31, 0, NOT_CONNECTED])
+                    .send(&[1, 0, 0x34, 0x12, 3, 0, 0x31, 0, NOT_CONNECTED])
                     .await
                     .unwrap();
                 let count = server.recv(&mut buffer).await.unwrap();
-                assert_eq!(&buffer[..count], &request(4, &peer(address, 1)));
+                assert_eq!(
+                    &buffer[..count],
+                    &[
+                        0x31, 0, 0x34, 0x12, 7, 0, 0xab, 0x89, 0x67, 0x45, 0x23, 1, 1
+                    ]
+                );
             }
             let kind = if classic {
                 0
@@ -256,20 +242,32 @@ mod tests {
             } else {
                 1
             };
-            // Oversized datagrams and unrelated events must not complete the request.
+            let packet = complete(0x1234, &peer(address, kind), rssi);
             server.send(&[0; 2048]).await.unwrap();
             server
-                .send(&complete(5, &peer(address, kind), 20))
+                .send(&complete(0x1235, &peer(address, kind), 20))
                 .await
                 .unwrap();
+            let mut wrong_peer = peer(address, kind);
+            wrong_peer[0] ^= 1;
             server
-                .send(&complete(4, &peer(address, kind), (-42_i8) as u8))
+                .send(&complete(0x1234, &wrong_peer, 20))
                 .await
                 .unwrap();
-            assert_eq!(
-                worker.await.unwrap().unwrap(),
-                (Reply::Reading(-42), classic)
-            );
+            for end in [3, 9, 18] {
+                server.send(&packet[..end]).await.unwrap();
+            }
+            for (offset, value) in [(0, 3), (4, 12), (6, 0x32)] {
+                let mut malformed = packet.clone();
+                malformed[offset] = value;
+                server.send(&malformed).await.unwrap();
+            }
+            server
+                .send(&[2, 0, 0x34, 0x12, 3, 0, 0x31, 0, 0])
+                .await
+                .unwrap();
+            server.send(&packet).await.unwrap();
+            assert_eq!(worker.await.unwrap().unwrap(), (expected, classic));
         }
     }
 
@@ -292,17 +290,22 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         tokio::time::resume(); // Real socket readiness must not race auto-advanced timers.
-        let (client, server) = pair();
-        let worker = tokio::spawn(read_from(client, 0, Address::default(), false));
-        server.recv(&mut buffer).await.unwrap();
-        server
-            .send(&[2, 0, 0, 0, 3, 0, 0x31, 0, PERMISSION_DENIED])
-            .await
-            .unwrap();
-        assert_eq!(worker.await.unwrap().unwrap(), (Reply::Denied, true));
-        assert_eq!(
-            server.try_recv(&mut buffer).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
+        for (status, expected) in [
+            (PERMISSION_DENIED, Reply::Denied),
+            (0x0c, Reply::Unavailable),
+        ] {
+            let (client, server) = pair();
+            let worker = tokio::spawn(read_from(client, 0, Address::default(), false));
+            server.recv(&mut buffer).await.unwrap();
+            server
+                .send(&[2, 0, 0, 0, 3, 0, 0x31, 0, status])
+                .await
+                .unwrap();
+            assert_eq!(worker.await.unwrap().unwrap(), (expected, true));
+            assert_eq!(
+                server.try_recv(&mut buffer).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
     }
 }

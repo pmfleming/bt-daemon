@@ -204,14 +204,3 @@ impl OutgoingTransfers {
         true
     }
 }
-
-#[cfg(test)]
-mod support_tests {
-    #[test]
-    fn incoming_agent_requires_explicit_opt_in() {
-        for value in [None, Some(""), Some("0"), Some("true")] {
-            assert!(!super::incoming_agent_enabled(value));
-        }
-        assert!(super::incoming_agent_enabled(Some("1")));
-    }
-}

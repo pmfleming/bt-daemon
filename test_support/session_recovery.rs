@@ -41,6 +41,15 @@ impl AgentManager {
     fn unregister_agent(&self, _path: ObjectPath<'_>) {}
 }
 
+struct ObexAgentManager(Arc<AtomicUsize>);
+
+#[zbus::interface(name = "org.bluez.obex.AgentManager1")]
+impl ObexAgentManager {
+    fn register_agent(&self, _path: ObjectPath<'_>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 async fn bluez(address: &str, allowed: Arc<AtomicBool>, attempts: Arc<AtomicUsize>) -> Connection {
     Builder::address(address)
         .unwrap()
@@ -110,6 +119,19 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
             .read_line(&mut address)
             .unwrap();
         let address = address.trim();
+        let incoming_registrations = Arc::new(AtomicUsize::new(0));
+        let _obex = Builder::address(address)
+            .unwrap()
+            .name("org.bluez.obex")
+            .unwrap()
+            .serve_at(
+                "/org/bluez/obex",
+                ObexAgentManager(Arc::clone(&incoming_registrations)),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let allowed = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicUsize::new(0));
         let mut service = if initially_present {
@@ -123,6 +145,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
                 .env("DBUS_SESSION_BUS_ADDRESS", address)
                 .env("DBUS_SYSTEM_BUS_ADDRESS", address)
                 .env("BT_DAEMON_STATE_DIR", state.path())
+                .env_remove("BT_DAEMON_OBEX_INCOMING")
                 .env("XDG_RUNTIME_DIR", state.path())
                 .env("PIPEWIRE_REMOTE", "bt-daemon-test-no-server")
                 .env("RUST_LOG", "error")
@@ -229,5 +252,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
             owner_proxy.get_name_owner(name).await.unwrap(),
             original_owner
         );
+        // Even with obexd present, default startup/recovery must not claim incoming transfers.
+        assert_eq!(incoming_registrations.load(Ordering::SeqCst), 0);
     }
 }

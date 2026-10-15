@@ -138,11 +138,6 @@ impl OperationCoordinator {
         json!({ "active": active, "recent": recent })
     }
 
-    #[cfg(test)]
-    pub(super) async fn start(&self, params: Value) -> Value {
-        self.start_owned(params, None).await
-    }
-
     pub(super) async fn start_owned(&self, params: Value, owner: Option<String>) -> Value {
         let (device_key, operation) = match api::typed_operation::<DeviceOperation>(&params) {
             Ok((key, operation)) => (key.to_owned(), operation),

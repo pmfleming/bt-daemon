@@ -829,63 +829,38 @@ mod tests {
     };
 
     #[test]
-    fn probe_results_are_deduplicated_and_linked_to_defaults() {
+    fn probed_profiles_are_unique_selectable_and_respect_active_policy() {
         let mut device = audio_device();
-        let profile = audio_profile(2, 100);
-        update_profile(
-            &mut device,
-            pipewire::spa::param::ParamType::EnumProfile,
-            profile.clone(),
-        );
-        update_profile(
-            &mut device,
-            pipewire::spa::param::ParamType::EnumProfile,
-            profile,
-        );
-        update_profile(
-            &mut device,
-            pipewire::spa::param::ParamType::Profile,
-            audio_profile(2, 0),
-        );
-        device
-            .profiles
-            .extend([audio_profile(1, i32::MIN), audio_profile(3, i32::MAX)]);
+        for _ in 0..2 {
+            update_profile(
+                &mut device,
+                pipewire::spa::param::ParamType::EnumProfile,
+                audio_profile(2, 100),
+            );
+        }
         let mut endpoints = HashMap::from([(
             7,
             DeviceEndpoints {
                 sink: Some(AudioEndpoint {
-                    name: "bluez_output.7".into(),
-                    state: "idle".into(),
+                    name: "output".into(),
+                    state: "running".into(),
                     is_default: false,
                 }),
                 source: None,
             },
         )]);
-        let devices = finalize_devices(
+        let mut device = finalize_devices(
             vec![device],
             &mut endpoints,
             &Defaults {
-                sink: "bluez_output.7".into(),
+                sink: "output".into(),
                 source: String::new(),
             },
-        );
-        assert_eq!(
-            devices[0]
-                .profiles
-                .iter()
-                .map(|profile| profile.index)
-                .collect::<Vec<_>>(),
-            [3, 2, 1]
-        );
-        assert!(endpoints.is_empty());
-        assert_eq!(devices[0].active_profile, Some(2));
-        assert!(devices[0].sink.as_ref().unwrap().is_default);
-    }
-
-    #[test]
-    fn profile_selection_is_scoped_available_and_skips_active_policy_profiles() {
-        let mut device = audio_device();
-        device.profiles.push(audio_profile(2, 100));
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(device.profiles.len(), 1);
+        assert!(device.sink.as_ref().unwrap().is_default);
         let mut request = super::PolicyRequest {
             device_key: "peer".into(),
             address: device.address.clone(),
@@ -897,7 +872,11 @@ mod tests {
         assert!(request.preferred_profile(&device).is_err());
         request.preferred_profile_key = Some(super::profile_key("peer", "a2dp-sink"));
         assert_eq!(request.preferred_profile(&device).unwrap(), Some(2));
-        device.active_profile = Some(2);
+        update_profile(
+            &mut device,
+            pipewire::spa::param::ParamType::Profile,
+            audio_profile(2, 100),
+        );
         assert_eq!(request.preferred_profile(&device).unwrap(), None);
         device.profiles[0].available = false;
         assert!(request.preferred_profile(&device).is_err());

@@ -1569,101 +1569,91 @@ impl FastPairBatteryProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatteryReport, PsmAvailability, anc_mode_flag, crypt_block, decode_anc_state,
-        decode_component, decode_message_stream_psm, derive_aes_key,
+        BatteryReport, audio_switch, commands, crypt_block, decode_anc_state, derive_aes_key,
+        noise_control_payload,
     };
 
     #[test]
-    fn psm_characteristic_decodes_state_and_little_endian_value() {
-        assert_eq!(
-            decode_message_stream_psm(&[0x01, 0x80, 0x00]).unwrap(),
-            PsmAvailability::Ready(0x80)
-        );
-        assert_eq!(
-            decode_message_stream_psm(&[0x00, 0x00, 0x00]).unwrap(),
-            PsmAvailability::Unknown
-        );
-        assert_eq!(
-            decode_message_stream_psm(&[0x02, 0x00, 0x00]).unwrap(),
-            PsmAvailability::Unavailable
-        );
-        assert!(decode_message_stream_psm(&[0x01, 0x7f, 0x00]).is_err());
-        assert!(decode_message_stream_psm(&[0x01, 0x00]).is_err());
-        assert!(decode_message_stream_psm(&[0x03, 0x80, 0x00]).is_err());
-    }
-
-    #[test]
-    fn battery_reports_preserve_component_values_and_reject_invalid_payloads() {
-        let reports = BatteryReport::from_payload(&[0xe4, 0x32, 0xff])
+    fn message_payloads_preserve_valid_readings_and_reject_untrusted_data() {
+        let reports = BatteryReport::from_payload(&[0xe4, 0x32, 0x4e])
             .unwrap()
             .model_batteries();
-        assert_eq!(reports[0].charging, Some(true));
-        assert_eq!(reports[1].charging, Some(false));
-        assert_eq!(reports.len(), 2); // Unknown percentage is still not invented.
-        assert_eq!(decode_component(0xe4).unwrap(), Some(100));
-        assert_eq!(decode_component(0x7f).unwrap(), None);
-        assert_eq!(decode_component(0xff).unwrap(), None);
-        assert!(decode_component(0x7e).is_err());
-        for (payload, expected) in [
-            (
-                [0x64, 0x64, 0x4e],
-                vec![("left", 100), ("right", 100), ("case", 78)],
-            ),
-            ([0x64, 0x64, 0xff], vec![("left", 100), ("right", 100)]),
-        ] {
-            let batteries = BatteryReport::from_payload(&payload)
+        assert_eq!(
+            reports
+                .iter()
+                .map(|b| (b.component.as_str(), b.percentage, b.charging))
+                .collect::<Vec<_>>(),
+            [
+                ("left", 100, Some(true)),
+                ("right", 50, Some(false)),
+                ("case", 78, Some(false))
+            ]
+        );
+        assert_eq!(
+            BatteryReport::from_payload(&[100, 50, 0xff])
                 .unwrap()
-                .model_batteries();
-            assert_eq!(
-                batteries
-                    .iter()
-                    .map(|battery| (battery.component.as_str(), battery.percentage))
-                    .collect::<Vec<_>>(),
-                expected,
-                "{payload:?}"
-            );
-            assert!(
-                batteries
-                    .iter()
-                    .all(|battery| battery.source == "google-fast-pair-message-stream")
-            );
+                .model_batteries()
+                .len(),
+            2
+        );
+        for invalid in [&[1, 2][..], &[1, 2, 3, 4][..], &[0x7e, 50, 0xff][..]] {
+            assert!(BatteryReport::from_payload(invalid).is_err());
         }
-        assert!(BatteryReport::from_payload(&[1, 2]).is_err());
-        assert!(BatteryReport::from_payload(&[1, 2, 3, 4]).is_err());
-    }
 
-    #[test]
-    fn anc_state_exposes_only_documented_modes() {
-        let mut state = decode_anc_state(&[0x02, 0xe8, 0xa8, 0x20]).unwrap();
+        let state = decode_anc_state(&[2, 0xe8, 0xa8, 0x20]).unwrap();
+        assert_eq!(state.active_mode.as_deref(), Some("off"));
         assert_eq!(
             state.available_modes,
             ["transparent", "adaptive", "off", "noise-cancelling"]
         );
         assert_eq!(
-            state.settable_modes,
-            ["transparent", "off", "noise-cancelling"]
+            noise_control_payload(&state, "transparent").unwrap(),
+            [2, 0xe8, 0xa8, 0x80]
         );
-        assert_eq!(state.active_mode.as_deref(), Some("off"));
-        assert_eq!(anc_mode_flag("noise-cancelling").unwrap(), 0x08);
-        assert!(decode_anc_state(&[2, 0xa8, 0xa8, 0xa0]).is_err());
-        assert!(decode_anc_state(&[2, 0xa8, 0xa8, 0]).is_err());
-        assert!(anc_mode_flag("wind").is_err());
-        for (flag, mode) in super::ANC_MODES {
-            assert_eq!(super::anc_modes(anc_mode_flag(mode).unwrap()), [mode]);
-            let payload = super::noise_control_payload(&state, mode);
-            if mode == "adaptive" {
-                assert!(payload.is_err());
-            } else {
-                assert_eq!(payload.unwrap(), [2, 0xe8, 0xa8, flag]);
-            }
+        for unavailable in ["adaptive", "wind"] {
+            assert!(noise_control_payload(&state, unavailable).is_err());
         }
-        assert!(super::noise_control_payload(&state, "wind").is_err());
-        state.version = 1;
-        assert!(super::noise_control_payload(&state, "off").is_err());
+        for invalid in [
+            &[2, 0xa8, 0xa8][..],
+            &[2, 0xa8, 0xa8, 0xa0][..],
+            &[2, 0xa8, 0xa8, 0][..],
+        ] {
+            assert!(decode_anc_state(invalid).is_err());
+        }
+        let unsupported = decode_anc_state(&[1, 0x20, 0x20, 0x20]).unwrap();
+        assert!(noise_control_payload(&unsupported, "off").is_err());
+
+        let mut payload = vec![1, 2];
+        payload.extend_from_slice("\n\u{202e}Buds".as_bytes());
+        let event = audio_switch::notification(&payload).unwrap();
+        assert_eq!(
+            (event.reason.as_str(), event.target.as_str()),
+            ("media", "another-device")
+        );
+        assert_eq!(event.target_name.as_deref(), Some("Buds"));
+        payload.extend_from_slice(&[b'x'; 200]);
+        assert_eq!(
+            audio_switch::notification(&payload)
+                .unwrap()
+                .target_name
+                .unwrap()
+                .chars()
+                .count(),
+            128
+        );
+        for invalid in [&[1][..], &[1, 2, 0xff][..]] {
+            assert!(audio_switch::notification(invalid).is_err());
+        }
     }
 
     #[test]
-    fn provisioning_crypto_matches_google_fast_pair_test_vectors() {
+    fn provisioning_and_authenticated_commands_match_independent_crypto_vectors() {
+        let frame =
+            commands::authenticated_frame(8, 0x12, &[1], &[4; 16], &[0x11; 8], &[0x22; 8]).unwrap();
+        assert_eq!(&frame[..5], &[8, 0x12, 0, 17, 1]);
+        assert_eq!(&frame[5..13], &[0x22; 8]);
+        // Independent Python hmac/SHA-256 reference: session || nonce || message.
+        assert_eq!(hex::encode(&frame[13..]), "13cfdae51949437e");
         let shared =
             hex::decode("9dade4f86ac3488bbac2ac34b5fe68a0ee5a6706f543d9061ad57889498ae6ba")
                 .unwrap();

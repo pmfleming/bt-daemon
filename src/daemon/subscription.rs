@@ -244,7 +244,54 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_payloads_preserve_data_and_request_recovery_on_loss() {
+    fn subscription_payloads_preserve_state_and_signal_recovery_on_failure() {
+        use super::{SharedSnapshot, audio_fields, snapshot_fields, valid_streams};
+        use std::sync::Arc;
+
+        assert!(!valid_streams(&[]));
+        assert!(!valid_streams(&["unsupported".into()]));
+        for (stream, _) in crate::protocol::STREAMS {
+            assert!(valid_streams(&[stream.to_string()]));
+            assert!(!valid_streams(&[stream.to_string(), "unsupported".into()]));
+        }
+        let (event, body) = snapshot_fields(SharedSnapshot::Loading, "subscribed");
+        assert_eq!(event, "loading");
+        assert_eq!(body.data, json!({"status": "loading"}));
+        let (event, body) =
+            snapshot_fields(SharedSnapshot::Available(Arc::default()), "subscribed");
+        assert_eq!(event, "subscribed");
+        assert!(body.data["snapshot"].is_object() && body.error.is_none());
+        let (event, body) = snapshot_fields(
+            SharedSnapshot::Unavailable(Arc::new("offline".into())),
+            "changed",
+        );
+        assert_eq!(event, "unavailable");
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            json!({"data": {}, "error": {"code": "bluez-unavailable", "message": "offline"}})
+        );
+
+        let (event, body) = audio_fields(
+            crate::api::success(json!({"audio_devices": [{"profiles": [1, 2]}], "ignored": true})),
+            "changed",
+        );
+        assert_eq!(event, "changed");
+        assert_eq!(body.data, json!({"audio_devices": [{"profiles": [1, 2]}]}));
+        let (event, body) = audio_fields(
+            crate::api::error("audio-unavailable", "offline".into()),
+            "changed",
+        );
+        assert_eq!(event, "unavailable");
+        assert_eq!(body.error.unwrap().message, "offline");
+        // Regression: scalar/array envelopes must never panic while extracting fields.
+        for malformed in [json!(null), json!([])] {
+            let (event, body) = audio_fields(malformed.clone(), "changed");
+            assert_eq!(event, "unavailable");
+            assert_eq!(body.error.unwrap().code, "audio-unavailable");
+            let (_, body) = audio_fields(json!({"ok": true, "data": malformed}), "changed");
+            assert_eq!(body.data, json!({"audio_devices": null}));
+        }
+
         let broken = BroadcastEvent::Item(Unserializable);
         let (event, body) = broadcast_fields(&broken, |_| "progress");
         assert_eq!(event, "gap");
@@ -252,7 +299,6 @@ mod tests {
             body.data,
             json!({"reason": "source-reset", "dropped_events": "1"})
         );
-        assert!(body.error.is_none());
         let lagged = BroadcastEvent::<Unserializable>::Lagged(u64::MAX);
         let (event, body) = broadcast_fields(&lagged, |_| "progress");
         assert_eq!(event, "gap");
@@ -260,88 +306,9 @@ mod tests {
             body.data,
             json!({"reason": "subscriber-lag", "dropped_events": u64::MAX.to_string()})
         );
-        // A failed event does not poison subsequent events or change their name/data.
         let next = BroadcastEvent::Item(json!({"stage": "connecting"}));
         let (event, body) = broadcast_fields(&next, |_| "progress");
         assert_eq!(event, "progress");
         assert_eq!(body.data, json!({"stage": "connecting"}));
-    }
-
-    #[test]
-    fn snapshot_payloads_preserve_loading_failure_and_watch_phases() {
-        use super::{SharedSnapshot, valid_streams};
-        fn snapshot_fields(
-            value: SharedSnapshot,
-            event: &'static str,
-        ) -> (&'static str, serde_json::Value) {
-            let (event, body) = super::snapshot_fields(value, event);
-            (event, serde_json::to_value(body).unwrap())
-        }
-        fn audio_fields(
-            value: serde_json::Value,
-            event: &'static str,
-        ) -> (&'static str, serde_json::Value) {
-            let (event, body) = super::audio_fields(value, event);
-            (event, serde_json::to_value(body).unwrap())
-        }
-        use std::sync::Arc;
-
-        assert!(!valid_streams(&[]));
-        assert!(!valid_streams(&["unsupported".into()]));
-        for (stream, _) in crate::protocol::STREAMS {
-            assert!(valid_streams(&[stream.to_string(), stream.to_string()]));
-            assert!(!valid_streams(&[stream.to_string(), "unsupported".into()]));
-        }
-        assert_eq!(
-            snapshot_fields(SharedSnapshot::Loading, "subscribed"),
-            ("loading", json!({"data": {"status": "loading"}}))
-        );
-        let error = json!({"code": "bluez-unavailable", "message": "offline"});
-        assert_eq!(
-            snapshot_fields(
-                SharedSnapshot::Unavailable(Arc::new("offline".into())),
-                "changed"
-            ),
-            ("unavailable", json!({"data": {}, "error": error}))
-        );
-        for phase in ["subscribed", "changed"] {
-            let snapshot = Arc::default();
-            let expected = json!({"data": {"snapshot": snapshot}});
-            assert_eq!(
-                snapshot_fields(SharedSnapshot::Available(snapshot), phase),
-                (phase, expected)
-            );
-            assert_eq!(
-                audio_fields(
-                    crate::api::success(
-                        json!({"audio_devices": [{"profiles": [1, 2]}], "ignored": true})
-                    ),
-                    phase
-                ),
-                (
-                    phase,
-                    json!({"data": {"audio_devices": [{"profiles": [1, 2]}]}})
-                )
-            );
-            assert_eq!(
-                audio_fields(json!({"ok": false, "error": error}), phase),
-                ("unavailable", json!({"data": {}, "error": error}))
-            );
-        }
-        for malformed in [json!(null), json!(false), json!([])] {
-            assert_eq!(
-                audio_fields(malformed, "changed"),
-                (
-                    "unavailable",
-                    json!({"data": {}, "error": {"code":"audio-unavailable", "message":"Invalid audio response"}})
-                )
-            );
-        }
-        for data in [json!(null), json!(false), json!([]), json!({})] {
-            assert_eq!(
-                audio_fields(json!({"ok": true, "data": data}), "changed"),
-                ("changed", json!({"data": {"audio_devices": null}}))
-            );
-        }
     }
 }

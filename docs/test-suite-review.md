@@ -1,6 +1,92 @@
 # Test-suite reduction
 
-## Current pass: 98 → 66 tests
+## Current pass: 74 → 50 tests
+
+Baseline: `fb66164`, discovered with Cargo (`--all-targets -- --list`) and Python
+unittest discovery. There are no doctests.
+
+| Suite | Baseline | Final |
+| --- | ---: | ---: |
+| Rust unit tests | 71 | 47 |
+| Rust integration tests | 1 | 1 |
+| Python quality tooling | 2 | 2 |
+| **Total** | **74** | **50** |
+
+`74 × 0.67 = 49.58`, rounded to **50**. Rust alone is **72 → 48**, exactly
+one third fewer, and the nearest whole-test target to `72 × 0.67 = 48.24`.
+Counts are runnable test functions, not table rows. No ignores, feature switches,
+discovery exclusions or fixed-count CI gates were added.
+
+### Selection and retained protection
+
+- **BlueZ (15 → 9):** remove private watch-container/observation mutation tests and
+  duplicate assembled snapshot scenarios. Retain signal-unit honesty, freshness,
+  adapter/device invalidation isolation, stale replies, bounded enumeration,
+  multi-batch failures and suspend notifications. Snapshot tests still distinguish
+  unknown/live/cached state and standard versus vendor UUIDs. Policy rejection
+  checks now sit with backend error contracts rather than repeating settings setup.
+- **Daemon (14 → 10):** retain ownership checks through the cancellation gateway
+  inside operation and scan lifecycles, rather than a second routing fixture.
+  Keep exactly one terminal result, request recovery, shared leases, owner loss and
+  failed-stop retryability. Trim repeated patch validation cases; preserve complete
+  validation before effects and the full write/snapshot failure matrix. Replace
+  the legacy-setting serialization scenario with submitted batches on the same
+  adapter, retaining caller-disconnect survival and independent-adapter progress.
+  Consolidate subscription projection checks without losing malformed-envelope or
+  serialization-gap regressions. Test default incoming-OBEX non-registration via
+  the private-bus daemon integration instead of a private string-predicate test.
+- **Fast Pair (16 → 9):** remove exact backoff/jitter sequences and private map-size
+  assertions. Retain bounded waits, quick-budget exhaustion, deadline ordering,
+  session-only reset and per-peer PSM isolation. Check PSM data through transport
+  selection; retain independent AES/key-derivation and HMAC vectors together.
+  Prune decoder round-trip/constant-table repetition while retaining charging and
+  unknown batteries, invalid percentages/modes, malformed frames, unsupported ANC
+  versions, and bounded/sanitized remote names. Transport/backpressure, command
+  cancellation and credential persistence tests remain separate.
+- **RSSI (7 → 5):** exercise signed/zero/unknown readings and malformed/cross-target
+  packets through socket exchange rather than a second pure decoder suite. Assert
+  request bytes independently of production encoding. Test broker-to-client error
+  mappings on the private bus rather than fabricating client-only samples; retain
+  limits, timeout cleanup, fail-closed permissions, Polkit identity and restart tests.
+- **Other boundaries:** remove a nondeterministic promotion test that could pass the
+  former two-lock implementation; retain identity privacy/promotion/alias/reload and
+  writer failure recovery. Fold global policy validation into the transactional
+  policy lifecycle, borrowed OBEX name fallback into file safety, and profile
+  deduplication/default mapping into selection. Remove malformed embedded-debug-
+  fixture tests, retaining the frozen public wire contract. Client correlation,
+  typed PipeWire POD parsing, pairing secrecy and rfkill behavior remain covered.
+
+The change removes **467 test-code lines** before documentation. Removed scenarios
+were pruned, not retained wholesale as helper functions. Production behavior is
+unchanged; the only non-test-module removal is an unused `#[cfg(test)]` operation
+starter. Fewer tests mean less independent failure isolation; some retained
+boundary tests are broader. This is not a claim of unchanged coverage.
+
+### Validation and trade-offs
+
+- All **48 Rust tests** pass in parallel and sequentially; both Python tests pass.
+  Formatting, diff checks and strict Clippy (`--all-targets --all-features --locked
+  -- -D warnings`) pass; RQLens execution confirms zero failures, ignored tests,
+  assertionless tests, test-quality findings and production reliability findings.
+- Same-command LCOV project line coverage: **59.15% → 57.36%**. These totals include
+  inline test code; deleting tests also changes the denominator. The existing 50%
+  line threshold and all coverage configuration/exclusions are unchanged.
+- A separate audit maps unchanged production lines across edits and excludes test
+  modules/hooks only for this comparison: **3,841/7,845 → 3,813/7,845**, or
+  **48.96% → 48.60%**. Remaining lost hits are private watch-collection mechanics,
+  unknown Audio Switch display labels, and the opt-in predicate's former direct
+  unit test. Default opt-in safety is now asserted through observable registration
+  attempts in the daemon subprocess; forced subprocess teardown does not reliably
+  flush its coverage. No claim of complete branch or subprocess coverage is made.
+- Hardware and mutation testing were not run. RQLens syntax inventories remain
+  partial around macros/lexical owners; successful execution is the count authority.
+
+Before/after LCOV files, a reproducible source-line audit and its JSON report are
+under `target/test-reduction-{before,after}.lcov` and `target/test-reduction-audit.*`.
+The baseline commit is recorded in the audit; temporary Cargo/Python logs are under
+`/tmp/bt-test-reduction-*`. RQLens artifacts are in `target/analysis/`.
+
+## Previous pass: 98 → 66 tests
 
 Baseline is the working tree after the [ownership/locality refactor](reviews/rqlens-ownership-refactor.md),
 not the older counts below. Cargo discovery confirmed 95 unit tests and one

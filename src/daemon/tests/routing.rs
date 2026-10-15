@@ -1,6 +1,6 @@
 use super::daemon;
-use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use serde_json::json;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn dispatch_validates_commands_and_routes_supported_methods() {
@@ -101,19 +101,11 @@ async fn dispatch_validates_commands_and_routes_supported_methods() {
 }
 
 #[tokio::test]
-async fn routed_operations_and_scans_keep_cancellation_scoped_to_the_caller_and_request() {
-    let (daemon, mut events, mut scan_events) = daemon(false);
-    let operation = daemon
-        .dispatch_call(
-            "bluetooth.device.operation",
-            json!({"key": "device-opaque", "operation": "connect"}),
-            Some(":owner"),
-            None,
-        )
-        .await;
-    let id = super::operation_request_id(&operation, &mut events).await;
-    let conflicting = super::start_operation(&daemon, "remove").await;
-    assert_eq!(conflicting["error"]["code"], "device-busy");
+async fn scan_disable_only_cancels_callers_leases() {
+    let (mut daemon, _, _) = daemon(true);
+    let scanning = Arc::new(std::sync::Mutex::new(Vec::new()));
+    daemon.scans = super::ScanCoordinator::new(super::test_backend(true, false, scanning.clone()));
+    let mut events = daemon.scans.subscribe();
     for key in ["adapter-off", "adapter-idle", "adapter-missing"] {
         let response = daemon
             .dispatch_call(
@@ -126,47 +118,7 @@ async fn routed_operations_and_scans_keep_cancellation_scoped_to_the_caller_and_
         assert_eq!(response["error"]["code"], "scan-start-failed");
         assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
     }
-    let scan = daemon
-        .dispatch_call(
-            "bluetooth.scan",
-            json!({"adapter_key": "adapter-1", "timeout_ms": 1000}),
-            Some(":owner"),
-            None,
-        )
-        .await;
-    let scan_id = scan["data"]["scan"]["request_id"].as_str().unwrap();
-    assert_eq!(scan_events.recv().await.unwrap().state, "running");
-    let cancelled = assert_owned_cancellation(&daemon, &id).await;
-    assert_eq!(cancelled["data"]["kind"], "operation");
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        if event.event == "cancelled" {
-            assert_eq!(event.request_id, id);
-            break;
-        }
-    }
-    assert_eq!(
-        daemon.scans.snapshot().await["active"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    let cancelled = assert_owned_cancellation(&daemon, scan_id).await;
-    assert_eq!(cancelled["data"]["stopped"], scan_id);
-    assert_eq!(scan_events.recv().await.unwrap().state, "cancelled");
-    assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
-}
-
-#[tokio::test]
-async fn scan_disable_only_cancels_callers_leases() {
-    let (mut daemon, _, _) = daemon(true);
-    let scanning = Arc::new(std::sync::Mutex::new(Vec::new()));
-    daemon.scans = super::ScanCoordinator::new(super::test_backend(true, false, scanning.clone()));
-    let mut events = daemon.scans.subscribe();
+    scanning.lock().unwrap().clear();
     let mut ids = Vec::new();
     for owner in [":other", ":owner", ":owner", ":owner"] {
         let response = daemon
@@ -203,14 +155,11 @@ async fn scan_disable_only_cancels_callers_leases() {
             4
         );
     }
-    let response = daemon
-        .dispatch_call(
-            "bluetooth.scan",
-            json!({"enabled": false, "request_id": ids[1]}),
-            Some(":owner"),
-            None,
-        )
-        .await;
+    let denied: serde_json::Value =
+        serde_json::from_str(&daemon.cancel_owned(&ids[1], Some(":stranger")).await).unwrap();
+    assert_eq!(denied["error"]["code"], "request-not-found");
+    let response: serde_json::Value =
+        serde_json::from_str(&daemon.cancel_owned(&ids[1], Some(":owner")).await).unwrap();
     assert_eq!(response["ok"], true);
     assert_eq!(events.recv().await.unwrap().request_id, ids[1]);
     assert!(daemon.scans.contains(&ids[2]).await);
@@ -257,14 +206,4 @@ async fn scan_disable_only_cancels_callers_leases() {
         ]
     );
     assert_eq!(daemon.scans.snapshot().await["active"], json!([]));
-}
-
-async fn assert_owned_cancellation(daemon: &crate::daemon::BluetoothDaemon, id: &str) -> Value {
-    let denied: Value =
-        serde_json::from_str(&daemon.cancel_owned(id, Some(":other")).await).unwrap();
-    assert_eq!(denied["error"]["code"], "request-not-found");
-    let cancelled: Value =
-        serde_json::from_str(&daemon.cancel_owned(id, Some(":owner")).await).unwrap();
-    assert_eq!(cancelled["ok"], true);
-    cancelled
 }

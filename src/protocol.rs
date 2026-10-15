@@ -344,13 +344,6 @@ mod tests {
     use super::{METHODS, STREAMS, VERSION, contract_fixture, registry};
 
     #[test]
-    fn malformed_fixture_data_returns_errors_instead_of_panicking() {
-        for encoded in ["{broken", "null", "[]", "true", "42", "\"text\""] {
-            assert!(super::fixture_from(encoded).is_err(), "{encoded}");
-        }
-    }
-
-    #[test]
     fn registry_preserves_the_wire_contract_and_rejects_invalid_examples() {
         for encoded in ["{broken", "null", "[]", "true", "42"] {
             assert_eq!(

@@ -216,39 +216,3 @@ async fn handle_property(
         _ => {}
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Event, Watches};
-    use futures::{FutureExt, StreamExt, channel::mpsc};
-
-    #[test]
-    fn watches_preserve_live_peers_and_allow_replacement_after_removal() {
-        let mut watches = Watches::default();
-        let (events, stream) = mpsc::unbounded();
-        watches.insert("hci1/device".into(), stream.boxed());
-        watches.insert("hci1/device".into(), futures::stream::empty().boxed());
-        for key in ["hci0", "hci0/device"] {
-            watches.insert(key.into(), futures::stream::pending().boxed());
-        }
-        watches.remove_adapter("hci0");
-        events
-            .unbounded_send(Event::Adapter(
-                "hci1".into(),
-                bluer::AdapterEvent::DeviceAdded(bluer::Address::default()),
-            ))
-            .unwrap();
-        assert!(matches!(watches.streams.next().now_or_never(),
-            Some(Some(Event::Adapter(name, _))) if name == "hci1"));
-        drop(events);
-        assert!(matches!(watches.streams.next().now_or_never(),
-            Some(Some(Event::Ended(key))) if key == "hci1/device"));
-        watches.remove("hci1/device");
-        watches.remove("missing");
-        watches.insert("hci1/device".into(), futures::stream::empty().boxed());
-        assert!(matches!(watches.streams.next().now_or_never(),
-            Some(Some(Event::Ended(key))) if key == "hci1/device"));
-        watches.remove_adapter("hci1");
-        assert!(matches!(watches.streams.next().now_or_never(), Some(None)));
-    }
-}

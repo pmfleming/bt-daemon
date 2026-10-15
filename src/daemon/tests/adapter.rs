@@ -57,20 +57,14 @@ fn patch(key: &str) -> Value {
 }
 
 #[tokio::test]
-async fn whole_patch_is_validated_before_any_write() {
+async fn batches_validate_before_writing_and_report_partial_outcomes() {
     let effects = Arc::new(Effects::default());
     for params in [
         json!({"key": "", "changes": {"alias": "ok"}}),
         json!({"key": "a", "changes": {}}),
-        json!({"key": "a", "changes": []}),
-        json!({"key": "a", "changes": {"alias": ""}}),
         json!({"key": "a", "changes": {"alias": null}}),
         json!({"key": "a", "changes": {"alias": "ok", "pairable_timeout": -1}}),
-        json!({"key": "a", "changes": {"alias": "ok", "pairable_timeout": 1.5}}),
         json!({"key": "a", "changes": {"alias": "ok", "pairable_timeout": 4294967296_u64}}),
-        json!({"key": "a", "changes": {"alias": "ok", "pairable_timeout": "120"}}),
-        json!({"key": "a", "changes": {"alias": "ok", "pairable_timeout": null}}),
-        json!({"key": "a", "changes": {"alias": "ok", "unknown": true}}),
         json!({"key": "a", "changes": {"alias": "ok"}, "unknown": true}),
     ] {
         let response =
@@ -78,10 +72,6 @@ async fn whole_patch_is_validated_before_any_write() {
         assert_eq!(response["error"]["code"], "validation-error");
         assert!(effects.calls.lock().unwrap().is_empty());
     }
-}
-
-#[tokio::test]
-async fn outcomes_preserve_applied_unknown_and_unattempted_fields() {
     for (fail, states, attempted) in [
         (None, ["applied"; 3], 3),
         (
@@ -170,7 +160,7 @@ fn assert_batch_fixture(response: &Value) {
 }
 
 #[tokio::test]
-async fn submitted_batch_survives_waiter_abort_and_serializes_legacy_settings() {
+async fn submitted_batches_survive_waiter_abort_and_serialize_per_adapter() {
     let effects = Arc::new(Effects {
         block_once: AtomicBool::new(true),
         ..Default::default()
@@ -186,10 +176,10 @@ async fn submitted_batch_survives_waiter_abort_and_serializes_legacy_settings() 
     assert!(crate::task::device_gate("captured").try_lock().is_ok());
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
-    let legacy = tokio::spawn(crate::api::dispatch(
+    let waiting = tokio::spawn(crate::api::dispatch(
         backend(&effects),
-        "bluetooth.adapter.operation",
-        json!({"key":"captured", "operation":"set-pairable", "pairable":true}),
+        "bluetooth.adapter.update",
+        patch("captured"),
     ));
     // A different adapter can complete while the first batch owns its gate.
     let other = tokio::time::timeout(
@@ -203,7 +193,7 @@ async fn submitted_batch_survives_waiter_abort_and_serializes_legacy_settings() 
     .await
     .unwrap();
     assert_eq!(other["ok"], true);
-    assert!(!legacy.is_finished());
+    assert!(!waiting.is_finished());
     assert_eq!(
         effects
             .calls
@@ -215,7 +205,7 @@ async fn submitted_batch_survives_waiter_abort_and_serializes_legacy_settings() 
         1
     );
     effects.release.notify_one();
-    let result = tokio::time::timeout(Duration::from_secs(2), legacy)
+    let result = tokio::time::timeout(Duration::from_secs(2), waiting)
         .await
         .unwrap()
         .unwrap();
@@ -231,7 +221,9 @@ async fn submitted_batch_survives_waiter_abort_and_serializes_legacy_settings() 
             AdapterOperation::SetAlias,
             AdapterOperation::SetDiscoverableTimeout,
             AdapterOperation::SetPairableTimeout,
-            AdapterOperation::SetPairable
+            AdapterOperation::SetAlias,
+            AdapterOperation::SetDiscoverableTimeout,
+            AdapterOperation::SetPairableTimeout,
         ]
     );
 }

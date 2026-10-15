@@ -67,6 +67,7 @@ struct Fake {
     stall: AtomicBool,
     reads: AtomicUsize,
     caller: Mutex<String>,
+    next_read: Mutex<Option<io::Result<(Reply, bool)>>>,
 }
 #[async_trait]
 impl Backend for Fake {
@@ -87,7 +88,11 @@ impl Backend for Fake {
         if self.stall.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
-        Ok((Reply::Reading(0), true))
+        self.next_read
+            .lock()
+            .await
+            .take()
+            .unwrap_or(Ok((Reply::Reading(0), true)))
     }
 }
 
@@ -158,6 +163,45 @@ async fn private_bus_checks_identity_authorization_targets_limits_and_helper_res
         Reply::NotConnected
     );
     assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
+    fake.connected.store(true, Ordering::SeqCst);
+    // Validate real broker-to-client envelopes, rather than a second decoder-only suite.
+    for (index, (result, expected)) in [
+        (
+            Ok((Reply::Reading(-42), false)),
+            Ok((Reply::Reading(-42), false)),
+        ),
+        (
+            Ok((Reply::Unavailable, false)),
+            Ok((Reply::Unavailable, false)),
+        ),
+        (
+            Ok((Reply::Denied, false)),
+            Err(io::ErrorKind::PermissionDenied),
+        ),
+        (
+            Err(io::Error::from(io::ErrorKind::TimedOut)),
+            Err(io::ErrorKind::TimedOut),
+        ),
+        (
+            Ok((Reply::Reading(127), false)),
+            Err(io::ErrorKind::InvalidData),
+        ),
+        (
+            Ok((Reply::Reading(i16::MIN), false)),
+            Err(io::ErrorKind::InvalidData),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        *fake.next_read.lock().await = Some(result);
+        assert_eq!(
+            client::read(&caller, index as u16 + 2, address)
+                .await
+                .map_err(|error| error.kind()),
+            expected
+        );
+    }
     server.close().await.unwrap();
     let replacement = Arc::new(Fake::default());
     replacement.allowed.store(true, Ordering::SeqCst);

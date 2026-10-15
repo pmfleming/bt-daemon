@@ -195,21 +195,4 @@ mod tests {
         pending.resolve(key, Ok(()));
         assert!(receiver.await.unwrap().is_ok());
     }
-
-    #[test]
-    fn encoding_binds_message_and_both_nonces() {
-        let frame =
-            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[0x11; 8], &[0x22; 8]).unwrap();
-        assert_eq!(&frame[..5], &[8, 0x12, 0, 17, 1]);
-        assert_eq!(&frame[5..13], &[0x22; 8]);
-        // Independent Python hmac/SHA-256 reference for session || nonce || message.
-        assert_eq!(hex::encode(&frame[13..]), "13cfdae51949437e");
-        for other in [
-            super::authenticated_frame(8, 0x12, &[0], &[4; 16], &[0x11; 8], &[0x22; 8]).unwrap(),
-            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[0x10; 8], &[0x22; 8]).unwrap(),
-            super::authenticated_frame(8, 0x12, &[1], &[4; 16], &[0x11; 8], &[0x23; 8]).unwrap(),
-        ] {
-            assert_ne!(&frame[13..], &other[13..]);
-        }
-    }
 }

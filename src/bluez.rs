@@ -1152,55 +1152,31 @@ mod tests {
     use super::{bluez_result, validate_obex_send_state};
 
     #[test]
-    fn operation_policies_reject_disallowed_controls_and_file_transfers() {
+    fn backend_contracts_preserve_policy_rejections_unknown_state_and_error_codes() {
         use crate::{backend::DeviceOperation, management::ManagementStore};
-        let store = ManagementStore::in_memory();
-        let policy = store
-            .update_device_policy(
-                "buds",
-                &serde_json::json!({
-                    "fast_pair_controls_enabled": false
-                }),
-            )
-            .unwrap();
+        let mut policy = ManagementStore::in_memory().device_policy("buds");
+        policy.fast_pair_controls_enabled = false;
         for operation in [
             DeviceOperation::SetNoiseControl,
             DeviceOperation::SetMultipoint,
         ] {
             assert!(super::validate_fast_pair_control_policy(operation, &policy).is_err());
         }
-        for operation in [
-            DeviceOperation::Connect,
-            DeviceOperation::Disconnect,
-            DeviceOperation::Pair,
-            DeviceOperation::ProvisionFastPair,
-            DeviceOperation::Remove,
-        ] {
-            assert!(super::validate_fast_pair_control_policy(operation, &policy).is_ok());
-        }
-        let policy = store
-            .update_device_policy(
-                "buds",
-                &serde_json::json!({
-                    "fast_pair_controls_enabled": true
-                }),
-            )
-            .unwrap();
+        assert!(
+            super::validate_fast_pair_control_policy(DeviceOperation::Connect, &policy).is_ok()
+        );
+        policy.fast_pair_controls_enabled = true;
         assert!(
             super::validate_fast_pair_control_policy(DeviceOperation::SetNoiseControl, &policy)
                 .is_ok()
         );
-        assert!(
-            super::validate_fast_pair_control_policy(DeviceOperation::SetMultipoint, &policy)
-                .is_ok()
-        );
-        assert!(validate_obex_send_state(true, false).is_ok());
-        assert!(validate_obex_send_state(false, false).is_err());
-        assert!(validate_obex_send_state(true, true).is_err());
-    }
-
-    #[test]
-    fn false_properties_are_values_but_unavailable_properties_are_errors() {
+        for (paired, blocked, allowed) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            assert_eq!(validate_obex_send_state(paired, blocked).is_ok(), allowed);
+        }
         assert!(!bluez_result(Ok(false), "read paired state").unwrap());
         assert_eq!(
             crate::api::backend_error(&anyhow::anyhow!("untyped"))["error"]["code"],

@@ -907,45 +907,6 @@ mod tests {
     use super::{reserve_incoming_destination_in, safe_file_name, validate_outgoing_path};
 
     #[test]
-    fn typed_properties_borrow_values_and_names_use_the_documented_fallbacks() {
-        use super::{HashMap, ObjectPath, OwnedValue, Value, incoming_name, property};
-        let mut values = HashMap::<String, OwnedValue>::from([
-            (
-                "Name".into(),
-                Value::from("Selected.txt").try_into().unwrap(),
-            ),
-            (
-                "Filename".into(),
-                Value::from("/tmp/fallback.txt").try_into().unwrap(),
-            ),
-            ("Size".into(), OwnedValue::from(42_u64)),
-            (
-                "Session".into(),
-                Value::from(ObjectPath::try_from("/session/one").unwrap())
-                    .try_into()
-                    .unwrap(),
-            ),
-        ]);
-        assert_eq!(property::<&str>(&values, "Name"), Some("Selected.txt"));
-        assert_eq!(property::<u64>(&values, "Size"), Some(42));
-        assert_eq!(
-            property::<&ObjectPath<'_>>(&values, "Session")
-                .unwrap()
-                .as_str(),
-            "/session/one"
-        );
-        assert!(property::<&str>(&values, "Size").is_none());
-        assert!(property::<u64>(&values, "Name").is_none());
-        assert!(property::<&ObjectPath<'_>>(&values, "Name").is_none());
-        assert!(property::<&str>(&values, "missing").is_none());
-        assert_eq!(incoming_name(&values), "Selected.txt");
-        values.remove("Name");
-        assert_eq!(incoming_name(&values), "fallback.txt");
-        values.insert("Filename".into(), OwnedValue::from(false));
-        assert_eq!(incoming_name(&values), "bluetooth-transfer");
-    }
-
-    #[test]
     fn refreshed_and_incremental_transfer_states_publish_consistent_events() {
         use super::{HashMap, ObexEvent, OwnedValue, TransferUpdate, Value, broadcast};
         let mut current = TransferUpdate {
@@ -993,6 +954,19 @@ mod tests {
 
     #[test]
     fn transfer_paths_are_confined_non_overwriting_and_regular_files() {
+        use super::{HashMap, OwnedValue, Value, incoming_name};
+        let mut names = HashMap::<String, OwnedValue>::from([(
+            "Filename".into(),
+            Value::from("/tmp/fallback.txt").try_into().unwrap(),
+        )]);
+        assert_eq!(incoming_name(&names), "fallback.txt");
+        names.insert(
+            "Name".into(),
+            Value::from("Selected.txt").try_into().unwrap(),
+        );
+        assert_eq!(incoming_name(&names), "Selected.txt");
+        names.clear();
+        assert_eq!(incoming_name(&names), "bluetooth-transfer");
         let directory = std::env::temp_dir().join(format!("bt-obex-in-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         assert!(validate_outgoing_path(directory.to_str().unwrap()).is_err());

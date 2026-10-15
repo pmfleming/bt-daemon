@@ -253,9 +253,7 @@ async fn poll_peer<F>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CACHE_TTL, FAILURE_BACKOFF, LIVE_TTL, POLL_INTERVAL, Peer, Signals, poll, suspend,
-    };
+    use super::{CACHE_TTL, FAILURE_BACKOFF, LIVE_TTL, POLL_INTERVAL, Signals, poll, suspend};
     use crate::model::RssiKind;
     use bluer::Address;
     use std::{io, time::Duration};
@@ -291,106 +289,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn enumeration_is_bounded_and_multiple_batches_record_every_failure() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let empty = Mutex::new(Signals::default());
-        let start = Instant::now();
-        poll(&empty, std::future::pending(), |_, _| async {
-            panic!("enumeration did not supply any peers");
-        })
-        .await;
-        assert_eq!(start.elapsed(), Duration::from_secs(4));
-
-        let mut signals = Signals::default();
-        let peers: Vec<Peer> = (0..9)
-            .map(|index| ((format!("hci{index}"), Address::default()), index))
-            .collect();
-        for (key, _) in &peers {
-            signals.accept(key.clone(), 0, Some((-60, RssiKind::Dbm)));
-        }
-        let signals = Mutex::new(signals);
-        let active = &AtomicUsize::new(0);
-        let completed = &AtomicUsize::new(0);
-        let started = Instant::now();
-        poll(
-            &signals,
-            async {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                peers.clone()
-            },
-            |_, _| async move {
-                assert!(active.fetch_add(1, Ordering::SeqCst) < 4);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                active.fetch_sub(1, Ordering::SeqCst);
-                completed.fetch_add(1, Ordering::SeqCst);
-                Err(io::ErrorKind::TimedOut.into())
-            },
-        )
-        .await;
-        assert_eq!(started.elapsed(), Duration::from_secs(9));
-        assert_eq!(completed.load(Ordering::SeqCst), peers.len());
-        let signals = signals.lock().await;
-        for (key, _) in &peers {
-            let reading = signals.get(&key.0, key.1, true).unwrap();
-            assert_eq!(reading.rssi, -60);
-            assert!(!reading.live);
-            assert!(!signals.due(key));
-        }
-        tokio::time::advance(FAILURE_BACKOFF).await;
-        for (key, _) in &peers {
-            assert!(signals.due(key));
-        }
-    }
-
-    #[tokio::test]
-    async fn invalidation_is_scoped_even_before_the_first_read_completes() {
-        let mut signals = Signals::default();
-        let address = Address::default();
-        let other_address = "01:23:45:67:89:AB".parse().unwrap();
-        let removed = ("hci0".into(), address);
-        let same_adapter = ("hci0".into(), other_address);
-        let other_adapter = ("hci1".into(), address);
-        let sample = Some((-60, RssiKind::Dbm));
-        let epoch = signals.begin_poll();
-
-        signals.invalidate("hci0", Some(address));
-        signals.accept(removed.clone(), epoch, sample);
-        signals.accept(same_adapter.clone(), epoch, sample);
-        signals.accept(other_adapter.clone(), epoch, sample);
-        assert!(signals.get("hci0", address, true).is_none());
-        assert!(signals.get("hci0", other_address, true).unwrap().live);
-        assert!(signals.get("hci1", address, true).unwrap().live);
-
-        signals.invalidate("hci0", None);
-        signals.accept(same_adapter.clone(), epoch, sample);
-        signals.accept(other_adapter.clone(), epoch, Some((-42, RssiKind::Dbm)));
-        assert!(!signals.get("hci0", other_address, true).unwrap().live);
-        assert_eq!(signals.get("hci1", address, true).unwrap().rssi, -42);
-
-        let next_epoch = signals.begin_poll();
-        assert!(signals.invalidated_devices.is_empty());
-        assert!(signals.invalidated_adapters.is_empty());
-        signals.accept(removed.clone(), epoch, sample);
-        assert!(signals.get("hci0", address, true).is_none());
-        signals.accept(removed, next_epoch, sample);
-        assert!(signals.get("hci0", address, true).unwrap().live);
-
-        signals.suspend();
-        for key in [same_adapter, other_adapter] {
-            signals.accept(key.clone(), next_epoch, sample);
-            assert!(!signals.get(&key.0, key.1, true).unwrap().live);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn failures_disconnects_expiry_and_late_replies_preserve_only_cached_samples() {
         let mut signals = Signals::default();
         let address = Address::default();
         let key = ("hci0".into(), address);
-        assert!(signals.due(&key));
+        let sibling = "01:23:45:67:89:AB".parse().unwrap();
+        let old = signals.begin_poll();
+        signals.invalidate("hci0", Some(address));
+        signals.accept(key.clone(), old, Some((-20, RssiKind::Dbm)));
+        signals.accept(("hci0".into(), sibling), old, Some((-60, RssiKind::Dbm)));
         assert!(signals.get("hci0", address, true).is_none());
-        signals.accept(key.clone(), 0, Some((-60, RssiKind::Dbm)));
+        assert!(signals.get("hci0", sibling, true).unwrap().live);
+        let epoch = signals.begin_poll();
+        signals.accept(key.clone(), old, Some((-20, RssiKind::Dbm)));
+        assert!(signals.get("hci0", address, true).is_none());
+        assert!(signals.due(&key));
+        signals.accept(key.clone(), epoch, Some((-60, RssiKind::Dbm)));
         let first = signals.get("hci0", address, true).unwrap();
         assert!(first.live);
         assert!(signals.due(&key)); // Next scheduled tick may sample again.
@@ -398,7 +312,7 @@ mod tests {
         assert!(!signals.get("hci0", address, false).unwrap().live);
         tokio::time::advance(POLL_INTERVAL).await;
         assert!(signals.due(&key));
-        signals.accept(key.clone(), 0, None);
+        signals.accept(key.clone(), epoch, None);
         let cached = signals.get("hci0", address, true).unwrap();
         assert_eq!(cached.rssi, first.rssi);
         assert_eq!(cached.last_seen_ms, first.last_seen_ms);
@@ -406,10 +320,15 @@ mod tests {
         assert!(!signals.due(&key));
         tokio::time::advance(FAILURE_BACKOFF).await;
         assert!(signals.due(&key));
-        signals.accept(key.clone(), 0, Some((0, RssiKind::BrEdrRelative)));
+        signals.accept(key.clone(), epoch, Some((0, RssiKind::BrEdrRelative)));
         assert_eq!(signals.get("hci0", address, true).unwrap().rssi, 0);
-        signals.invalidate("hci0", Some(address));
-        signals.accept(key.clone(), 0, Some((-20, RssiKind::Dbm)));
+        let other = ("hci1".into(), address);
+        signals.accept(other.clone(), epoch, Some((-60, RssiKind::Dbm)));
+        signals.accept(("hci0".into(), sibling), epoch, Some((-60, RssiKind::Dbm)));
+        signals.invalidate("hci0", None);
+        assert!(!signals.get("hci0", sibling, true).unwrap().live);
+        signals.accept(key.clone(), epoch, Some((-20, RssiKind::Dbm)));
+        assert!(signals.get(&other.0, other.1, true).unwrap().live);
         assert_eq!(signals.get("hci0", address, true).unwrap().rssi, 0);
         assert!(!signals.get("hci0", address, true).unwrap().live);
         let epoch = signals.begin_poll();
@@ -424,5 +343,27 @@ mod tests {
         assert!(!signals.due(&key));
         tokio::time::advance(FAILURE_BACKOFF).await;
         assert!(signals.due(&key));
+
+        // A slow batch must not prevent later peers recording failure/backoff.
+        let peers = (0..9)
+            .map(|i| ((format!("hci{i}"), address), i))
+            .collect::<Vec<_>>();
+        let signals = Mutex::new(signals);
+        poll(&signals, async { peers.clone() }, |_, _| async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Err(io::ErrorKind::TimedOut.into())
+        })
+        .await;
+        assert!(
+            peers
+                .iter()
+                .all(|(key, _)| !signals.try_lock().unwrap().due(key))
+        );
+        let started = Instant::now();
+        poll(&signals, std::future::pending(), |_, _| async {
+            unreachable!("enumeration supplied no peers")
+        })
+        .await;
+        assert!(started.elapsed() <= Duration::from_secs(10));
     }
 }

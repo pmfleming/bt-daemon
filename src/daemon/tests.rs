@@ -200,7 +200,10 @@ fn daemon(
 async fn start_operation(daemon: &BluetoothDaemon, operation: &str) -> Value {
     daemon
         .operations
-        .start(json!({ "key": "device-opaque", "operation": operation }))
+        .start_owned(
+            json!({ "key": "device-opaque", "operation": operation }),
+            Some(":owner".into()),
+        )
         .await
 }
 
@@ -227,33 +230,28 @@ fn stopped_calls(scanning: &ScanningCalls) -> Vec<(Option<String>, bool)> {
         .collect()
 }
 
-async fn operation_request_id(
-    response: &Value,
-    events: &mut broadcast::Receiver<OperationEvent>,
-) -> String {
-    let id = response["data"]["operation"]["request_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let started = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(started.event, "started");
-    assert_eq!(started.request_id, id);
-    id
-}
-
 #[tokio::test]
 async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_result() {
     for cancel_first in [false, true] {
-        let (daemon, mut events, _) = daemon(true);
+        let (daemon, mut events, _) = daemon(!cancel_first);
         let response = start_operation(&daemon, "connect").await;
         let id = response["data"]["operation"]["request_id"]
             .as_str()
             .unwrap();
         assert_eq!(response["data"]["operation"]["state"], "queued");
-        let cancelled = cancel_first && daemon.operations.cancel_owned(id, None).await;
+        let denied: Value =
+            serde_json::from_str(&daemon.cancel_owned(id, Some(":other")).await).unwrap();
+        assert_eq!(denied["error"]["code"], "request-not-found");
+        let cancelled = if cancel_first {
+            let conflicting = start_operation(&daemon, "remove").await;
+            assert_eq!(conflicting["error"]["code"], "device-busy");
+            let response: Value =
+                serde_json::from_str(&daemon.cancel_owned(id, Some(":owner")).await).unwrap();
+            assert_eq!(response["data"]["kind"], "operation");
+            true
+        } else {
+            false
+        };
         let expected = if cancelled { "cancelled" } else { "completed" };
         let mut sequence = Vec::new();
         loop {
@@ -282,7 +280,7 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
             "no progress or duplicate terminal event after {}",
             expected
         );
-        assert!(!daemon.operations.cancel_owned(id, None).await);
+        assert!(!daemon.operations.cancel_owned(id, Some(":owner")).await);
         let response = daemon
             .dispatch_call("bluetooth.requests.snapshot", json!({}), None, None)
             .await;

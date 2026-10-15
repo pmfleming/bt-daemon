@@ -472,35 +472,18 @@ mod tests {
     use super::ManagementStore;
 
     #[test]
-    fn policy_updates_are_retained_only_after_complete_validation() {
-        let store = ManagementStore::in_memory();
-        for invalid in [
-            json!({ "launch_state": "sometimes" }),
-            json!({ "unknown": true }),
-            json!({ "launch_state": "disable", "reconnect_on_resume": "yes" }),
-        ] {
-            assert!(store.update(&invalid).is_err(), "{invalid}");
-            let policy = store.policy();
-            assert_eq!(policy.launch_state, "remember");
-            assert!(policy.reconnect_on_resume);
-        }
-        let policy = store
-            .update(&json!({
-                "launch_state": "disable",
-                "trust_after_pair": false,
-                "preferred_adapter_key": "adapter-opaque"
-            }))
-            .unwrap();
-        assert_eq!(policy.launch_state, "disable");
-        assert!(!policy.trust_after_pair);
-        assert_eq!(store.policy().preferred_adapter_key, "adapter-opaque");
-    }
-
-    #[test]
-    fn device_policy_updates_validate_persist_reset_and_roll_back_failed_saves() {
+    fn policy_updates_validate_persist_reset_and_roll_back_failed_saves() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("device-policy.json");
         let mut store = ManagementStore::load(None, None, Some(path.clone())).unwrap();
+        for invalid in [
+            json!({"launch_state": "sometimes"}),
+            json!({"unknown": true}),
+            json!({"launch_state": "disable", "reconnect_on_resume": "yes"}),
+        ] {
+            assert!(store.update(&invalid).is_err());
+            assert_eq!(store.policy(), super::ManagementPolicy::default());
+        }
         let defaults = store.device_policy("peer");
         for (name, value, invalid) in [
             ("reconnect_on_resume", json!(false), json!("yes")),
@@ -575,5 +558,10 @@ mod tests {
         let saved = ManagementStore::load(None, None, Some(path)).unwrap();
         assert_eq!(saved.device_policy("peer"), defaults);
         assert_eq!(saved.device_policy("other"), policy);
+        let global = store
+            .update(&json!({"launch_state": "disable", "preferred_adapter_key": "adapter-opaque"}))
+            .unwrap();
+        assert_eq!(global.launch_state, "disable");
+        assert_eq!(store.policy().preferred_adapter_key, "adapter-opaque");
     }
 }

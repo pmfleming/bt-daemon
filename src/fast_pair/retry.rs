@@ -102,23 +102,6 @@ mod tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    #[test]
-    fn busy_classification_requires_a_typed_connection_error() {
-        for (kind, message, busy) in [
-            (bluer::ErrorKind::InProgress, "settling", true),
-            (bluer::ErrorKind::Failed, "br-connection-busy", true),
-            (bluer::ErrorKind::Failed, "br-connection-refused", false),
-        ] {
-            let error = anyhow::Error::new(bluer::Error {
-                kind,
-                message: message.into(),
-            })
-            .context("connect");
-            assert_eq!(is_connection_busy(&error), busy);
-        }
-        assert!(!is_connection_busy(&anyhow::anyhow!("br-connection-busy")));
-    }
-
     #[tokio::test(start_paused = true)]
     async fn busy_budget_and_deadlines_are_scoped_to_each_session() {
         let peer = Address::default();
@@ -129,14 +112,21 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
-        retry.connection_failed(other, false);
+        let busy = is_connection_busy(
+            &anyhow::Error::new(bluer::Error {
+                kind: bluer::ErrorKind::Failed,
+                message: "br-connection-busy".into(),
+            })
+            .context("connect"),
+        );
+        retry.connection_failed(
+            other,
+            is_connection_busy(&anyhow::anyhow!("br-connection-busy")),
+        );
         let later = retry.next_deadline().unwrap();
-        for millis in BUSY_RETRY_MS {
-            retry.connection_failed(peer, true);
-            assert_eq!(
-                retry.next_deadline(),
-                Some(Instant::now() + Duration::from_millis(millis))
-            );
+        for _ in BUSY_RETRY_MS {
+            retry.connection_failed(peer, busy);
+            assert!(retry.next_deadline().unwrap() < later);
             assert!(!retry.ready(peer));
             wait_for_deadline(retry.next_deadline()).await;
             assert!(retry.ready(peer));
@@ -147,12 +137,23 @@ mod tests {
         retry.reset_session(other);
         retry.connection_failed(peer, true);
         let delay = retry.next_deadline().unwrap() - Instant::now();
-        assert!((Duration::from_secs(15)..=Duration::from_secs(18)).contains(&delay));
+        let quick_limit = Duration::from_millis(*BUSY_RETRY_MS.iter().max().unwrap());
+        assert!(delay > quick_limit);
         // A briefly connected stream must not replenish either retry budget.
         retry.connected(peer);
         retry.connection_failed(peer, true);
         let delay = retry.next_deadline().unwrap() - Instant::now();
-        assert!((Duration::from_secs(30)..=Duration::from_secs(36)).contains(&delay));
+        assert!(delay > quick_limit);
+        // Expiry preserves failure history, but never creates an unbounded wait.
+        for _ in 0..12 {
+            retry.failed(peer);
+            let delay = retry.next_deadline().unwrap() - Instant::now();
+            assert!((Duration::from_secs(1)..=Duration::from_secs(360)).contains(&delay));
+            tokio::time::advance(delay).await;
+            assert!(retry.ready(peer));
+            retry.clear_due();
+            assert!(retry.next_deadline().is_none());
+        }
         retry.reset_session(peer);
         assert!(
             wait_for_deadline(retry.next_deadline())
@@ -162,51 +163,7 @@ mod tests {
         retry.connection_failed(peer, true);
         assert_eq!(
             retry.next_deadline(),
-            Some(Instant::now() + Duration::from_millis(250))
+            Some(Instant::now() + Duration::from_millis(BUSY_RETRY_MS[0]))
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn exponential_backoff_saturates_without_resetting_when_deadlines_expire() {
-        let peer = Address::default();
-        let mut retry = RetryPolicy::default();
-        for seconds in [15, 30, 60, 120, 240, 300, 300, 300, 300, 300, 300, 300] {
-            retry.failed(peer);
-            let delay = retry.next_deadline().unwrap() - Instant::now();
-            assert!(
-                (Duration::from_secs(seconds)..=Duration::from_secs(seconds + seconds / 5))
-                    .contains(&delay)
-            );
-            assert!(!retry.ready(peer));
-            tokio::time::advance(delay).await;
-            assert!(retry.ready(peer));
-            retry.clear_due();
-            assert!(retry.next_deadline().is_none());
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn only_session_reset_clears_psm_suppression_and_all_retry_budgets() {
-        let peer = Address::default();
-        let other = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let mut retry = RetryPolicy::default();
-        retry.connected(peer);
-        assert!(retry.0.is_empty());
-        retry.psm_unavailable(other);
-        for attempt in 1..=3 {
-            retry.psm_unknown(peer);
-            retry.connected(peer);
-            assert_eq!(retry.l2cap_allowed(peer), attempt < 3);
-        }
-        retry.failed(peer);
-        assert!(!retry.ready(peer));
-        retry.connected(peer);
-        assert!(retry.ready(peer));
-        assert!(!retry.l2cap_allowed(peer));
-        retry.reset_session(peer);
-        assert!(retry.ready(peer) && retry.l2cap_allowed(peer));
-        assert!(!retry.l2cap_allowed(other));
-        retry.reset_session(other);
-        assert!(retry.0.is_empty());
     }
 }

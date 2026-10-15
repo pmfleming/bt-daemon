@@ -1,6 +1,6 @@
 use super::{
-    ConnectionState, Frame, MAX_FRAME_PAYLOAD, MessageStreamTransport, read_transport,
-    select_transport, write_transport,
+    ConnectionState, Frame, MAX_FRAME_PAYLOAD, MessageStreamTransport, PsmAvailability,
+    decode_message_stream_psm, read_transport, select_transport, write_transport,
 };
 use bluer::Address;
 use std::time::Duration;
@@ -12,14 +12,37 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
     let other = "AA:BB:CC:DD:EE:FF".parse().unwrap();
     let rfcomm = select_transport(true, true, true).unwrap();
     assert_eq!(rfcomm, MessageStreamTransport::Rfcomm);
-    let ble = select_transport(true, false, true).unwrap();
+    let availability = decode_message_stream_psm(&[1, 0x80, 0]).unwrap();
+    assert_eq!(availability, PsmAvailability::Ready(0x80));
+    let ble = select_transport(
+        true,
+        false,
+        matches!(availability, PsmAvailability::Ready(_)),
+    )
+    .unwrap();
+    for invalid in [&[1, 0x7f, 0][..], &[1, 0][..], &[3, 0x80, 0][..]] {
+        assert!(decode_message_stream_psm(invalid).is_err());
+    }
+    assert_eq!(
+        decode_message_stream_psm(&[0, 0, 0]).unwrap(),
+        PsmAvailability::Unknown
+    );
+    assert_eq!(
+        decode_message_stream_psm(&[2, 0, 0]).unwrap(),
+        PsmAvailability::Unavailable
+    );
     assert_eq!(select_transport(false, true, true), Some(ble));
     assert_eq!(ble, MessageStreamTransport::L2cap);
     assert!(select_transport(true, false, false).is_none());
     for (seconds, reset) in [(59, false), (60, true)] {
         let mut state = ConnectionState::default();
         state.mark_connected(other);
-        state.retry.psm_unavailable(peer);
+        state.retry.psm_unavailable(other);
+        for attempt in 1..=3 {
+            state.retry.psm_unknown(peer);
+            state.retry.connected(peer);
+            assert_eq!(state.retry.l2cap_allowed(peer), attempt < 3);
+        }
         assert!(!state.begin(peer, ble));
         assert!(state.begin(peer, rfcomm));
         assert!(!state.begin(peer, rfcomm));
@@ -50,6 +73,7 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
         assert!(!state.mark_connected(other));
         state.retry.reset_session(peer);
         assert!(state.begin(peer, ble));
+        assert!(!state.retry.l2cap_allowed(other));
     }
 }
 

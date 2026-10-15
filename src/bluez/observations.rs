@@ -53,30 +53,3 @@ impl Observations {
             .copied()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Observations;
-    use bluer::Address;
-    use std::time::{Duration, Instant};
-    #[test]
-    fn reading_snapshots_does_not_refresh_last_seen_or_stopped_scan_signal() {
-        let mut observations = Observations::default();
-        let address = Address::default();
-        observations.record("hci0", address, Some(-40));
-        let first = observations.get("hci0", address).unwrap();
-        assert!(first.live(true));
-        assert!(!first.live(false));
-        assert_eq!(
-            first.last_seen_ms,
-            observations.get("hci0", address).unwrap().last_seen_ms
-        );
-        observations
-            .0
-            .get_mut(&("hci0".into(), address))
-            .unwrap()
-            .observed = Instant::now() - Duration::from_secs(31);
-        assert!(!observations.get("hci0", address).unwrap().live(true));
-        assert!(observations.get("hci1", address).is_none());
-    }
-}
