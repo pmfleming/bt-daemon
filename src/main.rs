@@ -91,7 +91,7 @@ async fn run() -> Result<()> {
         Command::Debug { command } => {
             let value = match command {
                 DebugCommand::ProtocolRegistry => protocol::registry(),
-                DebugCommand::ContractFixture => protocol::contract_fixture(),
+                DebugCommand::ContractFixture => protocol::contract_fixture()?,
                 DebugCommand::AudioProbe => serde_json::to_value(audio::probe()?)?,
             };
             println!("{}", serde_json::to_string_pretty(&value)?);

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde_json::{Map, Value, json};
 
 use crate::backend::{AdapterOperation, BackendErrorKind, DeviceOperation};
@@ -303,11 +304,18 @@ pub fn registry() -> Value {
 }
 
 /// Fixture payload examples use the same canonical constructors as live signals.
-pub fn contract_fixture() -> Value {
+pub fn contract_fixture() -> anyhow::Result<Value> {
+    fixture_from(include_str!("../test_support/bt-api-v1.json"))
+}
+
+fn fixture_from(encoded: &str) -> anyhow::Result<Value> {
     use shelllist_daemon_core::{ApiIdentity, Correlation, wire::Event};
-    let mut fixture: Value =
-        serde_json::from_str(include_str!("../test_support/bt-api-v1.json")).expect("fixture data");
-    for example in fixture.as_object_mut().unwrap().values_mut() {
+    let mut fixture: Value = serde_json::from_str(encoded).context("parse protocol fixture")?;
+    for example in fixture
+        .as_object_mut()
+        .context("protocol fixture must be an object")?
+        .values_mut()
+    {
         if example["ok"] == true {
             *example = crate::api::success(example["data"].take());
         } else if let (Some(stream), Some(event), Some(id)) = (
@@ -323,17 +331,24 @@ pub fn contract_fixture() -> Value {
                 example["data"].clone(),
             )
             .into_value()
-            .expect("event fixture");
+            .context("serialize protocol event fixture")?;
         }
     }
     fixture["version"] = json!(VERSION);
     fixture["registry"] = registry();
-    fixture
+    Ok(fixture)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{METHODS, STREAMS, VERSION, contract_fixture, registry};
+
+    #[test]
+    fn malformed_fixture_data_returns_errors_instead_of_panicking() {
+        for encoded in ["{broken", "null", "[]", "true", "42", "\"text\""] {
+            assert!(super::fixture_from(encoded).is_err(), "{encoded}");
+        }
+    }
 
     #[test]
     fn registry_preserves_the_wire_contract_and_rejects_invalid_examples() {
@@ -353,7 +368,7 @@ mod tests {
         )
         .unwrap();
 
-        let fixture = contract_fixture();
+        let fixture = contract_fixture().unwrap();
         if std::env::var_os("BT_DAEMON_UPDATE_CONTRACT_FIXTURE").is_some() {
             std::fs::write(
                 "test_support/bt-api-v1.json",

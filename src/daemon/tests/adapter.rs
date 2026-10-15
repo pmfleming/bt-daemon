@@ -155,7 +155,7 @@ async fn outcomes_preserve_applied_unknown_and_unattempted_fields() {
 }
 
 fn assert_batch_fixture(response: &Value) {
-    let mut fixture = crate::protocol::contract_fixture();
+    let mut fixture = crate::protocol::contract_fixture().unwrap();
     if std::env::var_os("BT_DAEMON_UPDATE_CONTRACT_FIXTURE").is_some() {
         fixture["adapter_update"] = response.clone();
         fixture["registry"] = crate::protocol::registry();
