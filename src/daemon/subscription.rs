@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use shelllist_daemon_core::{
     ApiError,
-    wire::{EventBody, Gap},
+    wire::{EventBody, Gap, GapReason},
 };
 use shelllist_daemon_tokio::{BroadcastEvent, WatchPhase, forward_broadcast, forward_watch};
 use tokio::{
@@ -122,31 +122,37 @@ async fn forward_events<T>(
     let emitter = &emitter;
     let subscription_id = subscription_id.as_str();
     forward_broadcast(receiver, move |update| async move {
-        match update {
-            BroadcastEvent::Item(event) => {
-                emit_event(
-                    emitter,
-                    stream,
-                    subscription_id,
-                    event_name(&event),
-                    EventBody::data(serde_json::to_value(&event).expect("Bluetooth event")),
-                )
-                .await;
-            }
-            BroadcastEvent::Lagged(skipped) => {
-                tracing::warn!(%subscription_id, %stream, skipped, "subscription events were dropped");
-                emit_event(
-                    emitter,
-                    stream,
-                    subscription_id,
-                    "gap",
-                    EventBody::data(serde_json::to_value(Gap::lagged(skipped)).expect("gap")),
-                )
-                .await;
-            }
+        if let BroadcastEvent::Lagged(skipped) = &update {
+            tracing::warn!(%subscription_id, %stream, skipped, "subscription events were dropped");
         }
-    }).await;
+        let (event, fields) = broadcast_fields(&update, event_name);
+        emit_event(emitter, stream, subscription_id, event, fields).await;
+    })
+    .await;
     tracing::warn!(%subscription_id, %stream, "subscription event source closed");
+}
+
+fn broadcast_fields<T: Serialize>(
+    update: &BroadcastEvent<T>,
+    event_name: fn(&T) -> &str,
+) -> (&str, EventBody) {
+    match update {
+        BroadcastEvent::Item(event) => match serde_json::to_value(event) {
+            Ok(data) => (event_name(event), EventBody::data(data)),
+            Err(error) => {
+                tracing::warn!(%error, event = event_name(event), "subscription event serialization failed; requesting recovery");
+                gap_fields(Gap {
+                    reason: GapReason::SourceReset,
+                    dropped_events: "1".into(),
+                })
+            }
+        },
+        BroadcastEvent::Lagged(skipped) => gap_fields(Gap::lagged(*skipped)),
+    }
+}
+
+fn gap_fields(gap: Gap) -> (&'static str, EventBody) {
+    ("gap", EventBody::data(json!(gap)))
 }
 
 async fn forward_snapshots<T: Clone>(
@@ -226,6 +232,41 @@ fn watch_event(phase: WatchPhase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::{BroadcastEvent, broadcast_fields};
+    use serde::{Serialize, Serializer};
+    use serde_json::json;
+
+    struct Unserializable;
+    impl Serialize for Unserializable {
+        fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("injected failure"))
+        }
+    }
+
+    #[test]
+    fn broadcast_payloads_preserve_data_and_request_recovery_on_loss() {
+        let broken = BroadcastEvent::Item(Unserializable);
+        let (event, body) = broadcast_fields(&broken, |_| "progress");
+        assert_eq!(event, "gap");
+        assert_eq!(
+            body.data,
+            json!({"reason": "source-reset", "dropped_events": "1"})
+        );
+        assert!(body.error.is_none());
+        let lagged = BroadcastEvent::<Unserializable>::Lagged(u64::MAX);
+        let (event, body) = broadcast_fields(&lagged, |_| "progress");
+        assert_eq!(event, "gap");
+        assert_eq!(
+            body.data,
+            json!({"reason": "subscriber-lag", "dropped_events": u64::MAX.to_string()})
+        );
+        // A failed event does not poison subsequent events or change their name/data.
+        let next = BroadcastEvent::Item(json!({"stage": "connecting"}));
+        let (event, body) = broadcast_fields(&next, |_| "progress");
+        assert_eq!(event, "progress");
+        assert_eq!(body.data, json!({"stage": "connecting"}));
+    }
+
     #[test]
     fn snapshot_payloads_preserve_loading_failure_and_watch_phases() {
         use super::{SharedSnapshot, valid_streams};
@@ -243,7 +284,6 @@ mod tests {
             let (event, body) = super::audio_fields(value, event);
             (event, serde_json::to_value(body).unwrap())
         }
-        use serde_json::json;
         use std::sync::Arc;
 
         assert!(!valid_streams(&[]));
