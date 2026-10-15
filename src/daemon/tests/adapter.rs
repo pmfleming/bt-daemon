@@ -82,11 +82,23 @@ async fn whole_patch_is_validated_before_any_write() {
 
 #[tokio::test]
 async fn outcomes_preserve_applied_unknown_and_unattempted_fields() {
-    for fail in [
-        None,
-        Some(AdapterOperation::SetAlias),
-        Some(AdapterOperation::SetDiscoverableTimeout),
-        Some(AdapterOperation::SetPairableTimeout),
+    for (fail, states, attempted) in [
+        (None, ["applied"; 3], 3),
+        (
+            Some(AdapterOperation::SetAlias),
+            ["unknown", "not-attempted", "not-attempted"],
+            1,
+        ),
+        (
+            Some(AdapterOperation::SetDiscoverableTimeout),
+            ["applied", "unknown", "not-attempted"],
+            2,
+        ),
+        (
+            Some(AdapterOperation::SetPairableTimeout),
+            ["applied", "applied", "unknown"],
+            3,
+        ),
     ] {
         for fail_snapshot in [false, true] {
             let effects = Arc::new(Effects {
@@ -105,38 +117,18 @@ async fn outcomes_preserve_applied_unknown_and_unattempted_fields() {
             assert_eq!(batch["key"], "adapter-opaque");
             assert_eq!(batch["snapshot_error"].is_object(), fail_snapshot);
             assert_eq!(response["data"]["snapshot"].is_object(), !fail_snapshot);
-            let mut stopped = false;
             let expected = [
-                ("alias", AdapterOperation::SetAlias, json!("Computer")),
-                (
-                    "discoverable_timeout",
-                    AdapterOperation::SetDiscoverableTimeout,
-                    json!(120),
-                ),
-                (
-                    "pairable_timeout",
-                    AdapterOperation::SetPairableTimeout,
-                    json!(0),
-                ),
+                ("alias", json!("Computer")),
+                ("discoverable_timeout", json!(120)),
+                ("pairable_timeout", json!(0)),
             ];
-            let mut attempted = 0;
-            for (i, (field, operation, value)) in expected.iter().enumerate() {
+            assert_eq!(batch["outcomes"].as_array().unwrap().len(), expected.len());
+            for (i, (field, value)) in expected.iter().enumerate() {
                 let outcome = &batch["outcomes"][i];
                 assert_eq!(outcome["field"], *field);
                 assert_eq!(&outcome["value"], value);
-                let state = if stopped {
-                    "not-attempted"
-                } else {
-                    attempted += 1;
-                    if fail == Some(*operation) {
-                        stopped = true;
-                        "unknown"
-                    } else {
-                        "applied"
-                    }
-                };
-                assert_eq!(outcome["state"], state);
-                assert_eq!(outcome["error"].is_object(), state == "unknown");
+                assert_eq!(outcome["state"], states[i]);
+                assert_eq!(outcome["error"].is_object(), states[i] == "unknown");
             }
             assert_eq!(effects.calls.lock().unwrap().len(), attempted);
             if fail == Some(AdapterOperation::SetDiscoverableTimeout) && fail_snapshot {

@@ -58,49 +58,21 @@ pub struct RecoveringBackend {
 }
 
 impl RecoveringBackend {
-    pub fn new(initial: Arc<BluezBackend>) -> Arc<Self> {
-        let (changes, _) = broadcast::channel(64);
-        let backend = Arc::new(Self {
-            current: RwLock::new(Some(Arc::clone(&initial))),
-            identities: Arc::clone(&initial.identities),
-            management: Arc::clone(&initial.management),
-            changes,
-            agent: Mutex::new(None),
-            available: AtomicBool::new(true),
-        });
-        backend.forward_changes(initial);
-        backend
-    }
-
     /// Load durable state without contacting BlueZ. Recovery initializes the first generation.
     pub fn load_default() -> Result<Arc<Self>> {
-        Ok(Self::new_unavailable(
-            DeviceIdentityRegistry::load_default()?,
-            Arc::new(ManagementStore::load_default()?),
-        ))
+        let (changes, _) = broadcast::channel(64);
+        Ok(Arc::new(Self {
+            current: RwLock::new(None),
+            identities: DeviceIdentityRegistry::load_default()?,
+            management: Arc::new(ManagementStore::load_default()?),
+            changes,
+            agent: Mutex::new(None),
+            available: AtomicBool::new(false),
+        }))
     }
 
     pub fn identity_registry(&self) -> Arc<DeviceIdentityRegistry> {
         Arc::clone(&self.identities)
-    }
-
-    fn new_unavailable(
-        identities: Arc<DeviceIdentityRegistry>,
-        management: Arc<ManagementStore>,
-    ) -> Arc<Self> {
-        let (changes, _) = broadcast::channel(64);
-        Arc::new(Self {
-            current: RwLock::new(None),
-            identities,
-            management,
-            changes,
-            agent: Mutex::new(None),
-            available: AtomicBool::new(false),
-        })
-    }
-
-    pub async fn set_agent(&self, agent: AgentHandle) {
-        *self.agent.lock().await = Some(agent);
     }
 
     fn current(&self) -> Result<Arc<BluezBackend>> {

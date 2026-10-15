@@ -262,7 +262,7 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
                 .unwrap()
                 .unwrap();
             assert_eq!(event.request_id, id);
-            assert!(["started", "progress", expected].contains(&event.event.as_str()));
+            assert!(["started", "progress", expected].contains(&event.event));
             let terminal = event.event == expected;
             sequence.push(event);
             if terminal {
@@ -271,10 +271,7 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
         }
         if !cancelled {
             assert_eq!(
-                sequence
-                    .iter()
-                    .map(|event| event.event.as_str())
-                    .collect::<Vec<_>>(),
+                sequence.iter().map(|event| event.event).collect::<Vec<_>>(),
                 ["started", "progress", "completed"]
             );
             assert_eq!(sequence[1].stage, "connecting");

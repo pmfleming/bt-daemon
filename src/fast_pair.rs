@@ -584,8 +584,7 @@ async fn apply_frame(
             });
         }
         (AUDIO_SWITCH_GROUP, 0x32) => {
-            let mut event = audio_switch::decode_switch(&frame.payload)?;
-            event.observed_at_ms = crate::time::unix_time_ms();
+            let event = audio_switch::notification(&frame.payload)?;
             tracing::info!(%address, reason = %event.reason, target = %event.target, "Fast Pair audio switched");
             provider
                 .update_runtime(address, event, |state| &mut state.last_switch)
@@ -977,7 +976,12 @@ impl FastPairBatteryProvider {
                 && runtime.session_nonce.is_some()
                 && account_key_available
                 && self.controls_enabled(&device_key),
-            ..capabilities::describe(runtime, account_key_available, model, recent)
+            ..capabilities::describe(
+                runtime,
+                account_key_available,
+                model.map(|model| model.name.as_str()),
+                recent,
+            )
         })
     }
 

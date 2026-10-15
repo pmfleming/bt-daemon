@@ -77,7 +77,7 @@ struct DevicePolicyOverrides {
     preferred_audio_profile_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct DevicePolicyFile {
     #[serde(default = "default_device_policy_version")]
     version: u8,
@@ -217,26 +217,27 @@ impl ManagementStore {
             .as_object()
             .context("device policy update must be an object")?;
         let mut policies = self.device_policy_lock();
-        let mut next = policies.clone();
-        let updated = next.devices.entry(device_key.to_string()).or_default();
+        let mut updated = policies
+            .devices
+            .get(device_key)
+            .cloned()
+            .unwrap_or_default();
         updated.apply(object)?;
-        if *updated == DevicePolicyOverrides::default() {
-            next.devices.remove(device_key);
-        }
-        self.persist_device_policies(&next)?;
-        *policies = next;
+        self.persist_device_change(
+            &mut policies,
+            device_key,
+            (updated != DevicePolicyOverrides::default()).then_some(updated),
+        )?;
         drop(policies);
         Ok(self.device_policy(device_key))
     }
 
     pub fn forget_device_policy(&self, device_key: &str) {
         let mut policies = self.device_policy_lock();
-        let Some((key, removed)) = policies.devices.remove_entry(device_key) else {
+        if !policies.devices.contains_key(device_key) {
             return;
-        };
-        if let Err(error) = self.persist_device_policies(&policies) {
-            // Keep Forget retryable and the in-memory view consistent with the saved file.
-            policies.devices.insert(key, removed);
+        }
+        if let Err(error) = self.persist_device_change(&mut policies, device_key, None) {
             tracing::warn!(%error, %device_key, "could not remove Bluetooth device policy");
         }
     }
@@ -257,11 +258,25 @@ impl ManagementStore {
         self.runtime_lock().clone()
     }
 
-    fn persist_device_policies(&self, policies: &DevicePolicyFile) -> Result<()> {
-        if let Some(path) = &self.device_policy_path {
-            state::write_json(path, policies, "Bluetooth per-device policy")?;
+    fn persist_device_change(
+        &self,
+        policies: &mut DevicePolicyFile,
+        key: &str,
+        updated: Option<DevicePolicyOverrides>,
+    ) -> Result<()> {
+        let previous = policies.devices.remove_entry(key);
+        if let Some(updated) = updated {
+            policies.devices.insert(key.into(), updated);
         }
-        Ok(())
+        let result = self.device_policy_path.as_ref().map_or(Ok(()), |path| {
+            state::write_json(path, policies, "Bluetooth per-device policy")
+        });
+        if result.is_err() {
+            // Roll back only the changed entry, not a clone of the entire registry.
+            policies.devices.remove(key);
+            policies.devices.extend(previous);
+        }
+        result
     }
 
     fn persist_policy(&self, policy: &ManagementPolicy) -> Result<()> {
@@ -540,9 +555,15 @@ mod tests {
                     .is_err()
             );
         }
+        assert!(
+            store
+                .update_device_policy("peer", &json!({"trust_after_pair": null}))
+                .is_err()
+        );
         store.forget_device_policy("peer");
         store.forget_device_policy("missing");
         assert_eq!(store.device_policy("peer"), policy);
+        assert_eq!(store.device_policy("other"), policy);
         assert_eq!(store.device_policy("new"), defaults);
         let saved = ManagementStore::load(None, None, Some(path.clone())).unwrap();
         assert_eq!(saved.device_policy("peer"), policy);

@@ -21,12 +21,12 @@ use crate::{
 
 #[derive(Clone, Serialize)]
 pub(super) struct OperationEvent {
-    pub(super) event: String,
+    pub(super) event: &'static str,
     pub(super) request_id: String,
     device_key: String,
-    operation: String,
-    state: String,
-    pub(super) stage: String,
+    operation: &'static str,
+    state: &'static str,
+    pub(super) stage: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<Arc<crate::model::Snapshot>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,31 +34,31 @@ pub(super) struct OperationEvent {
 }
 
 impl OperationEvent {
-    fn queued(request_id: String, device_key: String, operation: String) -> Self {
+    fn queued(request_id: String, device_key: String, operation: &'static str) -> Self {
         Self {
-            event: "queued".into(),
+            event: "queued",
             request_id,
             device_key,
             operation,
-            state: "queued".into(),
-            stage: "queued".into(),
+            state: "queued",
+            stage: "queued",
             snapshot: None,
             error: None,
         }
     }
 
-    fn with_state(mut self, event: &str, state: &str) -> Self {
-        self.event = event.into();
-        self.state = state.into();
-        self.stage = state.into();
+    fn with_state(mut self, event: &'static str, state: &'static str) -> Self {
+        self.event = event;
+        self.state = state;
+        self.stage = state;
         self
     }
 
-    fn progress(&self, stage: &str) -> Self {
+    fn progress(&self, stage: &'static str) -> Self {
         Self {
-            event: "progress".into(),
-            state: "running".into(),
-            stage: stage.into(),
+            event: "progress",
+            state: "running",
+            stage,
             ..self.clone()
         }
     }
@@ -72,10 +72,9 @@ impl OperationEvent {
             "failed"
         } else {
             "completed"
-        }
-        .into();
-        self.state.clone_from(&self.event);
-        self.stage.clone_from(&self.event);
+        };
+        self.state = self.event;
+        self.stage = self.event;
         self
     }
 }
@@ -165,11 +164,8 @@ impl OperationCoordinator {
             "operation-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
-        let queued = OperationEvent::queued(
-            request_id.clone(),
-            device_key.clone(),
-            operation.to_string(),
-        );
+        let queued =
+            OperationEvent::queued(request_id.clone(), device_key.clone(), operation.as_str());
         tracing::info!(%request_id, %device_key, %operation, "Bluetooth device operation queued");
         let execution = OperationExecution {
             backend: Arc::clone(&self.backend),

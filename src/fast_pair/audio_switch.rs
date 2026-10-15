@@ -3,7 +3,8 @@
 use crate::model::FastPairSwitchEvent;
 use anyhow::{Result, ensure};
 
-pub(super) fn decode_switch(payload: &[u8]) -> Result<FastPairSwitchEvent> {
+/// Decode and timestamp a received notification, without advertising seeker support.
+pub(super) fn notification(payload: &[u8]) -> Result<FastPairSwitchEvent> {
     ensure!(
         payload.len() >= 2,
         "Fast Pair switch notification is missing reason/target"
@@ -32,6 +33,30 @@ pub(super) fn decode_switch(payload: &[u8]) -> Result<FastPairSwitchEvent> {
         reason: reason.into(),
         target: target.into(),
         target_name: (!name.is_empty()).then_some(name),
-        observed_at_ms: 0,
+        observed_at_ms: crate::time::unix_time_ms(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notification;
+
+    #[test]
+    fn notifications_are_timestamped_and_sanitize_bounded_remote_names() {
+        assert!(notification(&[1]).is_err());
+        assert!(notification(&[1, 2, 0xff]).is_err());
+        let mut payload = vec![1, 2];
+        payload.extend_from_slice("\n\u{202e}Buds".as_bytes());
+        let event = notification(&payload).unwrap();
+        assert_eq!(event.reason, "media");
+        assert_eq!(event.target, "another-device");
+        assert_eq!(event.target_name.as_deref(), Some("Buds"));
+        assert!(event.observed_at_ms > 0);
+        assert!(notification(&[9, 9]).unwrap().target_name.is_none());
+        payload.extend_from_slice(&[b'x'; 200]);
+        assert_eq!(
+            notification(&payload).unwrap().target_name.unwrap().len(),
+            128
+        );
+    }
 }

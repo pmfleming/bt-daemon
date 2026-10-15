@@ -27,10 +27,12 @@ pub(super) fn start_monitor(events: broadcast::Sender<()>) -> Result<()> {
     Ok(())
 }
 
-async fn devices() -> Result<Vec<audio::AudioDevice>> {
+async fn devices() -> Result<Vec<audio::AudioDevice>, Value> {
     tokio::task::spawn_blocking(audio::probe)
         .await
-        .context("PipeWire audio probe task failed")?
+        .context("PipeWire audio probe task failed")
+        .and_then(std::convert::identity)
+        .map_err(|error| api::error("audio-unavailable", format!("{error:#}")))
 }
 
 fn resolved_device_key(pairing: &PairingBroker, device: &audio::AudioDevice) -> Option<String> {
@@ -132,32 +134,25 @@ pub(super) async fn apply_change(
     let exclusive = gate.lock_owned().await;
     let devices = match devices().await {
         Ok(devices) => devices,
-        Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
+        Err(error) => return error,
     };
-    let operation = devices.into_iter().find_map(|device| {
-        if resolved_device_key(pairing, &device).as_deref() != Some(device_key) {
-            return None;
-        }
-        (change.select)(device_key, requested_key, device)
-    });
+    let operation = devices
+        .into_iter()
+        .filter(|device| resolved_device_key(pairing, device).as_deref() == Some(device_key))
+        .find_map(|device| (change.select)(device_key, requested_key, device));
     let Some(operation) = operation else {
         return api::error(
             change.unavailable_code,
             change.unavailable_message.to_string(),
         );
     };
-    let device_key = device_key.to_owned();
-    let requested_key = requested_key.to_owned();
+    let policy = remember.then(|| (device_key.to_owned(), requested_key.to_owned()));
     // Keep both effects and the gate inside a non-abortable worker: disconnecting
     // a caller cannot release serialization while PipeWire is still mutating.
     match tokio::task::spawn_blocking(move || {
         let _exclusive = exclusive;
         apply_then_remember(operation, || {
-            if remember {
-                persist(&device_key, &requested_key)
-            } else {
-                Ok(())
-            }
+            policy.map_or(Ok(()), |(device, profile)| persist(&device, &profile))
         })
     })
     .await
@@ -192,7 +187,7 @@ fn applied_response(
 pub(super) async fn snapshot(pairing: &PairingBroker) -> Value {
     let devices = match devices().await {
         Ok(devices) => devices,
-        Err(error) => return api::error("audio-unavailable", format!("{error:#}")),
+        Err(error) => return error,
     };
     let devices = devices
         .into_iter()

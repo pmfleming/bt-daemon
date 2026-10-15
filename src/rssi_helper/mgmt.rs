@@ -3,11 +3,13 @@
 //! satisfy another request. No adapter settings or discovery commands are sent.
 use std::{
     io, mem,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    num::NonZeroU32,
+    os::fd::{AsRawFd, OwnedFd},
     time::Duration,
 };
 
 use bluer::Address;
+use rustix::net::{self, AddressFamily, Protocol, RecvFlags, SendFlags, SocketFlags, SocketType};
 use tokio::io::unix::AsyncFd;
 
 const GET_CONN_INFO: u16 = 0x0031;
@@ -26,19 +28,12 @@ struct SockAddrHci {
 }
 
 fn socket() -> io::Result<AsyncFd<OwnedFd>> {
-    // SAFETY: constant socket arguments; the returned descriptor is owned below.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_BLUETOOTH,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            1,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: socket returned a new, valid, exclusively owned descriptor.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = net::socket_with(
+        AddressFamily::BLUETOOTH,
+        SocketType::RAW,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        Some(Protocol::from_raw(NonZeroU32::MIN)), // BTPROTO_HCI
+    )?;
     let address = SockAddrHci {
         family: libc::AF_BLUETOOTH as _,
         dev: 0xffff, // HCI_DEV_NONE
@@ -104,10 +99,8 @@ fn reply(packet: &[u8], index: u16, peer: &[u8; 7]) -> Option<Reply> {
     })
 }
 
-fn sent_request(sent: isize, length: usize) -> io::Result<()> {
-    if sent < 0 {
-        Err(io::Error::last_os_error())
-    } else if sent == 0 || sent as usize == length {
+fn sent_request(sent: usize, length: usize) -> io::Result<()> {
+    if sent == 0 || sent == length {
         // Linux's management dispatcher can return zero after queuing a Command
         // Status error (e.g. permission denied). The reply, not send's byte count,
         // is authoritative. Still reject a genuinely partial positive write.
@@ -121,15 +114,7 @@ async fn exchange(socket: &AsyncFd<OwnedFd>, index: u16, peer: &[u8; 7]) -> io::
     let packet = request(index, peer);
     socket
         .async_io(tokio::io::Interest::WRITABLE, |fd| {
-            // SAFETY: packet is readable for packet.len(); fd is alive throughout send.
-            let sent = unsafe {
-                libc::send(
-                    fd.as_raw_fd(),
-                    packet.as_ptr().cast(),
-                    packet.len(),
-                    libc::MSG_NOSIGNAL,
-                )
-            };
+            let sent = net::send(fd, &packet, SendFlags::NOSIGNAL)?;
             sent_request(sent, packet.len())
         })
         .await?;
@@ -137,16 +122,9 @@ async fn exchange(socket: &AsyncFd<OwnedFd>, index: u16, peer: &[u8; 7]) -> io::
     loop {
         let count = socket
             .async_io(tokio::io::Interest::READABLE, |fd| {
-                // SAFETY: buffer is writable for its full size; fd remains alive.
-                let count = unsafe {
-                    libc::recv(
-                        fd.as_raw_fd(),
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                        libc::MSG_TRUNC,
-                    )
-                };
-                usize::try_from(count).map_err(|_| io::Error::last_os_error())
+                net::recv(fd, &mut buffer[..], RecvFlags::TRUNC)
+                    .map(|(_, count)| count)
+                    .map_err(io::Error::from)
             })
             .await?;
         if count == 0 {

@@ -334,6 +334,7 @@ dependencies = [
  "p256",
  "pipewire",
  "rand",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

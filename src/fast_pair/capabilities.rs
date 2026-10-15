@@ -1,14 +1,14 @@
 //! Pure presentation of trusted provisioning evidence and runtime capabilities.
-use super::{RuntimeReport, metadata::Model};
+use super::RuntimeReport;
 use crate::model::FastPairFeatures;
 
 pub(super) fn describe(
     runtime: RuntimeReport,
     account_key_available: bool,
-    model: Option<&Model>,
+    trusted_model_name: Option<&str>,
     recent: bool,
 ) -> FastPairFeatures {
-    let reason = provisioning_reason(account_key_available, model.is_some(), recent);
+    let reason = provisioning_reason(account_key_available, trusted_model_name.is_some(), recent);
     FastPairFeatures {
         model_id: runtime.model_id.map(hex::encode),
         ble_address: runtime.ble_address.map(|address| address.to_string()),
@@ -17,7 +17,7 @@ pub(super) fn describe(
         account_key_available,
         provisioning_available: reason.is_none(),
         provisioning_reason: reason.map(Into::into),
-        trusted_model_name: model.map(|model| model.name.clone()),
+        trusted_model_name: trusted_model_name.map(str::to_owned),
         multipoint: runtime.multipoint,
         noise_control: runtime.noise_control,
         last_switch: runtime.last_switch,
@@ -43,15 +43,11 @@ fn provisioning_reason(
 
 #[cfg(test)]
 mod tests {
+    use super::RuntimeReport;
     use super::describe;
-    use crate::fast_pair::{RuntimeReport, metadata::Model};
 
     #[test]
     fn advertised_features_keep_trust_separate_and_require_all_provisioning_prerequisites() {
-        let model = Model {
-            name: "Trusted buds".into(),
-            anti_spoofing_public_key: "not used by presentation".into(),
-        };
         for (key, trusted, recent) in [
             (false, false, false),
             (false, false, true),
@@ -68,7 +64,7 @@ mod tests {
                     ..RuntimeReport::default()
                 },
                 key,
-                trusted.then_some(&model),
+                trusted.then_some("Trusted buds"),
                 recent,
             );
             assert_eq!(features.model_id.as_deref(), Some("aabbcc"));

@@ -22,31 +22,65 @@ pub mod stream {
     pub const OBEX: &str = "bluetooth.obex.transfer";
 }
 
+type MethodSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+);
+
+struct MethodRegistry {
+    methods: &'static [MethodSpec],
+    descriptions: &'static [&'static str],
+}
+
 macro_rules! method_registry {
-    ($($name:literal, $params:literal, $response:literal, $stream:expr;)+) => {
-        &[$(($name, $params, $response, $stream)),+]
+    ($($name:literal, $params:literal, $response:literal, $stream:expr, $description:literal;)+) => {
+        MethodRegistry {
+            methods: &[$(($name, $params, $response, $stream)),+],
+            descriptions: &[$($description),+],
+        }
     };
 }
 
 /// Method names, parameter examples, response keys and associated event streams.
-pub const METHODS: &[(&str, &str, &str, Option<&str>)] = method_registry! {
-    "bluetooth.protocol.describe", "{}", "registry", None;
-    "bluetooth.snapshot", "{}", "snapshot", Some(stream::CHANGED);
-    "bluetooth.setPowered", r#"{"adapter_key":null,"powered":true}"#, "snapshot", Some(stream::CHANGED);
-    "bluetooth.scan", r#"{"adapter_key":"adapter-opaque","enabled":true,"timeout_ms":15000}"#, "scan", Some(stream::SCAN);
-    "bluetooth.adapter.operation", r#"{"key":"adapter-opaque","operation":"set-discoverable","discoverable":true}"#, "snapshot", Some(stream::CHANGED);
-    "bluetooth.adapter.update", r#"{"key":"adapter-opaque","changes":{"alias":"Computer","discoverable_timeout":120,"pairable_timeout":0}}"#, "adapter_batch", Some(stream::CHANGED);
-    "bluetooth.management.update", r#"{"launch_state":"remember","reconnect_on_resume":true,"trust_after_pair":true,"preferred_adapter_key":"adapter-opaque","show_blocked_devices":false,"show_recent_devices":false}"#, "snapshot", Some(stream::CHANGED);
-    "bluetooth.device.policy.update", r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"fast_pair_controls_enabled":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#, "snapshot", Some(stream::CHANGED);
-    "bluetooth.obex.snapshot", "{}", "obex", None;
-    "bluetooth.obex.send", r#"{"device_key":"device-opaque","path":"/selected/file"}"#, "transfer", Some(stream::OBEX);
-    "bluetooth.obex.respond", r#"{"request_id":"obex-incoming-1","accept":true}"#, "authorization", Some(stream::OBEX);
-    "bluetooth.audio.snapshot", "{}", "audio_devices", None;
-    "bluetooth.audio.setProfile", r#"{"device_key":"device-opaque","profile_key":"audio-profile-opaque","remember":true}"#, "audio_devices", None;
-    "bluetooth.audio.setDefault", r#"{"device_key":"device-opaque","endpoint_key":"audio-endpoint-opaque"}"#, "audio_devices", Some(stream::AUDIO);
-    "bluetooth.requests.snapshot", "{}", "requests", None;
-    "bluetooth.device.operation", r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#, "operation", Some(stream::OPERATION);
-    "bluetooth.pairing.respond", r#"{"request_id":"pairing-1","accept":true,"value":null}"#, "result", Some(stream::PAIRING);
+pub const METHODS: &[(&str, &str, &str, Option<&str>)] = METHOD_REGISTRY.methods;
+
+const METHOD_REGISTRY: MethodRegistry = method_registry! {
+    "bluetooth.protocol.describe", "{}", "registry", None,
+    "Return machine-readable bt-api methods, schemas, streams, operations, and errors.";
+    "bluetooth.snapshot", "{}", "snapshot", Some(stream::CHANGED),
+    "Return the current radio, adapter, device, and policy snapshot.";
+    "bluetooth.setPowered", r#"{"adapter_key":null,"powered":true}"#, "snapshot", Some(stream::CHANGED),
+    "Set global or adapter Bluetooth power.";
+    "bluetooth.scan", r#"{"adapter_key":"adapter-opaque","enabled":true,"timeout_ms":15000}"#, "scan", Some(stream::SCAN),
+    "Acquire or release a bounded caller-owned discovery lease.";
+    "bluetooth.adapter.operation", r#"{"key":"adapter-opaque","operation":"set-discoverable","discoverable":true}"#, "snapshot", Some(stream::CHANGED),
+    "Mutate one adapter setting.";
+    "bluetooth.adapter.update", r#"{"key":"adapter-opaque","changes":{"alias":"Computer","discoverable_timeout":120,"pairable_timeout":0}}"#, "adapter_batch", Some(stream::CHANGED),
+    "Apply a validated adapter patch in alias/discoverable_timeout/pairable_timeout order. Returns per-field applied/unknown/not-attempted outcomes; stops on error, without rollback or replay. Survives caller disconnect, but not daemon restart. Snapshot failure does not erase write acknowledgements.";
+    "bluetooth.management.update", r#"{"launch_state":"remember","reconnect_on_resume":true,"trust_after_pair":true,"preferred_adapter_key":"adapter-opaque","show_blocked_devices":false,"show_recent_devices":false}"#, "snapshot", Some(stream::CHANGED),
+    "Update persistent global Bluetooth policy.";
+    "bluetooth.device.policy.update", r#"{"key":"device-opaque","reconnect_on_resume":true,"trust_after_pair":true,"power_on_connect":true,"wait_for_services":true,"fast_pair_controls_enabled":true,"audio_route_on_connect":"keep","preferred_audio_profile_key":null}"#, "snapshot", Some(stream::CHANGED),
+    "Update persistent policy for one device; null clears an override.";
+    "bluetooth.obex.snapshot", "{}", "obex", None,
+    "Return object-push capabilities.";
+    "bluetooth.obex.send", r#"{"device_key":"device-opaque","path":"/selected/file"}"#, "transfer", Some(stream::OBEX),
+    "Start an outgoing object-push transfer.";
+    "bluetooth.obex.respond", r#"{"request_id":"obex-incoming-1","accept":true}"#, "authorization", Some(stream::OBEX),
+    "Answer an incoming object-push authorization request.";
+    "bluetooth.audio.snapshot", "{}", "audio_devices", None,
+    "Return Bluetooth PipeWire cards, profiles, and endpoints.";
+    "bluetooth.audio.setProfile", r#"{"device_key":"device-opaque","profile_key":"audio-profile-opaque","remember":true}"#, "audio_devices", None,
+    "Activate an available Bluetooth audio profile; remember=true persists it under the same device gate and returns profile_outcome with explicit partial success. Never automatically replay an uncertain write.";
+    "bluetooth.audio.setDefault", r#"{"device_key":"device-opaque","endpoint_key":"audio-endpoint-opaque"}"#, "audio_devices", Some(stream::AUDIO),
+    "Make a Bluetooth sink or source the PipeWire default.";
+    "bluetooth.requests.snapshot", "{}", "requests", None,
+    "Recover active and recent request state after reconnect or event loss.";
+    "bluetooth.device.operation", r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#, "operation", Some(stream::OPERATION),
+    "Start a cancellable staged device operation.";
+    "bluetooth.pairing.respond", r#"{"request_id":"pairing-1","accept":true,"value":null}"#, "result", Some(stream::PAIRING),
+    "Answer an active pairing-agent prompt.";
 };
 
 macro_rules! stream_registry {
@@ -64,39 +98,6 @@ pub const STREAMS: &[(&str, &[&str])] = stream_registry! {
     stream::OBEX => ["authorization-requested", "queued", "progress", "completed", "failed", "cancelled", "gap"];
     stream::AUDIO => ["subscribed", "changed", "unavailable"];
 };
-
-fn method_description(name: &str) -> &'static str {
-    match name {
-        "bluetooth.protocol.describe" => {
-            "Return machine-readable bt-api methods, schemas, streams, operations, and errors."
-        }
-        "bluetooth.snapshot" => "Return the current radio, adapter, device, and policy snapshot.",
-        "bluetooth.setPowered" => "Set global or adapter Bluetooth power.",
-        "bluetooth.scan" => "Acquire or release a bounded caller-owned discovery lease.",
-        "bluetooth.adapter.operation" => "Mutate one adapter setting.",
-        "bluetooth.adapter.update" => {
-            "Apply a validated adapter patch in alias/discoverable_timeout/pairable_timeout order. Returns per-field applied/unknown/not-attempted outcomes; stops on error, without rollback or replay. Survives caller disconnect, but not daemon restart. Snapshot failure does not erase write acknowledgements."
-        }
-        "bluetooth.management.update" => "Update persistent global Bluetooth policy.",
-        "bluetooth.device.policy.update" => {
-            "Update persistent policy for one device; null clears an override."
-        }
-        "bluetooth.obex.snapshot" => "Return object-push capabilities.",
-        "bluetooth.obex.send" => "Start an outgoing object-push transfer.",
-        "bluetooth.obex.respond" => "Answer an incoming object-push authorization request.",
-        "bluetooth.audio.snapshot" => "Return Bluetooth PipeWire cards, profiles, and endpoints.",
-        "bluetooth.audio.setProfile" => {
-            "Activate an available Bluetooth audio profile; remember=true persists it under the same device gate and returns profile_outcome with explicit partial success. Never automatically replay an uncertain write."
-        }
-        "bluetooth.audio.setDefault" => "Make a Bluetooth sink or source the PipeWire default.",
-        "bluetooth.requests.snapshot" => {
-            "Recover active and recent request state after reconnect or event loss."
-        }
-        "bluetooth.device.operation" => "Start a cancellable staged device operation.",
-        "bluetooth.pairing.respond" => "Answer an active pairing-agent prompt.",
-        _ => "Bluetooth API method.",
-    }
-}
 
 fn required_capability(name: &str) -> Option<&'static str> {
     match name {
@@ -265,11 +266,11 @@ pub fn registry() -> Value {
     json!({
         "protocol": NAME,
         "version": VERSION,
-        "methods": METHODS.iter().map(|(name, params, response_key, stream)| {
+        "methods": METHODS.iter().zip(METHOD_REGISTRY.descriptions).map(|((name, params, response_key, stream), description)| {
             let (example, schema) = parameter_contract(name, params);
             json!({
                 "name": name,
-                "description": method_description(name),
+                "description": description,
                 "params_example": example,
                 "params_schema": schema,
                 "response_key": response_key,
