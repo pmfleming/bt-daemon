@@ -43,7 +43,7 @@ pub(crate) struct RememberedPresentationValues {
     pub battery: Arc<[Battery]>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct RegistryFile {
     version: u8,
     #[serde(default)]
@@ -135,43 +135,19 @@ impl DeviceIdentityRegistry {
 
     pub fn device_key(&self, adapter: &str, address: Address) -> String {
         let mut state = self.state();
-        let adapter_identity = state.adapters.get(adapter).map_or(adapter, String::as_str);
-        let identity = format!("{adapter_identity}:{address}");
-        if let Some(key) = state.devices.get(&identity) {
-            return key.clone();
-        }
-        if let Some((key, seen)) = state.ephemeral.get_mut(&identity) {
-            *seen = Instant::now();
-            return key.clone();
-        }
-        state
-            .ephemeral
-            .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(300));
-        if state.ephemeral.len() >= EPHEMERAL_LIMIT
-            && let Some(oldest) = state
-                .ephemeral
-                .iter()
-                .min_by_key(|(_, (_, seen))| *seen)
-                .map(|(identity, _)| identity.clone())
-        {
-            state.ephemeral.remove(&oldest);
-        }
-        let key = format!("device-{}", Uuid::new_v4().simple());
-        state
-            .ephemeral
-            .insert(identity, (key.clone(), Instant::now()));
-        key
+        let identity = state.device_identity(adapter, address);
+        state.device_key(&identity)
     }
 
     /// Promote the same opaque ID only once BlueZ confirms pairing. Merely
     /// observing an advertising/private address must not leave a disk history.
     pub fn promote_device(&self, adapter: &str, address: Address) -> String {
-        let key = self.device_key(adapter, address);
+        // Resolve and promote under one lock: discovery eviction or another
+        // promotion must not replace the key between these two operations.
         let mut state = self.state();
-        let stable = state.adapters.get(adapter).map_or(adapter, String::as_str);
-        let identity = format!("{stable}:{address}");
-        if !state.devices.contains_key(&identity) {
-            state.ephemeral.remove(&identity);
+        let identity = state.device_identity(adapter, address);
+        let key = state.device_key(&identity);
+        if state.ephemeral.remove(&identity).is_some() {
             state.devices.insert(identity, key.clone());
             self.persist(&state);
         }
@@ -228,6 +204,38 @@ impl DeviceIdentityRegistry {
                 ephemeral: HashMap::new(),
             });
         }
+    }
+}
+
+impl RegistryFile {
+    fn device_identity(&self, adapter: &str, address: Address) -> String {
+        let stable = self.adapters.get(adapter).map_or(adapter, String::as_str);
+        format!("{stable}:{address}")
+    }
+
+    fn device_key(&mut self, identity: &str) -> String {
+        if let Some(key) = self.devices.get(identity) {
+            return key.clone();
+        }
+        if let Some((key, seen)) = self.ephemeral.get_mut(identity) {
+            *seen = Instant::now();
+            return key.clone();
+        }
+        self.ephemeral
+            .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(300));
+        if self.ephemeral.len() >= EPHEMERAL_LIMIT
+            && let Some(oldest) = self
+                .ephemeral
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(identity, _)| identity.clone())
+        {
+            self.ephemeral.remove(&oldest);
+        }
+        let key = format!("device-{}", Uuid::new_v4().simple());
+        self.ephemeral
+            .insert(identity.into(), (key.clone(), Instant::now()));
+        key
     }
 }
 
@@ -346,6 +354,35 @@ mod tests {
             source: "test".into(),
             confidence: "standard".into(),
         }]
+    }
+
+    #[test]
+    fn concurrent_promotions_through_adapter_aliases_keep_the_discovered_key() {
+        let registry = DeviceIdentityRegistry::in_memory();
+        for adapter in ["hci0", "hci1"] {
+            registry.register_adapter(adapter, "00:11:22:33:44:55");
+        }
+        let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let expected = registry.device_key("hci0", address);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|i| {
+                    let (registry, barrier) = (&registry, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        registry.promote_device(if i % 2 == 0 { "hci0" } else { "hci1" }, address)
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                assert_eq!(worker.join().unwrap(), expected);
+            }
+        });
+        let state = registry.state();
+        assert!(state.ephemeral.is_empty());
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices.values().next(), Some(&expected));
     }
 
     #[tokio::test]
