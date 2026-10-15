@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use zbus::{DBusError, fdo::PropertiesProxy};
-use zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::backend::{BluetoothBackend, ObexRemote};
 
@@ -115,9 +115,9 @@ pub struct TransferUpdate {
 impl TransferUpdate {
     fn apply(&mut self, properties: &HashMap<String, OwnedValue>) {
         self.apply_values(
-            properties.get("Status").and_then(value_string),
-            properties.get("Transferred").and_then(value_u64),
-            properties.get("Size").and_then(value_u64),
+            property::<&str>(properties, "Status"),
+            property(properties, "Transferred"),
+            property(properties, "Size"),
         );
     }
 
@@ -129,14 +129,9 @@ impl TransferUpdate {
         );
     }
 
-    fn apply_values(
-        &mut self,
-        status: Option<String>,
-        transferred: Option<u64>,
-        size: Option<u64>,
-    ) {
+    fn apply_values(&mut self, status: Option<&str>, transferred: Option<u64>, size: Option<u64>) {
         if let Some(status) = status {
-            self.status = status;
+            status.clone_into(&mut self.status);
         }
         if let Some(transferred) = transferred {
             self.transferred = transferred;
@@ -632,9 +627,11 @@ pub async fn start_file(
         session_path,
         transfer_path,
         file_name,
-        size: property_u64(&properties, "Size").unwrap_or(metadata.len()),
-        initial_status: property_string(&properties, "Status").unwrap_or_else(|| "queued".into()),
-        initial_transferred: property_u64(&properties, "Transferred").unwrap_or(0),
+        size: property(&properties, "Size").unwrap_or(metadata.len()),
+        initial_status: property::<&str>(&properties, "Status")
+            .unwrap_or("queued")
+            .into(),
+        initial_transferred: property(&properties, "Transferred").unwrap_or(0),
     })
 }
 
@@ -687,7 +684,7 @@ struct IncomingDetails {
 
 async fn read_properties(
     connection: &zbus::Connection,
-    path: &OwnedObjectPath,
+    path: &ObjectPath<'_>,
     interface: &'static str,
     description: &'static str,
 ) -> Result<HashMap<String, OwnedValue>> {
@@ -701,24 +698,15 @@ async fn read_properties(
         .with_context(|| format!("read {description}"))
 }
 
-fn property_path(values: &HashMap<String, OwnedValue>, name: &str) -> Option<OwnedObjectPath> {
-    values
-        .get(name)?
-        .try_clone()
-        .ok()
-        .and_then(|value| OwnedObjectPath::try_from(value).ok())
-}
-
 fn incoming_name(values: &HashMap<String, OwnedValue>) -> String {
-    property_string(values, "Name")
+    property::<&str>(values, "Name")
         .or_else(|| {
-            let filename = property_string(values, "Filename")?;
-            Path::new(&filename)
+            Path::new(property::<&str>(values, "Filename")?)
                 .file_name()?
                 .to_str()
-                .map(str::to_string)
         })
-        .unwrap_or_else(|| "bluetooth-transfer".into())
+        .unwrap_or("bluetooth-transfer")
+        .into()
 }
 
 async fn incoming_details(
@@ -732,23 +720,25 @@ async fn incoming_details(
         "incoming OBEX transfer",
     )
     .await?;
-    let session_path =
-        property_path(&values, "Session").context("incoming OBEX transfer has no session")?;
+    let session_path = property::<&ObjectPath<'_>>(&values, "Session")
+        .context("incoming OBEX transfer has no session")?;
     let session_values = read_properties(
         connection,
-        &session_path,
+        session_path,
         SESSION_INTERFACE,
         "incoming OBEX session",
     )
     .await?;
     Ok(IncomingDetails {
-        source: property_string(&session_values, "Source")
-            .context("incoming OBEX session has no source")?,
-        destination: property_string(&session_values, "Destination")
-            .context("incoming OBEX session has no destination")?,
+        source: property::<&str>(&session_values, "Source")
+            .context("incoming OBEX session has no source")?
+            .into(),
+        destination: property::<&str>(&session_values, "Destination")
+            .context("incoming OBEX session has no destination")?
+            .into(),
         name: incoming_name(&values),
-        media_type: property_string(&values, "Type"),
-        size: property_u64(&values, "Size").unwrap_or(0),
+        media_type: property::<&str>(&values, "Type").map(str::to_owned),
+        size: property(&values, "Size").unwrap_or(0),
     })
 }
 
@@ -897,20 +887,14 @@ fn validate_outgoing_path(value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn property_string(values: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
-    values.get(key).and_then(value_string)
+fn property<'a, T: TryFrom<&'a OwnedValue>>(
+    values: &'a HashMap<String, OwnedValue>,
+    key: &str,
+) -> Option<T> {
+    values.get(key)?.try_into().ok()
 }
-fn property_u64(values: &HashMap<String, OwnedValue>, key: &str) -> Option<u64> {
-    values.get(key).and_then(value_u64)
-}
-fn value_string(value: &OwnedValue) -> Option<String> {
-    <&str>::try_from(value).ok().map(str::to_string)
-}
-fn value_u64(value: &OwnedValue) -> Option<u64> {
-    u64::try_from(value).ok()
-}
-fn borrowed_string(value: &Value<'_>) -> Option<String> {
-    value.downcast_ref::<&str>().ok().map(str::to_string)
+fn borrowed_string<'a>(value: &'a Value<'_>) -> Option<&'a str> {
+    value.downcast_ref::<&str>().ok()
 }
 fn borrowed_u64(value: &Value<'_>) -> Option<u64> {
     value.downcast_ref::<u64>().ok()
@@ -921,6 +905,45 @@ mod tests {
     use std::fs;
 
     use super::{reserve_incoming_destination_in, safe_file_name, validate_outgoing_path};
+
+    #[test]
+    fn typed_properties_borrow_values_and_names_use_the_documented_fallbacks() {
+        use super::{HashMap, ObjectPath, OwnedValue, Value, incoming_name, property};
+        let mut values = HashMap::<String, OwnedValue>::from([
+            (
+                "Name".into(),
+                Value::from("Selected.txt").try_into().unwrap(),
+            ),
+            (
+                "Filename".into(),
+                Value::from("/tmp/fallback.txt").try_into().unwrap(),
+            ),
+            ("Size".into(), OwnedValue::from(42_u64)),
+            (
+                "Session".into(),
+                Value::from(ObjectPath::try_from("/session/one").unwrap())
+                    .try_into()
+                    .unwrap(),
+            ),
+        ]);
+        assert_eq!(property::<&str>(&values, "Name"), Some("Selected.txt"));
+        assert_eq!(property::<u64>(&values, "Size"), Some(42));
+        assert_eq!(
+            property::<&ObjectPath<'_>>(&values, "Session")
+                .unwrap()
+                .as_str(),
+            "/session/one"
+        );
+        assert!(property::<&str>(&values, "Size").is_none());
+        assert!(property::<u64>(&values, "Name").is_none());
+        assert!(property::<&ObjectPath<'_>>(&values, "Name").is_none());
+        assert!(property::<&str>(&values, "missing").is_none());
+        assert_eq!(incoming_name(&values), "Selected.txt");
+        values.remove("Name");
+        assert_eq!(incoming_name(&values), "fallback.txt");
+        values.insert("Filename".into(), OwnedValue::from(false));
+        assert_eq!(incoming_name(&values), "bluetooth-transfer");
+    }
 
     #[test]
     fn refreshed_and_incremental_transfer_states_publish_consistent_events() {
@@ -959,6 +982,13 @@ mod tests {
             assert_eq!(published.file_name, "file");
             assert_eq!(event.status, "queued");
         }
+        current.apply_changed(&HashMap::from([
+            ("Status", Value::from(false)),
+            ("Transferred", Value::from(-1_i64)),
+            ("Size", Value::from(999_u64)),
+        ]));
+        assert_eq!(current.status, "error");
+        assert_eq!((current.transferred, current.size), (42, 100));
     }
 
     #[test]
