@@ -1,9 +1,6 @@
 //! Retry policy is scoped to a physical Bluetooth connection, not each timer tick.
 use bluer::Address;
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
 
 // A connection still settling in BlueZ gets at most 4.75s of quick retries.
@@ -25,72 +22,75 @@ pub(super) async fn wait_for_deadline(deadline: Option<Instant>) {
 }
 
 #[derive(Default)]
-pub(super) struct RetryPolicy {
-    failures: HashMap<Address, u32>,
-    busy_attempts: HashMap<Address, usize>,
-    after: HashMap<Address, Instant>,
-    unknown_psm: HashMap<Address, u8>,
-    unavailable_psm: HashSet<Address>,
+struct PeerRetry {
+    failures: u32,
+    busy_attempts: usize,
+    after: Option<Instant>,
+    unknown_psm: u8,
+    unavailable_psm: bool,
 }
+
+impl PeerRetry {
+    fn failed(&mut self) {
+        let seconds = (15_u64 * (1_u64 << self.failures.min(5))).min(300);
+        self.failures = self.failures.saturating_add(1);
+        // Jitter prevents all peers/recovered adapters retrying simultaneously.
+        let jitter = u64::from(rand::random::<u8>()) % (seconds / 5 + 1);
+        self.after = Some(Instant::now() + Duration::from_secs(seconds + jitter));
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RetryPolicy(HashMap<Address, PeerRetry>);
 
 impl RetryPolicy {
     pub fn ready(&self, address: Address) -> bool {
-        self.after
+        self.0
             .get(&address)
-            .is_none_or(|deadline| *deadline <= Instant::now())
+            .and_then(|peer| peer.after)
+            .is_none_or(|deadline| deadline <= Instant::now())
     }
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.after.values().copied().min()
+        self.0.values().filter_map(|peer| peer.after).min()
     }
     pub fn clear_due(&mut self) {
         let now = Instant::now();
-        self.after.retain(|_, deadline| *deadline > now);
+        for peer in self.0.values_mut() {
+            peer.after = peer.after.filter(|deadline| *deadline > now);
+        }
     }
     pub fn connection_failed(&mut self, address: Address, busy: bool) {
-        if busy {
-            let attempts = self.busy_attempts.entry(address).or_default();
-            if let Some(&millis) = BUSY_RETRY_MS.get(*attempts) {
-                *attempts += 1;
-                self.after
-                    .insert(address, Instant::now() + Duration::from_millis(millis));
-                return;
-            }
+        let peer = self.0.entry(address).or_default();
+        if busy && let Some(&millis) = BUSY_RETRY_MS.get(peer.busy_attempts) {
+            peer.busy_attempts += 1;
+            peer.after = Some(Instant::now() + Duration::from_millis(millis));
+        } else {
+            peer.failed();
         }
-        self.failed(address);
     }
     pub fn failed(&mut self, address: Address) {
-        let attempts = self.failures.entry(address).or_default();
-        let seconds = (15_u64 * (1_u64 << (*attempts).min(5))).min(300);
-        *attempts = attempts.saturating_add(1);
-        // Jitter prevents all peers/recovered adapters retrying simultaneously.
-        let jitter = u64::from(rand::random::<u8>()) % (seconds / 5 + 1);
-        self.after.insert(
-            address,
-            Instant::now() + Duration::from_secs(seconds + jitter),
-        );
+        self.0.entry(address).or_default().failed();
     }
     pub fn connected(&mut self, address: Address) {
-        self.after.remove(&address);
-    }
-    pub fn l2cap_allowed(&self, address: Address) -> bool {
-        !self.unavailable_psm.contains(&address)
-    }
-    pub fn psm_unknown(&mut self, address: Address) {
-        let attempts = self.unknown_psm.entry(address).or_default();
-        *attempts = attempts.saturating_add(1);
-        if *attempts >= 3 {
-            self.psm_unavailable(address);
+        if let Some(peer) = self.0.get_mut(&address) {
+            peer.after = None;
         }
     }
+    pub fn l2cap_allowed(&self, address: Address) -> bool {
+        self.0
+            .get(&address)
+            .is_none_or(|peer| !peer.unavailable_psm)
+    }
+    pub fn psm_unknown(&mut self, address: Address) {
+        let peer = self.0.entry(address).or_default();
+        peer.unknown_psm = peer.unknown_psm.saturating_add(1);
+        peer.unavailable_psm |= peer.unknown_psm >= 3;
+    }
     pub fn psm_unavailable(&mut self, address: Address) {
-        self.unavailable_psm.insert(address);
+        self.0.entry(address).or_default().unavailable_psm = true;
     }
     pub fn reset_session(&mut self, address: Address) {
-        self.failures.remove(&address);
-        self.busy_attempts.remove(&address);
-        self.after.remove(&address);
-        self.unknown_psm.remove(&address);
-        self.unavailable_psm.remove(&address);
+        self.0.remove(&address);
     }
 }
 
@@ -98,12 +98,12 @@ impl RetryPolicy {
 mod tests {
     use super::{BUSY_RETRY_MS, RetryPolicy, is_connection_busy, wait_for_deadline};
     use bluer::Address;
+    use futures::FutureExt;
     use std::time::Duration;
     use tokio::time::Instant;
 
-    #[tokio::test(start_paused = true)]
-    async fn retries_are_bounded_classified_and_rearmed_only_by_a_new_session() {
-        use futures::FutureExt;
+    #[test]
+    fn busy_classification_requires_a_typed_connection_error() {
         for (kind, message, busy) in [
             (bluer::ErrorKind::InProgress, "settling", true),
             (bluer::ErrorKind::Failed, "br-connection-busy", true),
@@ -117,6 +117,10 @@ mod tests {
             assert_eq!(is_connection_busy(&error), busy);
         }
         assert!(!is_connection_busy(&anyhow::anyhow!("br-connection-busy")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_budget_and_deadlines_are_scoped_to_each_session() {
         let peer = Address::default();
         let other = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let mut retry = RetryPolicy::default();
@@ -144,36 +148,12 @@ mod tests {
         retry.connection_failed(peer, true);
         let delay = retry.next_deadline().unwrap() - Instant::now();
         assert!((Duration::from_secs(15)..=Duration::from_secs(18)).contains(&delay));
-        // A briefly connected stream must not replenish the quick-retry budget.
+        // A briefly connected stream must not replenish either retry budget.
         retry.connected(peer);
         retry.connection_failed(peer, true);
         let delay = retry.next_deadline().unwrap() - Instant::now();
         assert!((Duration::from_secs(30)..=Duration::from_secs(36)).contains(&delay));
         retry.reset_session(peer);
-        for _ in 0..12 {
-            retry.failed(peer);
-            let deadline = retry.next_deadline().unwrap();
-            let delay = deadline - tokio::time::Instant::now();
-            assert!(delay >= std::time::Duration::from_secs(15));
-            assert!(delay <= std::time::Duration::from_secs(360));
-            assert!(!retry.ready(peer));
-            tokio::time::advance(delay).await;
-            assert!(retry.ready(peer));
-        }
-        retry.reset_session(peer);
-        for _ in 0..2 {
-            retry.psm_unknown(peer);
-            assert!(retry.l2cap_allowed(peer));
-        }
-        retry.psm_unknown(peer);
-        assert!(!retry.l2cap_allowed(peer));
-        retry.failed(peer);
-        assert!(!retry.ready(peer));
-        retry.connected(peer);
-        assert!(retry.ready(peer));
-        assert!(!retry.l2cap_allowed(peer));
-        retry.reset_session(peer);
-        assert!(retry.ready(peer) && retry.l2cap_allowed(peer));
         assert!(
             wait_for_deadline(retry.next_deadline())
                 .now_or_never()
@@ -184,5 +164,49 @@ mod tests {
             retry.next_deadline(),
             Some(Instant::now() + Duration::from_millis(250))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exponential_backoff_saturates_without_resetting_when_deadlines_expire() {
+        let peer = Address::default();
+        let mut retry = RetryPolicy::default();
+        for seconds in [15, 30, 60, 120, 240, 300, 300, 300, 300, 300, 300, 300] {
+            retry.failed(peer);
+            let delay = retry.next_deadline().unwrap() - Instant::now();
+            assert!(
+                (Duration::from_secs(seconds)..=Duration::from_secs(seconds + seconds / 5))
+                    .contains(&delay)
+            );
+            assert!(!retry.ready(peer));
+            tokio::time::advance(delay).await;
+            assert!(retry.ready(peer));
+            retry.clear_due();
+            assert!(retry.next_deadline().is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_session_reset_clears_psm_suppression_and_all_retry_budgets() {
+        let peer = Address::default();
+        let other = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let mut retry = RetryPolicy::default();
+        retry.connected(peer);
+        assert!(retry.0.is_empty());
+        retry.psm_unavailable(other);
+        for attempt in 1..=3 {
+            retry.psm_unknown(peer);
+            retry.connected(peer);
+            assert_eq!(retry.l2cap_allowed(peer), attempt < 3);
+        }
+        retry.failed(peer);
+        assert!(!retry.ready(peer));
+        retry.connected(peer);
+        assert!(retry.ready(peer));
+        assert!(!retry.l2cap_allowed(peer));
+        retry.reset_session(peer);
+        assert!(retry.ready(peer) && retry.l2cap_allowed(peer));
+        assert!(!retry.l2cap_allowed(other));
+        retry.reset_session(other);
+        assert!(retry.0.is_empty());
     }
 }
