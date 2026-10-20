@@ -958,12 +958,16 @@ impl FastPairBatteryProvider {
         let reported = self.runtime.read().await.get(&device.address()).cloned();
         let has_report = reported.is_some();
         let mut runtime = reported.unwrap_or_default();
+        let advertisement = device.service_data().await.ok().flatten().and_then(|data| {
+            data.get(&self.uuids.service)
+                .and_then(|data| metadata::advertisement(data))
+        });
         if runtime.model_id.is_none() {
-            runtime.model_id = device.service_data().await.ok().flatten().and_then(|data| {
-                data.get(&self.uuids.service)
-                    .and_then(|data| metadata::advertised_model_id(data))
-            });
+            runtime.model_id = advertisement.as_ref().map(|data| data.model_id);
         }
+        let advertised_capabilities = advertisement
+            .filter(|data| Some(data.model_id) == runtime.model_id)
+            .and_then(|data| data.capabilities);
         let device_key = self
             .identities
             .device_key(device.adapter_name(), device.address());
@@ -990,6 +994,7 @@ impl FastPairBatteryProvider {
                 .writers
                 .contains_key(&device.address());
         Some(FastPairFeatures {
+            advertised_capabilities,
             controls_available,
             authenticated_controls: controls_available
                 && runtime.session_nonce.is_some()

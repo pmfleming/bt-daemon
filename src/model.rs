@@ -234,6 +234,8 @@ const TYPE_RULES: &[(&[&str], &str)] = &[
 /// Observed Fast Pair capabilities and live control prerequisites.
 pub struct FastPairFeatures {
     pub model_id: Option<String>,
+    /// Untrusted advertisement hints, not proof of ownership or seeker support.
+    pub advertised_capabilities: Option<FastPairAdvertisementCapabilities>,
     pub ble_address: Option<String>,
     /// Live Message Stream and operator policy permit controls; ANC needs no account key.
     pub controls_available: bool,
@@ -247,6 +249,13 @@ pub struct FastPairFeatures {
     pub noise_control: Option<FastPairNoiseControl>,
     pub last_switch: Option<FastPairSwitchEvent>,
     pub audio_switch_seeker_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// GFPS 3.3.1 capability-map hints. Unknown bits are intentionally not exposed.
+pub struct FastPairAdvertisementCapabilities {
+    pub le_audio_sharing: bool,
+    pub factory_new: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

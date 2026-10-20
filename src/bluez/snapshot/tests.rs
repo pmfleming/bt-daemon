@@ -13,6 +13,7 @@ use crate::model::{
 fn features() -> FastPairFeatures {
     FastPairFeatures {
         model_id: Some("aabbcc".into()),
+        advertised_capabilities: None,
         ble_address: None,
         controls_available: true,
         authenticated_controls: true,

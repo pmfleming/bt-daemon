@@ -11,6 +11,7 @@ pub(super) fn describe(
     let reason = provisioning_reason(account_key_available, trusted_model_name.is_some(), recent);
     FastPairFeatures {
         model_id: runtime.model_id.map(hex::encode),
+        advertised_capabilities: None,
         ble_address: runtime.ble_address.map(|address| address.to_string()),
         // The caller revalidates connection, nonce, credentials and operator policy.
         controls_available: false,

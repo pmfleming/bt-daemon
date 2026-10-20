@@ -78,15 +78,96 @@ impl Catalog {
     }
 }
 
-/// Only the standard three-byte discoverable Model ID format is handled here.
-/// Account-key-filter advertisements are not identities and must not be merged.
-pub(super) fn advertised_model_id(data: &[u8]) -> Option<[u8; 3]> {
-    data.try_into().ok()
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Advertisement {
+    pub model_id: [u8; 3],
+    pub capabilities: Option<crate::model::FastPairAdvertisementCapabilities>,
+}
+
+/// Parse legacy Model ID data or GFPS 3.3.1 LE Audio Sharing data.
+/// This is untrusted presentation metadata, never evidence of pairing or identity.
+/// Unknown versions and Model ID widths cannot select our 24-bit model catalog.
+pub(super) fn advertisement(data: &[u8]) -> Option<Advertisement> {
+    if let Ok(model_id) = data.try_into() {
+        return Some(Advertisement {
+            model_id,
+            capabilities: None,
+        });
+    }
+    let (&version_flags, mut fields) = data.split_first()?;
+    if version_flags != 0 {
+        return None;
+    }
+    let mut model_id = None;
+    let mut capabilities = None;
+    while let Some((&header, rest)) = fields.split_first() {
+        let length = usize::from(header >> 4);
+        if length == 0 || rest.len() < length {
+            return None;
+        }
+        let (value, remaining) = rest.split_at(length);
+        fields = remaining;
+        match header & 0x0f {
+            // Account-key filters (show/hide UI) are not discoverable Model IDs.
+            0 | 2 => return None,
+            7 => {
+                if model_id.is_some() {
+                    return None;
+                }
+                model_id = Some(value.try_into().ok()?);
+            }
+            8 => {
+                if capabilities.is_some() {
+                    return None;
+                }
+                capabilities = Some(crate::model::FastPairAdvertisementCapabilities {
+                    le_audio_sharing: value[0] & 2 != 0,
+                    factory_new: value[0] & 1 != 0,
+                });
+            }
+            _ => {} // Length-delimited extension; reserved capability bits are ignored.
+        }
+    }
+    Some(Advertisement {
+        model_id: model_id?,
+        capabilities: Some(capabilities?),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, advertised_model_id};
+    use super::{Catalog, advertisement};
+    #[test]
+    fn sharing_advertisements_are_bounded_versioned_and_not_account_filters() {
+        let parsed = advertisement(&[0, 0x37, 0xaa, 0xbb, 0xcc, 0x18, 3]).unwrap();
+        assert_eq!(parsed.model_id, [0xaa, 0xbb, 0xcc]);
+        let capabilities = parsed.capabilities.unwrap();
+        assert!(capabilities.le_audio_sharing && capabilities.factory_new);
+        // Extension fields, longer capability maps and reserved bits are harmless.
+        let extended = [0, 0x19, 0xff, 0x28, 0xfc, 0xff, 0x37, 1, 2, 3];
+        let parsed = advertisement(&extended).unwrap();
+        assert_eq!(parsed.model_id, [1, 2, 3]);
+        assert!(!parsed.capabilities.unwrap().le_audio_sharing);
+        for bad in [
+            &[][..],
+            &[0],
+            &[0, 0x37],
+            &[0, 0x37, 1, 2],
+            &[0x10, 0x37, 1, 2, 3, 0x18, 3],
+            &[1, 0x37, 1, 2, 3, 0x18, 3],
+            &[0, 0x37, 1, 2, 3],                   // Missing capability map.
+            &[0, 0x18, 3, 0x18, 3, 0x37, 1, 2, 3], // Duplicate.
+            &[0, 0x37, 1, 2, 3, 0x37, 1, 2, 3, 0x18, 3],
+            &[0, 0x27, 1, 2, 0x18, 3],    // Unsupported model width.
+            &[0, 0x37, 1, 2, 3, 0x08],    // Empty capability map.
+            &[0, 0x37, 1, 2, 3, 0x28, 3], // Truncated map.
+            &[0, 0x30, 1, 2, 3, 0x18, 3], // Account-key filter.
+            &[0, 0x32, 1, 2, 3, 0x18, 3],
+        ] {
+            assert!(advertisement(bad).is_none(), "accepted {bad:?}");
+        }
+    }
+
     #[test]
     fn catalog_checks_public_key_and_model_identity() {
         // SEC1 P-256 generator coordinates, for parser tests only (not production metadata).
@@ -97,7 +178,7 @@ mod tests {
         assert!(catalog.get(&[0, 0, 0]).is_none());
         assert!(Catalog::parse(br#"{"version":2,"models":{}}"#).is_err());
         assert!(Catalog::parse(br#"{"version":1,"models":{"aabbcc":{"name":"Invalid","anti_spoofing_public_key":"00"}}}"#).is_err());
-        assert_eq!(advertised_model_id(&[1, 2, 3]), Some([1, 2, 3]));
-        assert_eq!(advertised_model_id(&[0, 1, 2, 3]), None);
+        assert_eq!(advertisement(&[1, 2, 3]).unwrap().model_id, [1, 2, 3]);
+        assert_eq!(advertisement(&[0, 1, 2, 3]), None);
     }
 }
