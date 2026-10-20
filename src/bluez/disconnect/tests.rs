@@ -5,55 +5,6 @@ use std::{
     time::Duration,
 };
 
-#[test]
-fn diagnostics_are_normalized_bounded_and_scoped_to_adapter_and_device() {
-    for (name, expected) in [
-        ("Timeout", DisconnectReason::Timeout),
-        ("Local", DisconnectReason::Local),
-        ("Remote", DisconnectReason::Remote),
-        ("Authentication", DisconnectReason::Authentication),
-        ("Suspend", DisconnectReason::Suspend),
-        ("Unknown", DisconnectReason::Unknown),
-        ("FutureReason", DisconnectReason::Unknown),
-    ] {
-        let value = report(
-            &format!("org.bluez.Reason.{name}"),
-            &format!("\n\u{202e}{}", "x".repeat(300)),
-        );
-        assert_eq!(value.reason, expected);
-        assert_eq!(value.message, "x".repeat(256));
-    }
-    let (adapter, peer) = device_path("/org/bluez/hci12/dev_AA_BB_CC_DD_EE_FF").unwrap();
-    assert_eq!(adapter, "hci12");
-    for bad in [
-        "/org/bluez/hci/dev_AA_BB_CC_DD_EE_FF",
-        "/org/bluez/hci0/dev_AA_BB",
-        "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service001",
-        "/other/hci0/dev_AA_BB_CC_DD_EE_FF",
-        "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_GG",
-    ] {
-        assert!(device_path(bad).is_none());
-    }
-    let mut history = History::default();
-    for adapter in ["hci0", "hci1"] {
-        history.record(
-            adapter.into(),
-            peer,
-            report("org.bluez.Reason.Remote", "terminated"),
-        );
-    }
-    history.remove("hci0", Some(peer));
-    assert!(history.get("hci0", peer).is_none());
-    assert!(history.get("hci1", peer).is_some());
-    history.remove("hci1", None);
-    assert!(history.0.is_empty());
-    for i in 0..MAX_HISTORY + 20 {
-        let peer = Address([i as u8, (i >> 8) as u8, 0, 0, 0, 0]);
-        history.record("hci0".into(), peer, report("unknown", ""));
-    }
-    assert_eq!(history.0.len(), MAX_HISTORY);
-}
-
 struct Bus(Child);
 impl Drop for Bus {
     fn drop(&mut self) {

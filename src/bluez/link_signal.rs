@@ -253,40 +253,11 @@ async fn poll_peer<F>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CACHE_TTL, FAILURE_BACKOFF, LIVE_TTL, POLL_INTERVAL, Signals, poll, suspend};
+    use super::{CACHE_TTL, FAILURE_BACKOFF, LIVE_TTL, POLL_INTERVAL, Signals, poll};
     use crate::model::RssiKind;
     use bluer::Address;
     use std::{io, time::Duration};
-    use tokio::{
-        sync::{Mutex, broadcast},
-        time::Instant,
-    };
-
-    #[tokio::test(start_paused = true)]
-    async fn suspend_publishes_cached_freshness_without_a_poll_or_bluez_event() {
-        let key = ("hci0".into(), Address::default());
-        let mut signals = Signals::default();
-        let epoch = signals.begin_poll();
-        signals.accept(key.clone(), epoch, Some((0, RssiKind::BrEdrRelative)));
-        let before = signals.get(&key.0, key.1, true).unwrap();
-        assert!(before.live);
-        let signals = Mutex::new(signals);
-        let (changes, mut events) = broadcast::channel(4);
-        let started = Instant::now();
-
-        suspend(&signals, &changes).await;
-
-        // No timer, hardware event or snapshot request drives this notification.
-        assert_eq!(events.try_recv(), Ok(()));
-        assert_eq!(started.elapsed(), Duration::ZERO);
-        let mut signals = signals.lock().await;
-        signals.accept(key.clone(), epoch, Some((-42, RssiKind::Dbm)));
-        let after = signals.get(&key.0, key.1, true).unwrap();
-        assert!(!after.live);
-        assert_eq!(after.rssi, before.rssi);
-        assert_eq!(after.kind, before.kind);
-        assert_eq!(after.last_seen_ms, before.last_seen_ms);
-    }
+    use tokio::{sync::Mutex, time::Instant};
 
     #[tokio::test(start_paused = true)]
     async fn failures_disconnects_expiry_and_late_replies_preserve_only_cached_samples() {

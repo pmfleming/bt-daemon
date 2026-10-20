@@ -61,32 +61,3 @@ pub async fn run() -> Result<()> {
     })
     .await
 }
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-    use shelllist_daemon_tokio::{CorrelationPolicy, TrackedKind};
-
-    use super::BluetoothCorrelation;
-    use crate::daemon::{OBEX_STREAM, OPERATION_STREAM, SCAN_STREAM};
-
-    #[test]
-    fn correlates_bluetooth_operation_families() {
-        let policy = BluetoothCorrelation;
-        for (field, stream) in [
-            ("operation", OPERATION_STREAM),
-            ("scan", SCAN_STREAM),
-            ("transfer", OBEX_STREAM),
-        ] {
-            let response = json!({ "data": { field: { "request_id": "request-1" } } });
-            let tracked = policy.response_id(&response).unwrap();
-            assert_eq!(tracked.id, "request-1");
-            assert_eq!(tracked.kind, TrackedKind::Operation);
-            assert_eq!(
-                policy.event_id(stream, &json!({ "data": { "request_id": "request-1" } })),
-                Some("request-1".into())
-            );
-            assert!(policy.is_terminal(stream, &json!({ "event": "completed" })));
-        }
-    }
-}

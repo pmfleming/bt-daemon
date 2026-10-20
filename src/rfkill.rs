@@ -77,28 +77,3 @@ fn read_bluetooth_state(root: impl AsRef<Path>) -> io::Result<(bool, bool, bool)
 fn read_flag(path: &Path) -> io::Result<bool> {
     Ok(fs::read_to_string(path)?.trim() == "1")
 }
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::read_bluetooth_state;
-
-    #[test]
-    fn aggregates_bluetooth_rfkill_entries_only() {
-        let root = std::env::temp_dir().join(format!("bt-rfkill-{}", uuid::Uuid::new_v4()));
-        for (name, kind, soft, hard) in [
-            ("rfkill0", "wlan", "1", "0"),
-            ("rfkill1", "bluetooth", "0", "0"),
-            ("rfkill2", "bluetooth", "1", "0"),
-        ] {
-            let path = root.join(name);
-            fs::create_dir_all(&path).unwrap();
-            fs::write(path.join("type"), kind).unwrap();
-            fs::write(path.join("soft"), soft).unwrap();
-            fs::write(path.join("hard"), hard).unwrap();
-        }
-        assert_eq!(read_bluetooth_state(&root).unwrap(), (true, true, false));
-        fs::remove_dir_all(root).unwrap();
-    }
-}

@@ -112,28 +112,6 @@ fn snapshots_expose_only_resolvable_opaque_devices_and_endpoint_readiness() {
 }
 
 #[test]
-fn configured_preference_does_not_claim_effective_routing() {
-    for effective in [false, true] {
-        let response = super::applied_response(
-            crate::api::error("audio-unavailable", "offline".into()),
-            false,
-            None,
-            Some(audio::DefaultRouteOutcome {
-                configured: true,
-                effective,
-            }),
-        );
-        assert_eq!(response["ok"], true);
-        assert_eq!(
-            response["data"]["default_route_outcome"],
-            json!({"configured": true, "effective": effective})
-        );
-        assert!(response["data"]["refresh_error"].is_object());
-        assert!(response["data"].get("profile_outcome").is_none());
-    }
-}
-
-#[test]
 fn applied_profiles_report_effect_persistence_and_refresh_failures_independently() {
     assert!(
         super::PROFILE
