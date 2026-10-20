@@ -74,6 +74,19 @@ The implementation follows Google's public [Fast Pair BLE Device](https://develo
 
 `bt-daemon daemon` owns `org.laufan.BluetoothDaemon` on the session bus. `bt-daemon client` bridges newline-delimited frontend JSON through that service and does not bypass daemon policy with direct BlueZ mutations. Device and scan operations receive opaque request IDs and publish lifecycle events; active operations can be cancelled through the transport. Lifecycle streams emit a `lagged` event with a `skipped` count if a slow subscriber misses events. Consumers can then call `bluetooth.requests.snapshot` to reconcile active scans, operations, pairing prompts, and recently completed device operations instead of silently retaining stale state. Dropping BlueR's Pair future invokes BlueZ `CancelPairing`. Errors distinguish timeout, unavailable-device, rejected, BlueZ-unavailable, validation, and generic failures. If BlueZ is unavailable at startup or disappears later, the session API remains available, publishes unavailable snapshots, and builds or rebuilds its BlueZ session, monitors, Fast Pair provider, and pairing agent when BlueZ becomes available instead of restarting the daemon and discarding subscriptions. The application-specific BlueR pairing agent covers PIN input/display, passkey input/display, numeric confirmation, pairing authorization, service authorization, BlueZ cancellation, and a 60-second prompt timeout without requesting default-agent ownership from Blueman.
 
+## Disconnect diagnostics
+
+Device snapshots optionally expose `last_disconnect` with a normalized `reason`
+(`unknown`, `timeout`, `local`, `remote`, `authentication`, or `suspend`), bounded
+plain-text `message`, and `observed_at_ms`. This is the last BlueZ
+`Device1.Disconnected` report, not an inferred current failure. Remote termination
+does not prove multipoint switching, low battery, or a specific remote action.
+Reports trigger the existing debounced `bluetooth.changed` stream. Only the current
+BlueZ owner's signals for watched devices are accepted; diagnostics are bounded,
+in-memory, cleared on removal/unpairing/adapter removal and backend recovery, and
+never change reconnect policy. Older BlueZ versions that do not emit this signal
+continue to work without a reason field.
+
 ## Connected-link signal readings
 
 The unprivileged daemon polls the optional **`bt-rssi-helper`** system service

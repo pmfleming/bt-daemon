@@ -101,6 +101,30 @@ pub struct DeviceState {
     pub blocked: bool,
     pub wake_allowed: Option<bool>,
     pub legacy_pairing: bool,
+    /// Last reported disconnect in this BlueZ generation, not a current-state inference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_disconnect: Option<DeviceDisconnect>,
+}
+
+/// Stable BlueZ disconnect categories; unknown future reasons remain unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DisconnectReason {
+    Unknown,
+    Timeout,
+    Local,
+    Remote,
+    Authentication,
+    Suspend,
+}
+
+/// Session-local diagnostic report, not an inference about current connectivity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceDisconnect {
+    pub reason: DisconnectReason,
+    /// Bounded plain text from BlueZ; not a trusted identity or proof of multipoint switching.
+    pub message: String,
+    pub observed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

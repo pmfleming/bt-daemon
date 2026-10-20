@@ -24,6 +24,7 @@ pub(super) struct Reading {
     pub metadata: DeviceMetadata,
     pub bonded: Option<bool>,
     pub features: Option<FastPairFeatures>,
+    pub last_disconnect: Option<crate::model::DeviceDisconnect>,
 }
 
 pub(super) struct Signal {
@@ -90,6 +91,7 @@ pub(super) fn build(
         metadata,
         bonded,
         features,
+        last_disconnect,
     } = reading;
     let services = metadata
         .uuids
@@ -129,6 +131,7 @@ pub(super) fn build(
             blocked: state.blocked,
             wake_allowed: state.wake_allowed,
             legacy_pairing: metadata.legacy_pairing,
+            last_disconnect,
         },
         services: DeviceServices {
             services_resolved: metadata.services_resolved,
@@ -179,6 +182,29 @@ mod tests {
         management::ManagementStore,
     };
 
+    #[test]
+    fn disconnect_reports_are_additive_and_do_not_override_current_connection_state() {
+        let mut reading = reading();
+        reading.state.connected = true;
+        reading.last_disconnect = Some(crate::model::DeviceDisconnect {
+            reason: crate::model::DisconnectReason::Remote,
+            message: "terminated".into(),
+            observed_at_ms: 42,
+        });
+        let device = assemble(reading, Signal::resolve(None, None, false));
+        let value = serde_json::to_value(&device).unwrap();
+        assert_eq!(value["connected"], true);
+        assert_eq!(value["last_disconnect"]["reason"], "remote");
+        assert_eq!(value["last_disconnect"]["observed_at_ms"], 42);
+        let device = assemble(self::reading(), Signal::resolve(None, None, false));
+        assert!(
+            serde_json::to_value(device)
+                .unwrap()
+                .get("last_disconnect")
+                .is_none()
+        );
+    }
+
     fn reading() -> Reading {
         Reading {
             state: BluezDeviceState {
@@ -200,6 +226,7 @@ mod tests {
             },
             bonded: None,
             features: None,
+            last_disconnect: None,
         }
     }
     fn assemble(reading: Reading, signal: Signal) -> crate::model::Device {

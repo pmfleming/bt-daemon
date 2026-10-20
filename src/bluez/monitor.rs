@@ -12,6 +12,7 @@ enum Event {
     Session(SessionEvent),
     Adapter(String, AdapterEvent),
     Device(String, Address, DeviceEvent),
+    Disconnected(Result<super::disconnect::Report>),
     Ended(String),
 }
 
@@ -102,6 +103,13 @@ impl Watches {
 pub(super) async fn run(backend: &BluezBackend) -> Result<()> {
     let mut watches = Watches::default();
     watches.insert(
+        "disconnects".into(),
+        super::disconnect::listen(&backend.system_bus)
+            .await?
+            .map(Event::Disconnected)
+            .boxed(),
+    );
+    watches.insert(
         "session".into(),
         backend.session.events().await?.map(Event::Session).boxed(),
     );
@@ -130,6 +138,7 @@ async fn handle_event(backend: &BluezBackend, watches: &mut Watches, event: Even
     match event {
         Event::Session(SessionEvent::AdapterAdded(name)) => watches.adapter(backend, &name).await?,
         Event::Session(SessionEvent::AdapterRemoved(name)) => {
+            backend.disconnects.lock().await.remove(&name, None);
             backend.link_signals.lock().await.invalidate(&name, None);
             watches.remove_adapter(&name);
         }
@@ -141,6 +150,11 @@ async fn handle_event(backend: &BluezBackend, watches: &mut Watches, event: Even
         }
         Event::Adapter(name, AdapterEvent::DeviceRemoved(address)) => {
             backend
+                .disconnects
+                .lock()
+                .await
+                .remove(&name, Some(address));
+            backend
                 .link_signals
                 .lock()
                 .await
@@ -149,6 +163,22 @@ async fn handle_event(backend: &BluezBackend, watches: &mut Watches, event: Even
         }
         Event::Device(adapter, address, DeviceEvent::PropertyChanged(property)) => {
             handle_property(backend, &adapter, address, property).await;
+        }
+        Event::Disconnected(report) => {
+            let (adapter, address, report) = report?;
+            // Ignore removed/unknown peers; never create identities from diagnostics.
+            if watches
+                .handles
+                .contains_key(&format!("{adapter}/{address}"))
+            {
+                let key = backend.identities.device_key(&adapter, address);
+                tracing::info!(device_key = %key, reason = ?report.reason, "BlueZ device disconnected");
+                backend
+                    .disconnects
+                    .lock()
+                    .await
+                    .record(adapter, address, report);
+            }
         }
         Event::Ended(key) => {
             watches.remove(&key);
@@ -195,6 +225,13 @@ async fn handle_property(
                 .record(adapter, address, Some(rssi))
         }
         DeviceProperty::Paired(paired) => {
+            if !paired {
+                backend
+                    .disconnects
+                    .lock()
+                    .await
+                    .remove(adapter, Some(address));
+            }
             if let Some(provider) = &backend.fast_pair {
                 provider.note_pairing(adapter, address, paired).await;
             }

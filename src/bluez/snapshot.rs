@@ -300,6 +300,11 @@ async fn device_snapshot(
             metadata,
             bonded: bonded_property(&backend.system_bus, adapter.name(), identity).await,
             features: fast_pair_features,
+            last_disconnect: backend
+                .disconnects
+                .lock()
+                .await
+                .get(adapter.name(), identity),
         },
         presentation,
         signal,
@@ -371,6 +376,7 @@ fn presentation(
 fn cached_device_view(cached: &CachedDevice) -> Device {
     let mut device = cached.device.clone();
     device.state.connected = false;
+    device.state.last_disconnect = None;
     device.presentation.present = false;
     device.presentation.signal_live = false;
     if !device.presentation.battery.is_empty() {

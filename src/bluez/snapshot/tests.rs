@@ -179,6 +179,7 @@ fn cached_device_views_expire_and_never_claim_live_state() {
             blocked: false,
             wake_allowed: None,
             legacy_pairing: false,
+            last_disconnect: None,
         },
         services: DeviceServices {
             services_resolved: true,

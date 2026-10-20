@@ -26,6 +26,7 @@ use crate::{
     rfkill,
 };
 
+mod disconnect;
 mod link_signal;
 mod monitor;
 mod observations;
@@ -48,6 +49,7 @@ pub struct BluezBackend {
     device_cache: Mutex<HashMap<String, snapshot::CachedDevice>>,
     observations: Mutex<observations::Observations>,
     link_signals: Mutex<link_signal::Signals>,
+    disconnects: Mutex<disconnect::History>,
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
     management: Arc<ManagementStore>,
@@ -111,6 +113,7 @@ impl BluezBackend {
             device_cache: Mutex::new(HashMap::new()),
             observations: Mutex::new(observations::Observations::default()),
             link_signals: Mutex::new(link_signal::Signals::default()),
+            disconnects: Mutex::new(disconnect::History::default()),
             system_bus,
             fast_pair,
             management,
