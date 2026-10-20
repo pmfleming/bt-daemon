@@ -14,6 +14,7 @@ fn features() -> FastPairFeatures {
     FastPairFeatures {
         model_id: Some("aabbcc".into()),
         ble_address: None,
+        controls_available: true,
         authenticated_controls: true,
         account_key_available: true,
         provisioning_available: true,
@@ -59,9 +60,17 @@ fn device_capabilities_enforce_connection_authentication_and_block_policy() {
         (true, true, true)
     );
     features.authenticated_controls = false;
+    features.account_key_available = false;
     assert_eq!(
         fast_pair_capabilities(true, true, true, Some(&features)),
-        (true, false, false)
+        (true, false, true),
+        "ANC does not require account keys or a nonce"
+    );
+    features.controls_available = false;
+    assert_eq!(
+        fast_pair_capabilities(true, true, true, Some(&features)),
+        (true, false, false),
+        "disabled controls or a missing stream must still disable ANC"
     );
     features.authenticated_controls = true;
     features.provisioning_available = false;

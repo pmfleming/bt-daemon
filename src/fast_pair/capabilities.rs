@@ -13,6 +13,7 @@ pub(super) fn describe(
         model_id: runtime.model_id.map(hex::encode),
         ble_address: runtime.ble_address.map(|address| address.to_string()),
         // The caller revalidates connection, nonce, credentials and operator policy.
+        controls_available: false,
         authenticated_controls: false,
         account_key_available,
         provisioning_available: reason.is_none(),

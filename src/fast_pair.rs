@@ -194,6 +194,16 @@ fn noise_control_payload(state: &FastPairNoiseControl, mode: &str) -> Result<[u8
     ])
 }
 
+fn noise_control_frame(state: &FastPairNoiseControl, mode: &str) -> Result<Vec<u8>> {
+    // Hearable Controls removed HMAC/nonce in April 2024. The optional trailing
+    // 16 bytes are reserved, not authentication. Audio Switch still uses MACs.
+    Frame::encoded(
+        HEARABLE_CONTROLS_GROUP,
+        SET_ANC_STATE_CODE,
+        &noise_control_payload(state, mode)?,
+    )
+}
+
 fn decode_address(payload: &[u8]) -> Result<Address> {
     decode_fixed(payload, "BLE address").map(Address)
 }
@@ -971,11 +981,19 @@ impl FastPairBatteryProvider {
             .await
             .get(&device_key)
             .is_some_and(|start| start.elapsed() < Duration::from_secs(60));
+        let controls_available = connected
+            && self.controls_enabled(&device_key)
+            && self
+                .connections
+                .lock()
+                .await
+                .writers
+                .contains_key(&device.address());
         Some(FastPairFeatures {
-            authenticated_controls: connected
+            controls_available,
+            authenticated_controls: controls_available
                 && runtime.session_nonce.is_some()
-                && account_key_available
-                && self.controls_enabled(&device_key),
+                && account_key_available,
             ..capabilities::describe(
                 runtime,
                 account_key_available,
@@ -1088,21 +1106,25 @@ impl FastPairBatteryProvider {
     }
 
     pub async fn set_noise_control(&self, device: &Device, mode: &str) -> Result<()> {
-        let payload = {
+        self.validate_control(device).await?;
+        let frame = {
             let runtime = self.runtime.read().await;
             let state = runtime
                 .get(&device.address())
                 .and_then(|state| state.noise_control.as_ref())
                 .context("Fast Pair ANC state has not been reported")?;
-            noise_control_payload(state, mode)?
+            noise_control_frame(state, mode)?
         };
-        self.send_authenticated(
-            device,
-            HEARABLE_CONTROLS_GROUP,
-            SET_ANC_STATE_CODE,
-            &payload,
-        )
-        .await
+        self.pending_commands
+            .execute(
+                (
+                    device.address(),
+                    HEARABLE_CONTROLS_GROUP,
+                    SET_ANC_STATE_CODE,
+                ),
+                self.send_frame(device.address(), frame),
+            )
+            .await
     }
 
     pub async fn provision_account_key(
@@ -1188,6 +1210,23 @@ impl FastPairBatteryProvider {
             .fast_pair_controls_enabled
     }
 
+    async fn validate_control(&self, device: &Device) -> Result<String> {
+        ensure!(
+            device.is_paired().await?
+                && device.is_connected().await?
+                && !device.is_blocked().await?,
+            "Fast Pair controls require a connected, paired, unblocked device"
+        );
+        let key = self
+            .identities
+            .device_key(device.adapter_name(), device.address());
+        ensure!(
+            self.controls_enabled(&key),
+            "Fast Pair controls are disabled for this device"
+        );
+        Ok(key)
+    }
+
     async fn send_authenticated(
         &self,
         device: &Device,
@@ -1195,12 +1234,7 @@ impl FastPairBatteryProvider {
         code: u8,
         message: &[u8],
     ) -> Result<()> {
-        ensure!(
-            device.is_paired().await?
-                && device.is_connected().await?
-                && !device.is_blocked().await?,
-            "Fast Pair controls require a connected, paired, unblocked device"
-        );
+        let device_key = self.validate_control(device).await?;
         let address = device.address();
         let session_nonce = self
             .runtime
@@ -1209,11 +1243,6 @@ impl FastPairBatteryProvider {
             .get(&address)
             .and_then(|state| state.session_nonce)
             .context("Fast Pair session nonce is unavailable")?;
-        let device_key = self.identities.device_key(device.adapter_name(), address);
-        ensure!(
-            self.controls_enabled(&device_key),
-            "Fast Pair controls are disabled for this device"
-        );
         let account_key = self.account_keys.get(&device_key).context(
             "Fast Pair account key is unavailable; pair or provision this device through bt-daemon",
         )?;
@@ -1644,6 +1673,21 @@ mod tests {
         for invalid in [&[1][..], &[1, 2, 0xff][..]] {
             assert!(audio_switch::notification(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn anc_uses_four_byte_control_data_without_credentials() {
+        let state = decode_anc_state(&[2, 0xe8, 0xe8, 0x20]).unwrap();
+        assert_eq!(
+            super::noise_control_frame(&state, "adaptive").unwrap(),
+            [8, 0x12, 0, 4, 2, 0xe8, 0xe8, 0x40]
+        );
+        let mut unavailable = state.clone();
+        unavailable.settable_modes.clear();
+        assert!(super::noise_control_frame(&unavailable, "off").is_err());
+        unavailable = state;
+        unavailable.version = 3;
+        assert!(super::noise_control_frame(&unavailable, "off").is_err());
     }
 
     #[test]

@@ -231,10 +231,13 @@ const TYPE_RULES: &[(&[&str], &str)] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-/// Observed Fast Pair capabilities and the prerequisites for authenticated controls.
+/// Observed Fast Pair capabilities and live control prerequisites.
 pub struct FastPairFeatures {
     pub model_id: Option<String>,
     pub ble_address: Option<String>,
+    /// Live Message Stream and operator policy permit controls; ANC needs no account key.
+    pub controls_available: bool,
+    /// Audio Switch commands additionally require an account key and session nonce.
     pub authenticated_controls: bool,
     pub account_key_available: bool,
     pub provisioning_available: bool,

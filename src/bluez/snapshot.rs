@@ -472,7 +472,7 @@ fn fast_pair_capabilities(
         && features
             .multipoint
             .is_some_and(|multipoint| multipoint.supported && multipoint.configurable);
-    let noise_control = features.authenticated_controls
+    let noise_control = features.controls_available
         && features
             .noise_control
             .as_ref()
@@ -511,7 +511,7 @@ fn unsupported_reasons(
         (
             !can_set_noise_control,
             "set_noise_control",
-            "Authenticated Fast Pair noise control is unavailable",
+            "Fast Pair noise control is unavailable or disabled",
         ),
     ]
     .into_iter()
