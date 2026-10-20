@@ -25,6 +25,10 @@ impl Completion {
         self.main_loop.quit();
     }
 
+    pub fn failed(&self) -> bool {
+        matches!(*self.state.borrow(), Some(Err(_)))
+    }
+
     pub fn fail(&self, error: impl Into<String>) {
         // A removal/error in the same dispatch batch invalidates confirmation.
         *self.state.borrow_mut() = Some(Err(error.into()));

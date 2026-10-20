@@ -7,8 +7,20 @@ use crate::{
 use serde_json::json;
 
 fn device() -> AudioDevice {
+    let sink = AudioEndpoint {
+        pipewire_id: 20,
+        serial: Some(200),
+        name: "private-pipewire-node".into(),
+        kind: audio::EndpointKind::Sink,
+        state: "running".into(),
+        is_default: true,
+        codec: Some("aac".into()),
+        priority: 100,
+        internal: false,
+    };
     AudioDevice {
         pipewire_id: 10,
+        serial: Some(100),
         address: "AA:BB:CC:DD:EE:FF".into(),
         adapter: "hci0".into(),
         name: "Headphones".into(),
@@ -22,11 +34,9 @@ fn device() -> AudioDevice {
             mode: "high-fidelity".into(),
             codec: Some("AAC".into()),
         }],
-        sink: Some(AudioEndpoint {
-            name: "private-pipewire-node".into(),
-            state: "running".into(),
-            is_default: true,
-        }),
+        endpoints: vec![sink.clone()],
+        internal_endpoints: vec![],
+        sink: Some(sink),
         source: None,
     }
 }
@@ -50,11 +60,25 @@ fn snapshots_expose_only_resolvable_opaque_devices_and_endpoint_readiness() {
     assert!(value["source"].is_null());
     assert!(!value.to_string().contains("AA:BB:CC:DD:EE:FF"));
     assert!(!value.to_string().contains("private-pipewire-node"));
+    let mut other_adapter = device();
+    other_adapter.adapter = "hci1".into();
+    let other_value = device_snapshot(&pairing, other_adapter).unwrap();
+    assert_ne!(other_value["device_key"], value["device_key"]);
+    assert_ne!(
+        other_value["endpoints"][0]["key"],
+        value["endpoints"][0]["key"]
+    );
     let profile = value["active_profile_key"].as_str().unwrap();
     assert!(super::select_profile(&key, profile, device()).is_some());
     assert!(super::select_profile("other-device", profile, device()).is_none());
     let sink = value["sink"]["key"].as_str().unwrap();
     assert!(select_default(&key, sink, device()).is_some());
+    let explicit = value["endpoints"][0]["key"].as_str().unwrap();
+    assert_ne!(explicit, sink);
+    assert!(select_default(&key, explicit, device()).is_some());
+    assert!(select_default("other-device", explicit, device()).is_none());
+    assert_eq!(value["endpoints"][0]["kind"], "sink");
+    assert_eq!(value["endpoints"][0]["codec"], "aac");
     assert!(select_default("other-device", sink, device()).is_none());
     assert!(select_default(&key, &audio::endpoint_key(&key, "source"), device()).is_none());
 

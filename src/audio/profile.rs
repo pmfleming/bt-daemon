@@ -55,7 +55,7 @@ impl ProfileValues {
         Some(AudioProfile {
             index: self.index?,
             mode: profile_mode(&name).into(),
-            codec: profile_codec(&description),
+            codec: profile_codec(&name),
             name,
             description,
             available: self.available,
@@ -69,6 +69,10 @@ pub(super) fn profile_mode(name: &str) -> &'static str {
         "high-fidelity"
     } else if name.starts_with("headset-") || name.starts_with("handsfree-") {
         "headset"
+    } else if name.starts_with("bap-") {
+        "le-audio"
+    } else if name.starts_with("asha-") {
+        "hearing-aid"
     } else if name == "off" {
         "off"
     } else {
@@ -79,9 +83,36 @@ pub(super) fn profile_mode(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests;
 
-pub(super) fn profile_codec(description: &str) -> Option<String> {
-    let marker = "codec ";
-    let start = description.rfind(marker)? + marker.len();
-    let value = description[start..].trim_end_matches(')').trim();
-    (!value.is_empty()).then(|| value.to_string())
+/// Profile names are machine identifiers; translated descriptions are not data.
+/// The highest-priority codec has an unsuffixed name, so its codec remains unknown
+/// until an active endpoint reports api.bluez5.codec.
+pub(super) fn profile_codec(name: &str) -> Option<String> {
+    [
+        "a2dp-sink",
+        "a2dp-source",
+        "a2dp-duplex",
+        "headset-head-unit",
+        "handsfree-head-unit",
+        "bap-broadcast-sink",
+        "bap-broadcast-source",
+        "bap-sink",
+        "bap-source",
+        "bap-duplex",
+        "asha-sink",
+    ]
+    .into_iter()
+    .find_map(|base| {
+        name.strip_prefix(base)?
+            .strip_prefix('-')
+            .and_then(codec_name)
+    })
+}
+
+pub(super) fn codec_name(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+    .then(|| value.to_owned())
 }

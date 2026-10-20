@@ -554,6 +554,13 @@ const SERVICE_LABELS: &[(&str, &str)] = &[
     ("1124", "Human Interface Device"),
     ("1200", "Device Information"),
     ("180f", "Battery Service"),
+    ("1844", "Volume Control"),
+    ("1846", "Coordinated Set Identification"),
+    ("184e", "Audio Stream Control"),
+    ("184f", "Broadcast Audio Scan"),
+    ("1850", "Published Audio Capabilities"),
+    ("1853", "Common Audio"),
+    ("fdf0", "Audio Streaming for Hearing Aids"),
 ];
 
 #[cfg(test)]

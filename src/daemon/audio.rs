@@ -55,22 +55,27 @@ fn select_default(
     requested_key: &str,
     device: audio::AudioDevice,
 ) -> Option<AudioOperation> {
-    let kind = [
-        ("sink", device.sink.is_some()),
-        ("source", device.source.is_some()),
-    ]
-    .into_iter()
-    .find(|(kind, available)| *available && audio::endpoint_key(device_key, kind) == requested_key)?
-    .0;
-    let address = device.address;
-    match kind {
-        "sink" => Some(Box::new(move || {
-            audio::set_default_sink(&address).map(Some)
-        })),
-        _ => Some(Box::new(move || {
-            audio::set_default_source(&address).map(Some)
-        })),
-    }
+    let endpoint = device
+        .endpoints
+        .iter()
+        .find(|node| node.key(device_key) == requested_key)
+        .or_else(|| {
+            // Preserve old sink/source keys as deterministic compatibility aliases.
+            [
+                ("sink", device.sink.as_ref()),
+                ("source", device.source.as_ref()),
+            ]
+            .into_iter()
+            .find_map(|(kind, node)| {
+                (audio::endpoint_key(device_key, kind) == requested_key)
+                    .then_some(node)
+                    .flatten()
+            })
+        })?
+        .clone();
+    Some(Box::new(move || {
+        audio::set_default_node(&device, &endpoint).map(Some)
+    }))
 }
 
 fn select_profile(
@@ -80,7 +85,7 @@ fn select_profile(
 ) -> Option<AudioOperation> {
     let index = device.available_profile(device_key, requested_key)?.index;
     Some(Box::new(move || {
-        audio::set_profile(&device.address, index).map(|()| None)
+        audio::set_profile(&device, index).map(|()| None)
     }))
 }
 
@@ -232,6 +237,7 @@ fn device_snapshot(pairing: &PairingBroker, device: audio::AudioDevice) -> Optio
         .collect::<Vec<_>>();
     Some(json!({
         "device_key": device_key, "active_profile_key": active_profile_key, "profiles": profiles,
+        "endpoints": device.endpoints.iter().map(|node| node_snapshot(node, node.key(&device_key))).collect::<Vec<_>>(),
         "sink": endpoint_snapshot(&device_key, "sink", device.sink),
         "source": endpoint_snapshot(&device_key, "source", device.source),
     }))
@@ -242,12 +248,14 @@ fn endpoint_snapshot(
     kind: &str,
     endpoint: Option<audio::AudioEndpoint>,
 ) -> Option<Value> {
-    endpoint.map(|endpoint| {
-        json!({
-            "key": audio::endpoint_key(device_key, kind),
-            "ready": !matches!(endpoint.state.as_str(), "creating" | "error"),
-            "state": endpoint.state, "is_default": endpoint.is_default,
-        })
+    endpoint.map(|endpoint| node_snapshot(&endpoint, audio::endpoint_key(device_key, kind)))
+}
+
+fn node_snapshot(endpoint: &audio::AudioEndpoint, key: String) -> Value {
+    json!({
+        "key": key, "kind": endpoint.kind, "codec": endpoint.codec,
+        "ready": !matches!(endpoint.state.as_str(), "creating" | "error"),
+        "state": endpoint.state, "is_default": endpoint.is_default,
     })
 }
 

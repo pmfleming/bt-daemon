@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::{BluezAdapter, BluezBackend, BluezDevice};
 use crate::management::DevicePolicy;
 use crate::{
-    audio::PolicyRequest,
+    audio::{PolicyMutationFailed, PolicyRequest},
     backend::{DeviceOperation, OperationProgress, Params},
 };
 
@@ -122,6 +122,7 @@ impl Effects for DeviceEffects<'_> {
         (self.progress)("waiting-for-audio");
         let request = Arc::new(PolicyRequest {
             device_key: self.key.to_string(),
+            adapter: self.device.adapter_name().to_owned(),
             address: self.device.address().to_string(),
             preferred_profile_key: self.policy.preferred_audio_profile_key.clone(),
             switch_output: self.policy.audio_route_on_connect == "switch",
@@ -134,7 +135,10 @@ impl Effects for DeviceEffects<'_> {
                 .context("Bluetooth audio policy task failed")?;
             match result {
                 Ok(()) => return Ok(()),
-                Err(error) if tokio::time::Instant::now() < deadline => {
+                Err(error)
+                    if error.downcast_ref::<PolicyMutationFailed>().is_none()
+                        && tokio::time::Instant::now() < deadline =>
+                {
                     tracing::debug!(%error, device_key = self.key, "Bluetooth audio policy is waiting for PipeWire");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
