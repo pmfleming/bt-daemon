@@ -2,6 +2,8 @@
   description = "Bluetooth policy and API daemon for Shelllist";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  # Keep the framework's Rust toolchain while upgrading the coherent audio stack.
+  inputs.runtimeNixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   # Co-development: one live sibling framework; no per-daemon revision pins.
   # Use ../daemon-framework/tools/local-build for Nix builds/checks.
   inputs.daemonFramework = {
@@ -13,14 +15,20 @@
     {
       self,
       nixpkgs,
+      runtimeNixpkgs,
       daemonFramework,
     }:
     let
       systems = [ "x86_64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system:
+        f system (nixpkgs.legacyPackages.${system}.extend (_final: _prev: {
+          inherit (runtimeNixpkgs.legacyPackages.${system}) bluez pipewire wireplumber;
+        }))
+      );
     in
     {
       nixosModules.rssi-helper = import ./nix/rssi-helper.nix self;
+      nixosModules.audio-stack = import ./nix/audio-stack.nix self;
 
       packages = forAllSystems (
         system: pkgs:
@@ -98,6 +106,27 @@
       checks = forAllSystems (
         system: pkgs: {
           default = self.packages.${system}.default;
+          runtime-versions = let
+            host = enabled: (nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [ self.nixosModules.audio-stack {
+                services.bt-daemon.audioStack.enable = enabled;
+              } ];
+            }).config;
+            enabled = host true;
+            disabled = host false;
+          in
+            assert pkgs.lib.versionAtLeast pkgs.bluez.version "5.87";
+            assert pkgs.lib.versionAtLeast pkgs.pipewire.version "1.6.9";
+            assert enabled.hardware.bluetooth.package == pkgs.bluez;
+            assert enabled.services.pipewire.package == pkgs.pipewire;
+            assert enabled.services.pipewire.wireplumber.package == pkgs.wireplumber;
+            assert disabled.hardware.bluetooth.package == nixpkgs.legacyPackages.${system}.bluez;
+            assert disabled.services.pipewire.package == nixpkgs.legacyPackages.${system}.pipewire;
+            pkgs.runCommand "bt-runtime-versions" { } ''
+              printf '%s\n' 'BlueZ ${pkgs.bluez.version}' 'PipeWire ${pkgs.pipewire.version}' \
+                'WirePlumber ${pkgs.wireplumber.version}' > $out
+            '';
         }
       );
 
