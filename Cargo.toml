@@ -18,7 +18,7 @@ futures = "0.3"
 hex = "0.4"
 libc = "0.2"
 p256 = { version = "0.13", features = ["ecdh"] }
-pipewire = { version = "0.10", features = ["v1_2_0"] }
+pipewire = { version = "0.10.1", features = ["v1_2_0"] }
 rand = "0.8"
 rustix = { version = "1", features = ["net"] }
 serde = { version = "1", features = ["derive", "rc"] }
