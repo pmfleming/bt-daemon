@@ -170,7 +170,7 @@ fn decode_anc_state(payload: &[u8]) -> Result<FastPairNoiseControl> {
 
 fn noise_control_payload(state: &FastPairNoiseControl, mode: &str) -> Result<[u8; 4]> {
     ensure!(
-        state.version == 2,
+        matches!(state.version, 1 | 2),
         "unsupported Fast Pair ANC protocol version"
     );
     let mode_flag = anc_mode_flag(mode)?;
@@ -187,7 +187,7 @@ fn noise_control_payload(state: &FastPairNoiseControl, mode: &str) -> Result<[u8
         })
     };
     Ok([
-        2,
+        state.version,
         flags(&state.available_modes)?,
         flags(&state.settable_modes)?,
         mode_flag,
@@ -1654,8 +1654,10 @@ mod tests {
         ] {
             assert!(decode_anc_state(invalid).is_err());
         }
-        let unsupported = decode_anc_state(&[1, 0x20, 0x20, 0x20]).unwrap();
-        assert!(noise_control_payload(&unsupported, "off").is_err());
+        for version in [0, 3, 255] {
+            let unsupported = decode_anc_state(&[version, 0x20, 0x20, 0x20]).unwrap();
+            assert!(noise_control_payload(&unsupported, "off").is_err());
+        }
 
         let mut payload = vec![1, 2];
         payload.extend_from_slice("\n\u{202e}Buds".as_bytes());
@@ -1682,17 +1684,20 @@ mod tests {
 
     #[test]
     fn anc_uses_four_byte_control_data_without_credentials() {
-        let state = decode_anc_state(&[2, 0xe8, 0xe8, 0x20]).unwrap();
-        assert_eq!(
-            super::noise_control_frame(&state, "adaptive").unwrap(),
-            [8, 0x12, 0, 4, 2, 0xe8, 0xe8, 0x40]
-        );
-        let mut unavailable = state.clone();
-        unavailable.settable_modes.clear();
-        assert!(super::noise_control_frame(&unavailable, "off").is_err());
-        unavailable = state;
-        unavailable.version = 3;
-        assert!(super::noise_control_frame(&unavailable, "off").is_err());
+        for version in [1, 2] {
+            let state = decode_anc_state(&[version, 0xe8, 0xe8, 0x08]).unwrap();
+            assert_eq!(
+                super::noise_control_frame(&state, "transparent").unwrap(),
+                [8, 0x12, 0, 4, version, 0xe8, 0xe8, 0x80]
+            );
+            assert_eq!(
+                super::noise_control_frame(&state, "adaptive").unwrap(),
+                [8, 0x12, 0, 4, version, 0xe8, 0xe8, 0x40]
+            );
+            let mut unavailable = state;
+            unavailable.settable_modes.clear();
+            assert!(super::noise_control_frame(&unavailable, "off").is_err());
+        }
     }
 
     #[test]

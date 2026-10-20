@@ -479,10 +479,9 @@ fn fast_pair_capabilities(
             .multipoint
             .is_some_and(|multipoint| multipoint.supported && multipoint.configurable);
     let noise_control = features.controls_available
-        && features
-            .noise_control
-            .as_ref()
-            .is_some_and(|noise| noise.version == 2 && !noise.settable_modes.is_empty());
+        && features.noise_control.as_ref().is_some_and(|noise| {
+            matches!(noise.version, 1 | 2) && !noise.settable_modes.is_empty()
+        });
     (features.provisioning_available, multipoint, noise_control)
 }
 

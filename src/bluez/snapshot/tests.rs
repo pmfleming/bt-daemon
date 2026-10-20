@@ -31,6 +31,27 @@ fn features() -> FastPairFeatures {
 }
 
 #[test]
+fn noise_control_capability_accepts_versions_one_and_two_without_credentials() {
+    let mut features = features();
+    features.authenticated_controls = false;
+    features.account_key_available = false;
+    for version in [0, 1, 2, 3, 255] {
+        features.noise_control.as_mut().unwrap().version = version;
+        assert_eq!(
+            fast_pair_capabilities(true, true, true, Some(&features)).2,
+            matches!(version, 1 | 2),
+            "ANC version {version}"
+        );
+    }
+    for version in [1, 2] {
+        let noise = features.noise_control.as_mut().unwrap();
+        noise.version = version;
+        noise.settable_modes.clear();
+        assert!(!fast_pair_capabilities(true, true, true, Some(&features)).2);
+    }
+}
+
+#[test]
 fn device_capabilities_enforce_connection_authentication_and_block_policy() {
     let mut features = features();
     for (paired, connected, advertised) in [
