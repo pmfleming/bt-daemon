@@ -20,7 +20,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 mod profile;
+mod wait;
 use profile::parse_profile;
+use wait::Completion;
+
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Derive a stable profile identifier scoped to an opaque Bluetooth device key.
 pub fn profile_key(device_key: &str, profile_name: &str) -> String {
@@ -205,6 +209,10 @@ fn bind_monitor_object(
                 .info(move |_| info_event())
                 .param(move |_, _, _, _, _| event())
                 .register();
+            device.subscribe_params(&[
+                pw::spa::param::ParamType::Profile,
+                pw::spa::param::ParamType::EnumProfile,
+            ]);
             objects.borrow_mut().retain(global.id, device, listener);
         }
         ObjectType::Node => {
@@ -323,16 +331,16 @@ pub fn probe() -> Result<Vec<AudioDevice>> {
 }
 
 /// Make this Bluetooth device's sink the PipeWire default; performs blocking I/O.
-pub fn set_default_sink(address: &str) -> Result<()> {
+pub fn set_default_sink(address: &str) -> Result<DefaultRouteOutcome> {
     set_default_endpoint(address, EndpointKind::Sink)
 }
 
 /// Make this Bluetooth device's source the PipeWire default; performs blocking I/O.
-pub fn set_default_source(address: &str) -> Result<()> {
+pub fn set_default_source(address: &str) -> Result<DefaultRouteOutcome> {
     set_default_endpoint(address, EndpointKind::Source)
 }
 
-fn set_default_endpoint(address: &str, kind: EndpointKind) -> Result<()> {
+fn set_default_endpoint(address: &str, kind: EndpointKind) -> Result<DefaultRouteOutcome> {
     let devices = probe()?;
     let device = devices
         .iter()
@@ -349,16 +357,45 @@ fn set_default_endpoint(address: &str, kind: EndpointKind) -> Result<()> {
     set_default_node(kind, &endpoint.name)
 }
 
-fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct DefaultRouteOutcome {
+    pub configured: bool,
+    pub effective: bool,
+}
+
+impl DefaultRouteOutcome {
+    fn observe(
+        &mut self,
+        kind: EndpointKind,
+        expected: &str,
+        key: Option<&str>,
+        value: Option<&str>,
+    ) {
+        let matches = value.and_then(default_node_name).as_deref() == Some(expected);
+        match key {
+            Some(key) if key == configured_default_key(kind) => self.configured = matches,
+            Some(key) if key == effective_default_key(kind) => self.effective = matches,
+            None => *self = Self::default(),
+            _ => {}
+        }
+    }
+}
+
+fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<DefaultRouteOutcome> {
     let session = pipewire_session()?;
+    let completion = Completion::new(&session.main_loop);
+    let _core_listener = completion.watch_core(&session.core);
     let registry = &session.registry;
     let registry_weak = registry.downgrade();
-    let applied = Rc::new(Cell::new(false));
-    let applied_for_registry = Rc::clone(&applied);
-    let retained = RefCell::new(None::<Metadata>);
-    // Match wpctl set-default: effective default.audio.* belongs to policy;
-    // configured defaults express a user choice and are persisted by WirePlumber.
-    let key = configured_default_key(kind);
+    let outcome = Rc::new(RefCell::new(DefaultRouteOutcome::default()));
+    let observed = outcome.clone();
+    let metadata_id = Rc::new(Cell::new(None));
+    let removed_id = metadata_id.clone();
+    let removed = completion.clone();
+    let applied = completion.clone();
+    let retained = RefCell::new(Objects::default());
+    let node_name = node_name.to_owned();
+    // Only configured defaults are written; effective defaults belong to policy.
     let value = serde_json::json!({ "name": node_name }).to_string();
     let _registry_listener = registry
         .add_listener_local()
@@ -368,24 +405,53 @@ fn set_default_node(kind: EndpointKind, node_name: &str) -> Result<()> {
             {
                 return;
             }
+            metadata_id.set(Some(global.id));
             let Some(registry) = registry_weak.upgrade() else {
                 return;
             };
             match registry.bind::<Metadata, _>(global) {
                 Ok(metadata) => {
-                    metadata.set_property(0, key, Some("Spa:String:JSON"), Some(&value));
-                    *retained.borrow_mut() = Some(metadata);
-                    applied_for_registry.set(true);
+                    let observed = observed.clone();
+                    let applied = applied.clone();
+                    let expected = node_name.clone();
+                    let listener = metadata
+                        .add_listener_local()
+                        .property(move |subject, key, _, value| {
+                            if subject == 0 {
+                                let mut outcome = observed.borrow_mut();
+                                outcome.observe(kind, &expected, key, value);
+                                if outcome.configured && outcome.effective {
+                                    applied.succeed();
+                                }
+                            }
+                            0
+                        })
+                        .register();
+                    metadata.set_property(
+                        0,
+                        configured_default_key(kind),
+                        Some("Spa:String:JSON"),
+                        Some(&value),
+                    );
+                    retained.borrow_mut().retain(global.id, metadata, listener);
                 }
-                Err(error) => tracing::warn!(%error, "could not bind PipeWire default metadata"),
+                Err(error) => applied.fail(format!("bind PipeWire default metadata: {error}")),
+            }
+        })
+        .global_remove(move |id| {
+            if removed_id.get() == Some(id) {
+                removed.fail("PipeWire default metadata disappeared");
             }
         })
         .register();
-    session.settle()?;
-    if !applied.get() {
-        anyhow::bail!("PipeWire default metadata is unavailable");
-    }
-    Ok(())
+    completion.wait(OPERATION_TIMEOUT)?;
+    let outcome = *outcome.borrow();
+    anyhow::ensure!(
+        outcome.configured,
+        "PipeWire did not confirm the configured default before the deadline"
+    );
+    // Policy may reject/defer the effective route even though the preference was saved.
+    Ok(outcome)
 }
 
 /// Activate a PipeWire profile for the Bluetooth address and confirm the result.
@@ -396,8 +462,12 @@ pub fn set_profile(address: &str, index: u32) -> Result<()> {
     let registry = &session.registry;
     let registry_weak = registry.downgrade();
     let expected_name = format!("bluez_card.{}", address.replace(':', "_"));
-    let confirmed = Rc::new(Cell::new(false));
-    let confirmed_for_registry = Rc::clone(&confirmed);
+    let completion = Completion::new(&session.main_loop);
+    let _core_listener = completion.watch_core(&session.core);
+    let confirmed_for_registry = completion.clone();
+    let target_id = Rc::new(Cell::new(None));
+    let removed_id = target_id.clone();
+    let removed = completion.clone();
     let objects = RefCell::new(Objects::default());
     let _registry_listener = registry
         .add_listener_local()
@@ -411,21 +481,28 @@ pub fn set_profile(address: &str, index: u32) -> Result<()> {
             let Some(registry) = registry_weak.upgrade() else {
                 return;
             };
+            target_id.set(Some(global.id));
             if let Err(error) = apply_profile(
                 &registry,
                 global,
                 &bytes,
                 index,
-                Rc::clone(&confirmed_for_registry),
+                confirmed_for_registry.clone(),
                 &objects,
             ) {
-                tracing::warn!(id = global.id, %error, "could not apply PipeWire Bluetooth profile");
+                confirmed_for_registry.fail(format!("apply PipeWire Bluetooth profile: {error:#}"));
+            }
+        })
+        .global_remove(move |id| {
+            if removed_id.get() == Some(id) {
+                removed.fail("PipeWire Bluetooth device disappeared during profile change");
             }
         })
         .register();
-    session.settle()?;
-    if !confirmed.get() {
-        anyhow::bail!("PipeWire did not activate the requested Bluetooth audio profile");
+    if !completion.wait(OPERATION_TIMEOUT)? {
+        anyhow::bail!(
+            "PipeWire profile activation was not observed before the deadline; the write may still complete"
+        );
     }
     Ok(())
 }
@@ -453,7 +530,7 @@ fn apply_profile(
     global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
     bytes: &[u8],
     requested_index: u32,
-    confirmed: Rc<Cell<bool>>,
+    confirmed: Completion,
     objects: &RefCell<Objects>,
 ) -> Result<()> {
     let device = registry
@@ -469,12 +546,12 @@ fn apply_profile(
                     .and_then(parse_profile)
                     .is_some_and(|profile| profile.index == requested_index)
             {
-                confirmed.set(true);
+                confirmed.succeed();
             }
         })
         .register();
+    device.subscribe_params(&[pw::spa::param::ParamType::Profile]);
     device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
-    device.enum_params(1, Some(pw::spa::param::ParamType::Profile), 0, 1);
     objects.borrow_mut().retain(global.id, device, listener);
     Ok(())
 }
@@ -511,34 +588,19 @@ fn pipewire_roundtrip(
     main_loop: &pw::main_loop::MainLoopRc,
     core: &pw::core::CoreRc,
 ) -> Result<()> {
+    let completion = Completion::new(main_loop);
+    let _errors = completion.watch_core(core);
     let pending = core.sync(0).context("start PipeWire synchronization")?;
-    let done = Rc::new(Cell::new(false));
-    let done_for_listener = Rc::clone(&done);
-    let loop_for_listener = main_loop.clone();
+    let done_for_listener = completion.clone();
     let _listener = core
         .add_listener_local()
         .done(move |id, sequence| {
             if id == pw::core::PW_ID_CORE && sequence == pending {
-                done_for_listener.set(true);
-                loop_for_listener.quit();
+                done_for_listener.succeed();
             }
         })
         .register();
-    let timed_out = Rc::new(Cell::new(false));
-    let timed_out_for_timer = Rc::clone(&timed_out);
-    let loop_for_timer = main_loop.clone();
-    let timer = main_loop.loop_().add_timer(move |_| {
-        timed_out_for_timer.set(true);
-        loop_for_timer.quit();
-    });
-    timer
-        .update_timer(Some(Duration::from_secs(3)), None)
-        .into_result()
-        .context("arm PipeWire synchronization timeout")?;
-    while !done.get() && !timed_out.get() {
-        main_loop.run();
-    }
-    if timed_out.get() {
+    if !completion.wait(Duration::from_secs(3))? {
         anyhow::bail!("PipeWire synchronization timed out");
     }
     Ok(())
@@ -787,6 +849,13 @@ fn configured_default_key(kind: EndpointKind) -> &'static str {
     }
 }
 
+fn effective_default_key(kind: EndpointKind) -> &'static str {
+    match kind {
+        EndpointKind::Sink => "default.audio.sink",
+        EndpointKind::Source => "default.audio.source",
+    }
+}
+
 fn endpoint_kind(media_class: Option<&str>) -> Option<EndpointKind> {
     match media_class {
         Some("Audio/Sink") => Some(EndpointKind::Sink),
@@ -827,6 +896,37 @@ mod tests {
         AudioDevice, AudioEndpoint, AudioProfile, Defaults, DeviceEndpoints, finalize_devices,
         update_profile,
     };
+
+    #[test]
+    fn default_confirmation_tracks_configured_and_effective_metadata_separately() {
+        let mut outcome = super::DefaultRouteOutcome::default();
+        let kind = super::EndpointKind::Sink;
+        outcome.observe(
+            kind,
+            "wanted",
+            Some("default.configured.audio.sink"),
+            Some(r#"{"name":"wanted"}"#),
+        );
+        assert!(outcome.configured && !outcome.effective);
+        outcome.observe(
+            kind,
+            "wanted",
+            Some("default.audio.sink"),
+            Some(r#"{"name":"other"}"#),
+        );
+        assert!(!outcome.effective);
+        outcome.observe(
+            kind,
+            "wanted",
+            Some("default.audio.sink"),
+            Some(r#"{"name":"wanted"}"#),
+        );
+        assert!(outcome.effective);
+        outcome.observe(kind, "wanted", Some("default.audio.sink"), None);
+        assert!(outcome.configured && !outcome.effective);
+        outcome.observe(kind, "wanted", None, None);
+        assert!(!outcome.configured && !outcome.effective);
+    }
 
     #[test]
     fn probed_profiles_are_unique_selectable_and_respect_active_policy() {

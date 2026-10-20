@@ -88,6 +88,28 @@ fn snapshots_expose_only_resolvable_opaque_devices_and_endpoint_readiness() {
 }
 
 #[test]
+fn configured_preference_does_not_claim_effective_routing() {
+    for effective in [false, true] {
+        let response = super::applied_response(
+            crate::api::error("audio-unavailable", "offline".into()),
+            false,
+            None,
+            Some(audio::DefaultRouteOutcome {
+                configured: true,
+                effective,
+            }),
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["data"]["default_route_outcome"],
+            json!({"configured": true, "effective": effective})
+        );
+        assert!(response["data"]["refresh_error"].is_object());
+        assert!(response["data"].get("profile_outcome").is_none());
+    }
+}
+
+#[test]
 fn applied_profiles_report_effect_persistence_and_refresh_failures_independently() {
     assert!(
         super::PROFILE
@@ -110,7 +132,7 @@ fn applied_profiles_report_effect_persistence_and_refresh_failures_independently
         );
         assert_eq!(persisted, apply_ok);
         assert_eq!(result.is_ok(), apply_ok);
-        let Ok(error) = result else {
+        let Ok(((), error)) = result else {
             continue;
         };
         assert_eq!(error.as_deref(), (!persist_ok).then_some("disk full"));
@@ -119,10 +141,10 @@ fn applied_profiles_report_effect_persistence_and_refresh_failures_independently
             crate::api::error("audio-unavailable", "offline".into()),
         ] {
             assert_eq!(
-                super::applied_response(snapshot.clone(), false, None),
+                super::applied_response(snapshot.clone(), false, None, None),
                 snapshot
             );
-            let response = super::applied_response(snapshot.clone(), true, error.clone());
+            let response = super::applied_response(snapshot.clone(), true, error.clone(), None);
             assert_eq!(response["ok"], true);
             assert_eq!(
                 response["data"]["profile_outcome"],

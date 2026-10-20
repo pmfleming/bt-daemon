@@ -47,7 +47,7 @@ fn resolved_device_key(pairing: &PairingBroker, device: &audio::AudioDevice) -> 
     }
 }
 
-type AudioOperation = Box<dyn FnOnce() -> Result<()> + Send>;
+type AudioOperation = Box<dyn FnOnce() -> Result<Option<audio::DefaultRouteOutcome>> + Send>;
 type SelectOperation = fn(&str, &str, audio::AudioDevice) -> Option<AudioOperation>;
 
 fn select_default(
@@ -64,8 +64,12 @@ fn select_default(
     .0;
     let address = device.address;
     match kind {
-        "sink" => Some(Box::new(move || audio::set_default_sink(&address))),
-        _ => Some(Box::new(move || audio::set_default_source(&address))),
+        "sink" => Some(Box::new(move || {
+            audio::set_default_sink(&address).map(Some)
+        })),
+        _ => Some(Box::new(move || {
+            audio::set_default_source(&address).map(Some)
+        })),
     }
 }
 
@@ -75,7 +79,9 @@ fn select_profile(
     device: audio::AudioDevice,
 ) -> Option<AudioOperation> {
     let index = device.available_profile(device_key, requested_key)?.index;
-    Some(Box::new(move || audio::set_profile(&device.address, index)))
+    Some(Box::new(move || {
+        audio::set_profile(&device.address, index).map(|()| None)
+    }))
 }
 
 pub(super) struct Change {
@@ -112,12 +118,12 @@ impl Change {
 
 // An apply failure never persists; a persistence failure never claims that the
 // already-applied hardware change was rolled back.
-fn apply_then_remember(
-    apply: impl FnOnce() -> Result<()>,
+fn apply_then_remember<T>(
+    apply: impl FnOnce() -> Result<T>,
     remember: impl FnOnce() -> Result<()>,
-) -> Result<Option<String>> {
-    apply()?;
-    Ok(remember().err().map(|error| format!("{error:#}")))
+) -> Result<(T, Option<String>)> {
+    let outcome = apply()?;
+    Ok((outcome, remember().err().map(|error| format!("{error:#}"))))
 }
 
 pub(super) async fn apply_change(
@@ -157,8 +163,8 @@ pub(super) async fn apply_change(
     })
     .await
     {
-        Ok(Ok(persistence_error)) => {
-            applied_response(snapshot(pairing).await, remember, persistence_error)
+        Ok(Ok((route, persistence_error))) => {
+            applied_response(snapshot(pairing).await, remember, persistence_error, route)
         }
         Ok(Err(error)) => api::error("audio-operation-failed", format!("{error:#}")),
         Err(error) => api::error("audio-operation-failed", error.to_string()),
@@ -170,17 +176,23 @@ fn applied_response(
     mut response: Value,
     remember: bool,
     persistence_error: Option<String>,
+    route: Option<audio::DefaultRouteOutcome>,
 ) -> Value {
-    if !remember {
+    if !remember && route.is_none() {
         return response;
     }
     if response["ok"] != true {
         response = api::success(json!({"refresh_error": response["error"]}));
     }
-    response["data"]["profile_outcome"] = json!({
-        "applied": true, "remembered": persistence_error.is_none(),
-        "persistence_error": persistence_error
-    });
+    if remember {
+        response["data"]["profile_outcome"] = json!({
+            "applied": true, "remembered": persistence_error.is_none(),
+            "persistence_error": persistence_error
+        });
+    }
+    if let Some(route) = route {
+        response["data"]["default_route_outcome"] = json!(route);
+    }
     response
 }
 
