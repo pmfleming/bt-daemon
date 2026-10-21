@@ -8,7 +8,7 @@ use crate::{
     management::DevicePolicy,
     model::{
         Device, DeviceIdentity, DevicePresentation, DeviceServices, DeviceState, FastPairFeatures,
-        RssiKind, Service,
+        NoiseControl, RssiKind, Service,
     },
 };
 
@@ -24,6 +24,8 @@ pub(super) struct Reading {
     pub metadata: DeviceMetadata,
     pub bonded: Option<bool>,
     pub features: Option<FastPairFeatures>,
+    /// Noise control from a non-Fast Pair vendor channel; preferred when present.
+    pub vendor_noise_control: Option<NoiseControl>,
     pub last_disconnect: Option<crate::model::DeviceDisconnect>,
 }
 
@@ -91,6 +93,7 @@ pub(super) fn build(
         metadata,
         bonded,
         features,
+        vendor_noise_control,
         last_disconnect,
     } = reading;
     let services = metadata
@@ -109,7 +112,14 @@ pub(super) fn build(
         state.wake_allowed,
         has_fast_pair,
         features.as_ref(),
+        vendor_noise_control.as_ref(),
     );
+    let noise_control = vendor_noise_control.or_else(|| {
+        features
+            .as_ref()
+            .and_then(|features| features.noise_control.as_ref())
+            .map(NoiseControl::from_fast_pair)
+    });
     Device {
         key: context.key,
         adapter_key: context.adapter_key,
@@ -145,6 +155,7 @@ pub(super) fn build(
             components: presentation.components,
             model_id: presentation.model_id,
             fast_pair: features,
+            noise_control,
             rssi: signal.rssi,
             rssi_kind: signal.kind,
             signal_strength: signal

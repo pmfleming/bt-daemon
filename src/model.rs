@@ -156,6 +156,9 @@ pub struct DevicePresentation {
     pub model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast_pair: Option<FastPairFeatures>,
+    /// Live noise control from whichever vendor channel reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_control: Option<NoiseControl>,
     pub rssi: Option<i16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rssi_kind: Option<RssiKind>,
@@ -308,6 +311,26 @@ pub struct FastPairNoiseControl {
     pub available_modes: Vec<String>,
     pub settable_modes: Vec<String>,
     pub active_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Vendor-neutral noise control; `source` names the channel that set-noise-control uses.
+pub struct NoiseControl {
+    pub source: String,
+    pub available_modes: Vec<String>,
+    pub settable_modes: Vec<String>,
+    pub active_mode: Option<String>,
+}
+
+impl NoiseControl {
+    pub(crate) fn from_fast_pair(state: &FastPairNoiseControl) -> Self {
+        Self {
+            source: "google-fast-pair-message-stream".into(),
+            available_modes: state.available_modes.clone(),
+            settable_modes: state.settable_modes.clone(),
+            active_mode: state.active_mode.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

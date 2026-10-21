@@ -35,6 +35,7 @@ mod capabilities;
 mod commands;
 mod retry;
 use retry::RetryPolicy;
+pub(crate) use retry::is_connection_busy;
 mod keys;
 mod metadata;
 use commands::PendingCommands;

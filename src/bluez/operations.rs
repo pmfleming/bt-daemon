@@ -106,6 +106,17 @@ impl Effects for DeviceEffects<'_> {
     }
 
     async fn run(&self, operation: DeviceOperation) -> Result<()> {
+        if operation == DeviceOperation::SetNoiseControl
+            && let Some(provider) = &self.backend.sony
+            && provider
+                .noise_control(self.device.address())
+                .await
+                .is_some()
+        {
+            return provider
+                .set_noise_control(self.device.address(), self.params.require_string("mode")?)
+                .await;
+        }
         super::run_device_operation(
             self.adapter,
             self.device,

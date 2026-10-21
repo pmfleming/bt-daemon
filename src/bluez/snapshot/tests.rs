@@ -1,5 +1,5 @@
 use super::{device_capabilities, fast_pair_capabilities};
-use crate::model::{FastPairFeatures, FastPairMultipoint, FastPairNoiseControl};
+use crate::model::{FastPairFeatures, FastPairMultipoint, FastPairNoiseControl, NoiseControl};
 
 fn features() -> FastPairFeatures {
     FastPairFeatures {
@@ -96,7 +96,8 @@ fn device_capabilities_enforce_connection_authentication_and_block_policy() {
     let features = self::features();
     for paired in [false, true] {
         for connected in [false, true] {
-            let blocked = device_capabilities(paired, connected, true, None, true, Some(&features));
+            let blocked =
+                device_capabilities(paired, connected, true, None, true, Some(&features), None);
             assert!(!blocked.can_pair && !blocked.can_connect && !blocked.can_send_file);
             assert!(
                 !blocked.can_provision_fast_pair
@@ -107,7 +108,8 @@ fn device_capabilities_enforce_connection_authentication_and_block_policy() {
             assert_eq!(blocked.can_remove, paired);
             assert!(!blocked.can_wake);
             assert!(blocked.unsupported_reasons.contains_key("wake"));
-            let allowed = device_capabilities(paired, connected, false, Some(false), false, None);
+            let allowed =
+                device_capabilities(paired, connected, false, Some(false), false, None, None);
             assert_eq!(allowed.can_pair, !paired);
             assert_eq!(allowed.can_connect, !connected);
             assert_eq!(allowed.can_send_file, paired);
@@ -115,4 +117,35 @@ fn device_capabilities_enforce_connection_authentication_and_block_policy() {
             assert!(!allowed.unsupported_reasons.contains_key("wake"));
         }
     }
+}
+
+#[test]
+fn vendor_noise_control_needs_a_paired_live_link_without_fast_pair() {
+    let mut sony = NoiseControl {
+        source: "sony-headphones-control".into(),
+        available_modes: vec!["off".into(), "noise-cancelling".into()],
+        settable_modes: vec!["off".into(), "noise-cancelling".into()],
+        active_mode: Some("off".into()),
+    };
+    for (paired, connected, blocked, expected) in [
+        (true, true, false, true),
+        (false, true, false, false),
+        (true, false, false, false),
+        (true, true, true, false),
+    ] {
+        let capabilities =
+            device_capabilities(paired, connected, blocked, None, false, None, Some(&sony));
+        assert_eq!(capabilities.can_set_noise_control, expected);
+        assert_eq!(
+            capabilities
+                .unsupported_reasons
+                .contains_key("set_noise_control"),
+            !(paired && connected)
+        );
+    }
+    sony.settable_modes.clear();
+    assert!(
+        !device_capabilities(true, true, false, None, false, None, Some(&sony))
+            .can_set_noise_control
+    );
 }

@@ -28,6 +28,7 @@ pub mod protocol;
 mod rfkill;
 /// Capability-scoped connected-link RSSI broker; deployed as a separate service.
 pub mod rssi_helper;
+mod sony;
 mod state;
 mod task;
 mod time;

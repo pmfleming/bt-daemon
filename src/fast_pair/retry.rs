@@ -7,7 +7,7 @@ use tokio::time::Instant;
 // Exhaustion falls back to the normal failure policy until a new/stable session.
 const BUSY_RETRY_MS: [u64; 6] = [250, 500, 1000, 1000, 1000, 1000];
 
-pub(super) fn is_connection_busy(error: &anyhow::Error) -> bool {
+pub(crate) fn is_connection_busy(error: &anyhow::Error) -> bool {
     error.downcast_ref::<bluer::Error>().is_some_and(|error| {
         error.kind == bluer::ErrorKind::InProgress
             || (error.kind == bluer::ErrorKind::Failed && error.message == "br-connection-busy")

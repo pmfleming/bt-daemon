@@ -24,6 +24,7 @@ use crate::{
     management::{DevicePolicy, ManagementStore},
     model::Snapshot,
     rfkill,
+    sony::SonyControlProvider,
 };
 
 mod disconnect;
@@ -52,6 +53,7 @@ pub struct BluezBackend {
     disconnects: Mutex<disconnect::History>,
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
+    sony: Option<Arc<SonyControlProvider>>,
     management: Arc<ManagementStore>,
     tasks: crate::task::TaskGroup,
     sleeping: tokio::sync::watch::Sender<bool>,
@@ -104,7 +106,18 @@ impl BluezBackend {
                 None
             }
         };
-        tracing::info!(fast_pair = fast_pair.is_some(), "BlueZ backend initialized");
+        let sony = match SonyControlProvider::start(session.clone(), changes.clone()).await {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                tracing::warn!(error = %error, "Sony headphones control provider is unavailable");
+                None
+            }
+        };
+        tracing::info!(
+            fast_pair = fast_pair.is_some(),
+            sony = sony.is_some(),
+            "BlueZ backend initialized"
+        );
         Ok(Self {
             session,
             discovery_tasks: Mutex::new(HashMap::new()),
@@ -116,6 +129,7 @@ impl BluezBackend {
             disconnects: Mutex::new(disconnect::History::default()),
             system_bus,
             fast_pair,
+            sony,
             management,
             tasks: crate::task::TaskGroup::default(),
             sleeping: tokio::sync::watch::channel(false).0,
@@ -128,6 +142,16 @@ impl BluezBackend {
         self.stop_discovery(None).await;
         if let Some(provider) = &self.fast_pair {
             provider.shutdown().await;
+        }
+        if let Some(provider) = &self.sony {
+            provider.shutdown().await;
+        }
+    }
+
+    async fn sony_noise_control(&self, address: bluer::Address) -> bool {
+        match &self.sony {
+            Some(provider) => provider.noise_control(address).await.is_some(),
+            None => false,
         }
     }
 
@@ -603,7 +627,12 @@ impl BluetoothBackend for BluezBackend {
         let _exclusive = gate.lock().await;
         let (adapter, device) = self.find_device(device_key).await?;
         let policy = self.management.device_policy(device_key);
-        validate_fast_pair_control_policy(operation, &policy)?;
+        // Sony noise control is a separate vendor channel, not a Fast Pair control.
+        if !(operation == DeviceOperation::SetNoiseControl
+            && self.sony_noise_control(device.address()).await)
+        {
+            validate_fast_pair_control_policy(operation, &policy)?;
+        }
         let plan = operations::Plan::new(operation, params, &policy)?;
         operations::DeviceEffects {
             backend: self,

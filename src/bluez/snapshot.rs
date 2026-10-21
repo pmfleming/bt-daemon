@@ -8,8 +8,8 @@ use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::{DeviceIdentityRegistry, RememberedPresentationValues},
     model::{
-        Adapter, Battery, Device, DeviceCapabilities, Snapshot, presentation_components,
-        presentation_type,
+        Adapter, Battery, Device, DeviceCapabilities, NoiseControl, Snapshot,
+        presentation_components, presentation_type,
     },
 };
 
@@ -277,6 +277,10 @@ async fn device_snapshot(
         Some(provider) => provider.features(device, state.connected).await,
         None => None,
     };
+    let vendor_noise_control = match backend.sony.as_deref() {
+        Some(provider) if state.connected => provider.noise_control(identity).await,
+        _ => None,
+    };
     let presentation = presentation(
         &backend.identities,
         &key,
@@ -300,6 +304,7 @@ async fn device_snapshot(
             metadata,
             bonded: bonded_property(&backend.system_bus, adapter.name(), identity).await,
             features: fast_pair_features,
+            vendor_noise_control,
             last_disconnect: backend
                 .disconnects
                 .lock()
@@ -383,6 +388,7 @@ fn cached_device_view(cached: &CachedDevice) -> Device {
         device.presentation.battery_live = false;
         device.presentation.battery_last_known = true;
     }
+    device.presentation.noise_control = None;
     let has_fast_pair = has_fast_pair_service(&device.services.uuids);
     device.capabilities = device_capabilities(
         device.state.paired,
@@ -391,6 +397,7 @@ fn cached_device_view(cached: &CachedDevice) -> Device {
         device.state.wake_allowed,
         has_fast_pair,
         device.presentation.fast_pair.as_ref(),
+        None,
     );
     device
 }
@@ -431,9 +438,14 @@ fn device_capabilities(
     wake_allowed: Option<bool>,
     has_fast_pair: bool,
     fast_pair: Option<&crate::model::FastPairFeatures>,
+    vendor_noise_control: Option<&NoiseControl>,
 ) -> DeviceCapabilities {
-    let (can_provision_fast_pair, can_set_multipoint, can_set_noise_control) =
+    let (can_provision_fast_pair, can_set_multipoint, fast_pair_noise_control) =
         fast_pair_capabilities(paired, connected, has_fast_pair, fast_pair);
+    let can_set_noise_control = fast_pair_noise_control
+        || (paired
+            && connected
+            && vendor_noise_control.is_some_and(|noise| !noise.settable_modes.is_empty()));
     DeviceCapabilities {
         can_pair: !paired && !blocked,
         can_connect: !connected && !blocked,
@@ -516,7 +528,7 @@ fn unsupported_reasons(
         (
             !can_set_noise_control,
             "set_noise_control",
-            "Fast Pair noise control is unavailable or disabled",
+            "Noise control is unavailable or disabled",
         ),
     ]
     .into_iter()

@@ -42,6 +42,9 @@ impl Drop for Candidate {
             if let Some(provider) = &self.backend.fast_pair {
                 provider.abort();
             }
+            if let Some(provider) = &self.backend.sony {
+                provider.abort();
+            }
         }
     }
 }
