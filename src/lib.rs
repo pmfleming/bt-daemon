@@ -31,4 +31,6 @@ pub mod rssi_helper;
 mod sony;
 mod state;
 mod task;
+#[cfg(test)]
+mod test_bus;
 mod time;

@@ -1,5 +1,5 @@
 //! Cancellation-safe ownership of authenticated Message Stream commands.
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bluer::Address;
 use std::{
     collections::HashMap,
@@ -50,20 +50,17 @@ impl PendingCommands {
         let (_reservation, receiver) = self.reserve(key)?;
         // The deadline includes writer backpressure. Drop releases the slot on
         // send failure, disconnect, timeout and task cancellation alike.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             send.await?;
-            Ok::<_, anyhow::Error>(receiver.await)
+            receiver
+                .await
+                .context("Fast Pair control acknowledgement was cancelled")?
+                .map_err(|reason| {
+                    anyhow::anyhow!("Fast Pair provider rejected control command: {reason}")
+                })
         })
-        .await;
-        match result {
-            Ok(Ok(Ok(Ok(())))) => Ok(()),
-            Ok(Ok(Ok(Err(reason)))) => {
-                bail!("Fast Pair provider rejected control command: {reason}")
-            }
-            Ok(Ok(Err(_))) => bail!("Fast Pair control acknowledgement was cancelled"),
-            Ok(Err(error)) => Err(error),
-            Err(_) => bail!("Fast Pair control acknowledgement timed out"),
-        }
+        .await
+        .context("Fast Pair control acknowledgement timed out")?
     }
 
     pub fn reserve(&self, key: Key) -> Result<(Reservation<'_>, oneshot::Receiver<Reply>)> {

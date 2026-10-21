@@ -1,7 +1,6 @@
 //! End-to-end regressions on a private bus, with no host BlueZ or PipeWire access.
 use std::{
-    io::{BufRead, BufReader},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11,16 +10,11 @@ use std::{
 
 use futures::StreamExt;
 use serde_json::{Value, json};
-use zbus::{Connection, Proxy, connection::Builder, fdo, zvariant::ObjectPath};
+use zbus::{Connection, Proxy, fdo, zvariant::ObjectPath};
 
-struct Process(Child);
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+#[path = "../src/test_bus.rs"]
+mod test_bus;
+use test_bus::{Bus, Process};
 
 struct AgentManager {
     allowed: Arc<AtomicBool>,
@@ -50,9 +44,8 @@ impl ObexAgentManager {
     }
 }
 
-async fn bluez(address: &str, allowed: Arc<AtomicBool>, attempts: Arc<AtomicUsize>) -> Connection {
-    Builder::address(address)
-        .unwrap()
+async fn bluez(bus: &Bus, allowed: Arc<AtomicBool>, attempts: Arc<AtomicUsize>) -> Connection {
+    bus.builder()
         .serve_at("/", fdo::ObjectManager)
         .unwrap()
         .serve_at("/org/bluez", AgentManager { allowed, attempts })
@@ -88,40 +81,11 @@ async fn snapshot_when(proxy: &Proxy<'_>, predicate: impl Fn(&Value) -> bool) ->
 async fn startup_recovery_and_policy_changes_reach_existing_clients() {
     for initially_present in [false, true] {
         let state = tempfile::tempdir().unwrap();
-        // Do not load the host's session service directories: auto-activation
-        // could otherwise launch an installed daemon against the real system bus.
-        let config = state.path().join("bus.conf");
-        std::fs::write(
-            &config,
-            r#"<busconfig>
-            <type>session</type>
-            <listen>unix:tmpdir=/tmp</listen>
-            <auth>EXTERNAL</auth>
-            <policy context="default">
-                <allow send_destination="*"/>
-                <allow receive_sender="*"/>
-                <allow own="*"/>
-            </policy>
-        </busconfig>"#,
-        )
-        .unwrap();
-        let mut bus = Process(
-            Command::new("dbus-daemon")
-                .arg("--config-file")
-                .arg(&config)
-                .args(["--nofork", "--print-address=1"])
-                .stdout(Stdio::piped())
-                .spawn()
-                .expect("dbus-daemon is required for this test"),
-        );
-        let mut address = String::new();
-        BufReader::new(bus.0.stdout.take().unwrap())
-            .read_line(&mut address)
-            .unwrap();
-        let address = address.trim();
+        let bus = Bus::new();
+        let address = bus.address.as_str();
         let incoming_registrations = Arc::new(AtomicUsize::new(0));
-        let _obex = Builder::address(address)
-            .unwrap()
+        let _obex = bus
+            .builder()
             .name("org.bluez.obex")
             .unwrap()
             .serve_at(
@@ -135,7 +99,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
         let allowed = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicUsize::new(0));
         let mut service = if initially_present {
-            Some(bluez(address, allowed.clone(), attempts.clone()).await)
+            Some(bluez(&bus, allowed.clone(), attempts.clone()).await)
         } else {
             None
         };
@@ -153,7 +117,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
                 .spawn()
                 .unwrap(),
         );
-        let client = Builder::address(address).unwrap().build().await.unwrap();
+        let client = bus.connection().await;
         let proxy = Proxy::new(
             &client,
             "org.laufan.BluetoothDaemon",
@@ -181,7 +145,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
         );
 
         if service.is_none() {
-            service = Some(bluez(address, allowed.clone(), attempts.clone()).await);
+            service = Some(bluez(&bus, allowed.clone(), attempts.clone()).await);
         }
         // Agent registration failures must keep the API available and retry even
         // if BlueZ keeps the same owner throughout startup.
@@ -242,7 +206,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
             value["error"]["code"] == "bluez-unavailable"
         })
         .await;
-        let _replacement = bluez(address, allowed.clone(), attempts.clone()).await;
+        let _replacement = bluez(&bus, allowed.clone(), attempts.clone()).await;
         snapshot_when(&proxy, |value| {
             value["data"]["snapshot"]["management"]["trust_after_pair"] == false
         })

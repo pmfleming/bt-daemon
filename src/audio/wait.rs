@@ -70,7 +70,9 @@ impl Completion {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Completion;
+    use pipewire as pw;
+    use std::time::Duration;
 
     #[test]
     fn waits_for_late_events_and_distinguishes_timeout_from_failure() {

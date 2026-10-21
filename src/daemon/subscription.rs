@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::Serialize;
 use serde_json::{Value, json};
 use shelllist_daemon_core::{
@@ -11,12 +13,39 @@ use tokio::{
 };
 use zbus::{names::UniqueName, object_server::SignalEmitter};
 
-use crate::{api, protocol};
+use crate::{api, model::Snapshot, protocol};
 
 use super::{
     AUDIO_STREAM, BluetoothDaemon, CHANGED_STREAM, INTERFACE, OBEX_STREAM, OPERATION_STREAM,
-    PAIRING_STREAM, SCAN_STREAM, SharedSnapshot,
+    PAIRING_STREAM, SCAN_STREAM,
 };
+
+/// One captured state feeds both request responses and subscription events.
+#[derive(Clone, PartialEq)]
+pub(super) enum SharedSnapshot {
+    Loading,
+    Available(Arc<Snapshot>),
+    Unavailable(Arc<String>),
+}
+
+impl From<anyhow::Result<Snapshot>> for SharedSnapshot {
+    fn from(result: anyhow::Result<Snapshot>) -> Self {
+        match result {
+            Ok(snapshot) => Self::Available(Arc::new(snapshot)),
+            Err(error) => Self::Unavailable(Arc::new(format!("{error:#}"))),
+        }
+    }
+}
+
+impl SharedSnapshot {
+    pub(super) fn response(&self) -> Value {
+        match self {
+            Self::Loading => api::error("snapshot-loading", "Bluetooth snapshot is loading".into()),
+            Self::Available(snapshot) => api::success(json!({ "snapshot": snapshot })),
+            Self::Unavailable(error) => api::error("bluez-unavailable", error.to_string()),
+        }
+    }
+}
 
 fn valid_streams(streams: &[String]) -> bool {
     !streams.is_empty()

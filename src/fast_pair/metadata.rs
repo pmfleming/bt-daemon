@@ -107,25 +107,20 @@ pub(super) fn advertisement(data: &[u8]) -> Option<Advertisement> {
         }
         let (value, remaining) = rest.split_at(length);
         fields = remaining;
-        match header & 0x0f {
+        let duplicate = match header & 0x0f {
             // Account-key filters (show/hide UI) are not discoverable Model IDs.
             0 | 2 => return None,
-            7 => {
-                if model_id.is_some() {
-                    return None;
-                }
-                model_id = Some(value.try_into().ok()?);
-            }
-            8 => {
-                if capabilities.is_some() {
-                    return None;
-                }
-                capabilities = Some(crate::model::FastPairAdvertisementCapabilities {
+            7 => model_id.replace(value.try_into().ok()?).is_some(),
+            8 => capabilities
+                .replace(crate::model::FastPairAdvertisementCapabilities {
                     le_audio_sharing: value[0] & 2 != 0,
                     factory_new: value[0] & 1 != 0,
-                });
-            }
-            _ => {} // Length-delimited extension; reserved capability bits are ignored.
+                })
+                .is_some(),
+            _ => false, // Length-delimited extension; reserved capability bits are ignored.
+        };
+        if duplicate {
+            return None;
         }
     }
     Some(Advertisement {

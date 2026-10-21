@@ -93,22 +93,12 @@ impl Links {
         if self.connecting.remove(&address).is_none() {
             return;
         }
-        match self.retry.get_mut(&address) {
-            Some(retry) if busy && retry.busy < BUSY_RETRIES => {
-                retry.busy += 1;
-                retry.after = Instant::now() + Duration::from_secs(1);
-            }
-            None if busy => {
-                self.retry.insert(
-                    address,
-                    Retry {
-                        failures: 0,
-                        busy: 1,
-                        after: Instant::now() + Duration::from_secs(1),
-                    },
-                );
-            }
-            _ => self.back_off(address),
+        let retry = self.retry_state(address);
+        if busy && retry.busy < BUSY_RETRIES {
+            retry.busy += 1;
+            retry.after = Instant::now() + Duration::from_secs(1);
+        } else {
+            self.back_off(address);
         }
     }
 
@@ -125,12 +115,16 @@ impl Links {
         self.retry.remove(&address);
     }
 
-    fn back_off(&mut self, address: Address) {
-        let retry = self.retry.entry(address).or_insert(Retry {
+    fn retry_state(&mut self, address: Address) -> &mut Retry {
+        self.retry.entry(address).or_insert(Retry {
             failures: 0,
             busy: 0,
             after: Instant::now(),
-        });
+        })
+    }
+
+    fn back_off(&mut self, address: Address) {
+        let retry = self.retry_state(address);
         let delay = Duration::from_secs((15_u64 << retry.failures.min(5)).min(300));
         retry.failures += 1;
         retry.after = Instant::now() + delay;
@@ -227,7 +221,7 @@ impl SonyControlProvider {
             .context("Sony control channel closed before acknowledging")??;
         // The returned snapshot should already show the new mode.
         let confirmed = tokio::time::timeout(STATE_TIMEOUT, async {
-            while self.active_mode(address).await.as_deref() != Some(mode) {
+            while self.active_mode(address).await != Some(mode) {
                 if let Err(broadcast::error::RecvError::Closed) = changes.recv().await {
                     break;
                 }
@@ -240,8 +234,13 @@ impl SonyControlProvider {
         Ok(())
     }
 
-    async fn active_mode(&self, address: Address) -> Option<String> {
-        self.noise_control(address).await?.active_mode
+    async fn active_mode(&self, address: Address) -> Option<&'static str> {
+        self.channels
+            .read()
+            .await
+            .get(&address)?
+            .noise_control?
+            .active_mode()
     }
 
     fn spawn_request_handler(provider: Arc<Self>, mut requests: ProfileHandle) {

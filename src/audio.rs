@@ -193,10 +193,7 @@ struct Defaults {
     source: String,
 }
 
-#[derive(Default)]
-struct DeviceEndpoints {
-    nodes: HashMap<u32, AudioEndpoint>,
-}
+type DeviceEndpoints = HashMap<u32, AudioEndpoint>;
 
 type ChangeCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
 
@@ -402,6 +399,10 @@ pub struct DefaultRouteOutcome {
 }
 
 impl DefaultRouteOutcome {
+    fn confirmed(&self, written: bool) -> bool {
+        written && self.configured && self.effective
+    }
+
     fn observe(
         &mut self,
         kind: EndpointKind,
@@ -419,9 +420,171 @@ impl DefaultRouteOutcome {
     }
 }
 
-struct RetainedMetadata {
-    _listener: pw::metadata::MetadataListener,
-    proxy: Metadata,
+/// Only transport identity crosses into callbacks, not a cloned device snapshot.
+struct DeviceIdentity {
+    id: u32,
+    serial: Option<u64>,
+    adapter: String,
+    address: String,
+}
+
+impl From<&AudioDevice> for DeviceIdentity {
+    fn from(device: &AudioDevice) -> Self {
+        Self {
+            id: device.pipewire_id,
+            serial: device.serial,
+            adapter: device.adapter.clone(),
+            address: device.address.clone(),
+        }
+    }
+}
+
+struct RouteChange {
+    device: DeviceIdentity,
+    node_id: u32,
+    node_serial: Option<u64>,
+    name: String,
+    kind: EndpointKind,
+    completion: Completion,
+    outcome: RefCell<DefaultRouteOutcome>,
+    device_seen: Cell<bool>,
+    node_seen: Cell<bool>,
+    written: Cell<bool>,
+    metadata_id: Cell<Option<u32>>,
+    metadata: RefCell<Option<Rc<Metadata>>>,
+}
+
+impl RouteChange {
+    fn confirm(&self) {
+        if self.outcome.borrow().confirmed(self.written.get()) {
+            self.completion.succeed();
+        }
+    }
+
+    fn write_if_ready(&self) {
+        if !self.device_seen.get()
+            || !self.node_seen.get()
+            || self.written.get()
+            || self.completion.failed()
+        {
+            return;
+        }
+        let metadata = self.metadata.borrow();
+        let Some(metadata) = metadata.as_ref() else {
+            return;
+        };
+        self.written.set(true);
+        metadata.set_property(
+            0,
+            configured_default_key(self.kind),
+            Some("Spa:String:JSON"),
+            Some(&serde_json::json!({ "name": self.name }).to_string()),
+        );
+        self.confirm();
+    }
+
+    fn bind_device(
+        self: &Rc<Self>,
+        registry: &pw::registry::RegistryRc,
+        global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
+        objects: &mut Objects,
+    ) -> Result<()> {
+        let device = registry
+            .bind::<Device, _>(global)
+            .context("bind PipeWire routing device")?;
+        let state = Rc::clone(self);
+        let listener = device
+            .add_listener_local()
+            .info(move |info| {
+                let Some(properties) = info.props() else {
+                    return;
+                };
+                if !device_properties_match(
+                    &state.device.adapter,
+                    &state.device.address,
+                    properties,
+                ) {
+                    state
+                        .completion
+                        .fail("PipeWire routing device changed identity");
+                    return;
+                }
+                state.device_seen.set(true);
+                state.write_if_ready();
+            })
+            .register();
+        objects.retain(global.id, device, listener);
+        Ok(())
+    }
+
+    fn bind_metadata(
+        self: &Rc<Self>,
+        registry: &pw::registry::RegistryRc,
+        global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
+        objects: &mut Objects,
+    ) -> Result<()> {
+        if let Some(previous) = self.metadata_id.replace(Some(global.id)) {
+            objects.remove(previous);
+        }
+        let metadata = Rc::new(
+            registry
+                .bind::<Metadata, _>(global)
+                .context("bind PipeWire default metadata")?,
+        );
+        let state = Rc::clone(self);
+        let listener = metadata
+            .add_listener_local()
+            .property(move |subject, key, _, value| {
+                if subject == 0 {
+                    state
+                        .outcome
+                        .borrow_mut()
+                        .observe(state.kind, &state.name, key, value);
+                    state.confirm();
+                }
+                0
+            })
+            .register();
+        *self.metadata.borrow_mut() = Some(Rc::clone(&metadata));
+        // Listeners live outside state so their Rc callbacks cannot form a cycle.
+        objects.retain(global.id, metadata, listener);
+        Ok(())
+    }
+
+    fn observe(
+        self: &Rc<Self>,
+        registry: &pw::registry::RegistryRc,
+        global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
+        objects: &mut Objects,
+    ) -> Result<()> {
+        match global.type_ {
+            ObjectType::Device if object_matches(global, self.device.id, self.device.serial) => {
+                self.bind_device(registry, global, objects)?;
+            }
+            ObjectType::Node if object_matches(global, self.node_id, self.node_serial) => {
+                anyhow::ensure!(
+                    global.props.is_some_and(|props| {
+                        props.get("device.id").and_then(|id| id.parse::<u32>().ok())
+                            == Some(self.device.id)
+                            && props.get("node.name") == Some(self.name.as_str())
+                            && endpoint_kind(props.get("media.class")) == Some(self.kind)
+                    }),
+                    "PipeWire endpoint changed identity"
+                );
+                self.node_seen.set(true);
+            }
+            ObjectType::Metadata
+                if global.props.and_then(|props| props.get("metadata.name")) == Some("default") =>
+            {
+                self.bind_metadata(registry, global, objects)?;
+            }
+            _ => {}
+        }
+        // Serial checks alone do not protect against server restarts: device
+        // info must also confirm the adapter/address before any write.
+        self.write_if_ready();
+        Ok(())
+    }
 }
 
 /// Route to a current public endpoint after validating its device and object serials.
@@ -445,150 +608,49 @@ pub fn set_default_node(
     let session = pipewire_session()?;
     let completion = Completion::new(&session.main_loop);
     let _core_listener = completion.watch_core(&session.core);
-    let registry = &session.registry;
-    let registry_weak = registry.downgrade();
-    let outcome = Rc::new(RefCell::new(DefaultRouteOutcome::default()));
-    let observed = outcome.clone();
-    let metadata_id = Rc::new(Cell::new(None));
-    let removed_id = metadata_id.clone();
-    let removed = completion.clone();
-    let applied = completion.clone();
-    let metadata = Rc::new(RefCell::new(None::<RetainedMetadata>));
-    let (device_id, device_serial) = (target.pipewire_id, target.serial);
-    let (node_id, node_serial, kind) = (endpoint.pipewire_id, endpoint.serial, endpoint.kind);
-    let device_seen = Rc::new(Cell::new(false));
-    let node_seen = Rc::new(Cell::new(false));
+    let state = Rc::new(RouteChange {
+        device: target.into(),
+        node_id: endpoint.pipewire_id,
+        node_serial: endpoint.serial,
+        name: endpoint.name.clone(),
+        kind: endpoint.kind,
+        completion: completion.clone(),
+        outcome: RefCell::default(),
+        device_seen: Cell::new(false),
+        node_seen: Cell::new(false),
+        written: Cell::new(false),
+        metadata_id: Cell::new(None),
+        metadata: RefCell::default(),
+    });
+    let observed = Rc::clone(&state);
+    let removed = Rc::clone(&state);
+    let registry_weak = session.registry.downgrade();
     let objects = RefCell::new(Objects::default());
-    let (adapter, address) = (target.adapter.clone(), target.address.clone());
-    let written = Rc::new(Cell::new(false));
-    let write_observed = written.clone();
-    let node_name = endpoint.name.clone();
-    let value = serde_json::json!({ "name": node_name }).to_string();
-    let write_if_ready = {
-        let device_seen = device_seen.clone();
-        let node_seen = node_seen.clone();
-        let written = written.clone();
-        let metadata = metadata.clone();
-        let observed = observed.clone();
-        let applied = applied.clone();
-        Rc::new(move || {
-            if device_seen.get()
-                && node_seen.get()
-                && !written.get()
-                && !applied.failed()
-                && let Some(metadata) = metadata.borrow().as_ref()
-            {
-                written.set(true);
-                metadata.proxy.set_property(
-                    0,
-                    configured_default_key(kind),
-                    Some("Spa:String:JSON"),
-                    Some(&value),
-                );
-                let outcome = observed.borrow();
-                if outcome.configured && outcome.effective {
-                    applied.succeed();
-                }
-            }
-        })
-    };
-    let _registry_listener = registry
+    let _registry_listener = session
+        .registry
         .add_listener_local()
         .global(move |global| {
-            if global.type_ == ObjectType::Device
-                && object_matches(global, device_id, device_serial)
+            if let Some(registry) = registry_weak.upgrade()
+                && let Err(error) = observed.observe(&registry, global, &mut objects.borrow_mut())
             {
-                let Some(registry) = registry_weak.upgrade() else {
-                    return;
-                };
-                match registry.bind::<Device, _>(global) {
-                    Ok(device) => {
-                        let (adapter, address) = (adapter.clone(), address.clone());
-                        let seen = device_seen.clone();
-                        let applied = applied.clone();
-                        let write = write_if_ready.clone();
-                        let listener = device
-                            .add_listener_local()
-                            .info(move |info| {
-                                let Some(properties) = info.props() else {
-                                    return;
-                                };
-                                if !device_properties_match(&adapter, &address, properties) {
-                                    applied.fail("PipeWire routing device changed identity");
-                                    return;
-                                }
-                                seen.set(true);
-                                write();
-                            })
-                            .register();
-                        objects.borrow_mut().retain(global.id, device, listener);
-                    }
-                    Err(error) => applied.fail(format!("bind PipeWire routing device: {error}")),
-                }
-            } else if global.type_ == ObjectType::Node
-                && object_matches(global, node_id, node_serial)
-            {
-                let valid = global.props.is_some_and(|props| {
-                    props.get("device.id").and_then(|id| id.parse::<u32>().ok()) == Some(device_id)
-                        && props.get("node.name") == Some(node_name.as_str())
-                        && endpoint_kind(props.get("media.class")) == Some(kind)
-                });
-                if !valid {
-                    applied.fail("PipeWire endpoint changed identity");
-                    return;
-                }
-                node_seen.set(true);
-            } else if global.type_ == ObjectType::Metadata
-                && global.props.and_then(|props| props.get("metadata.name")) == Some("default")
-            {
-                metadata_id.set(Some(global.id));
-                let Some(registry) = registry_weak.upgrade() else {
-                    return;
-                };
-                match registry.bind::<Metadata, _>(global) {
-                    Ok(proxy) => {
-                        let observed = observed.clone();
-                        let applied = applied.clone();
-                        let expected = node_name.clone();
-                        let written = written.clone();
-                        let listener = proxy
-                            .add_listener_local()
-                            .property(move |subject, key, _, value| {
-                                if subject == 0 {
-                                    let mut outcome = observed.borrow_mut();
-                                    outcome.observe(kind, &expected, key, value);
-                                    if written.get() && outcome.configured && outcome.effective {
-                                        applied.succeed();
-                                    }
-                                }
-                                0
-                            })
-                            .register();
-                        *metadata.borrow_mut() = Some(RetainedMetadata {
-                            _listener: listener,
-                            proxy,
-                        });
-                    }
-                    Err(error) => {
-                        applied.fail(format!("bind PipeWire default metadata: {error}"));
-                        return;
-                    }
-                }
+                observed.completion.fail(format!("{error:#}"));
             }
-            // A server restart can reuse serials too: validate adapter/address
-            // from device info as well as both serials before writing.
-            write_if_ready();
         })
         .global_remove(move |id| {
-            if removed_id.get() == Some(id) || id == device_id || id == node_id {
-                removed.fail("PipeWire routing target or default metadata disappeared");
+            if removed.metadata_id.get() == Some(id)
+                || id == removed.device.id
+                || id == removed.node_id
+            {
+                removed
+                    .completion
+                    .fail("PipeWire routing target or default metadata disappeared");
             }
         })
         .register();
     completion.wait(OPERATION_TIMEOUT)?;
-    let outcome = *outcome.borrow();
+    let outcome = *state.outcome.borrow();
     anyhow::ensure!(
-        write_observed.get() && outcome.configured,
+        state.written.get() && outcome.configured,
         "PipeWire did not confirm the requested default before the deadline (target may have disappeared)"
     );
     Ok(outcome)
@@ -605,8 +667,7 @@ pub fn set_profile(target: &AudioDevice, index: u32) -> Result<()> {
     let session = pipewire_session()?;
     let registry = &session.registry;
     let registry_weak = registry.downgrade();
-    let (expected_id, expected_serial) = (target.pipewire_id, target.serial);
-    let target = target.clone();
+    let target = Rc::new(DeviceIdentity::from(target));
     let completion = Completion::new(&session.main_loop);
     let _core_listener = completion.watch_core(&session.core);
     let confirmed_for_registry = completion.clone();
@@ -618,7 +679,7 @@ pub fn set_profile(target: &AudioDevice, index: u32) -> Result<()> {
         .add_listener_local()
         .global(move |global| {
             if global.type_ != ObjectType::Device
-                || !object_matches(global, expected_id, expected_serial)
+                || !object_matches(global, target.id, target.serial)
             {
                 return;
             }
@@ -674,7 +735,7 @@ fn apply_profile(
     registry: &pw::registry::RegistryRc,
     global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
     bytes: &[u8],
-    target: &AudioDevice,
+    target: &Rc<DeviceIdentity>,
     requested_index: u32,
     confirmed: Completion,
     objects: &RefCell<Objects>,
@@ -686,7 +747,7 @@ fn apply_profile(
     );
     pw::spa::pod::Pod::from_bytes(bytes).context("decode serialized PipeWire profile parameter")?;
     let bytes = bytes.to_vec();
-    let (adapter, address) = (target.adapter.clone(), target.address.clone());
+    let target = Rc::clone(target);
     let weak = Rc::downgrade(&device);
     let checked = confirmed.clone();
     let written = Rc::new(Cell::new(false));
@@ -697,7 +758,7 @@ fn apply_profile(
             let Some(properties) = info.props() else {
                 return;
             };
-            if !device_properties_match(&adapter, &address, properties) {
+            if !device_properties_match(&target.adapter, &target.address, properties) {
                 checked.fail("PipeWire Bluetooth device changed identity");
                 return;
             }
@@ -868,7 +929,9 @@ impl ProbeState {
             .register();
         device.enum_params(1, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
         device.enum_params(2, Some(pw::spa::param::ParamType::Profile), 0, 1);
-        self.retain(global.id, device, listener);
+        self.objects
+            .borrow_mut()
+            .retain(global.id, device, listener);
     }
 
     fn bind_node(
@@ -904,7 +967,6 @@ impl ProbeState {
             .borrow_mut()
             .entry(device_id)
             .or_default()
-            .nodes
             .insert(global.id, endpoint);
         let node = bind_or_return!(registry, global, Node);
         let endpoints_for_info = Rc::clone(&self.endpoints);
@@ -915,7 +977,7 @@ impl ProbeState {
                 let mut endpoints = endpoints_for_info.borrow_mut();
                 let Some(endpoint) = endpoints
                     .get_mut(&device_id)
-                    .and_then(|device| device.nodes.get_mut(&node_id))
+                    .and_then(|device| device.get_mut(&node_id))
                 else {
                     return;
                 };
@@ -925,7 +987,7 @@ impl ProbeState {
                 }
             })
             .register();
-        self.retain(global.id, node, listener);
+        self.objects.borrow_mut().retain(global.id, node, listener);
     }
 
     fn bind_metadata(
@@ -951,11 +1013,9 @@ impl ProbeState {
                 0
             })
             .register();
-        self.retain(global.id, metadata, listener);
-    }
-
-    fn retain(&self, id: u32, proxy: impl std::any::Any, listener: impl Listener + 'static) {
-        self.objects.borrow_mut().retain(id, proxy, listener);
+        self.objects
+            .borrow_mut()
+            .retain(global.id, metadata, listener);
     }
 
     fn remove(&self, id: u32) {
@@ -963,7 +1023,7 @@ impl ProbeState {
         let mut endpoints = self.endpoints.borrow_mut();
         endpoints.remove(&id);
         for device in endpoints.values_mut() {
-            device.nodes.remove(&id);
+            device.remove(&id);
         }
         self.objects.borrow_mut().remove(id);
     }
@@ -1079,7 +1139,6 @@ fn finalize_devices(
             .sort_by_key(|profile| std::cmp::Reverse(profile.priority));
         if let Some(device_endpoints) = endpoints.remove(&device.pipewire_id) {
             let (internal, public): (Vec<_>, Vec<_>) = device_endpoints
-                .nodes
                 .into_values()
                 .partition(|node| node.internal);
             device.internal_endpoints = internal;
@@ -1196,9 +1255,7 @@ fn adapter_from_bluez_path(path: &str) -> Option<String> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{
-        AudioDevice, AudioEndpoint, AudioProfile, Defaults, DeviceEndpoints, finalize_devices,
-    };
+    use super::{AudioDevice, AudioEndpoint, AudioProfile, Defaults, finalize_devices};
 
     fn endpoint(id: u32, name: &str) -> AudioEndpoint {
         AudioEndpoint {
@@ -1226,9 +1283,7 @@ mod tests {
         second.priority = 100;
         let mut endpoints = HashMap::from([(
             7,
-            DeviceEndpoints {
-                nodes: HashMap::from([(10, endpoint(10, "first")), (11, second), (12, internal)]),
-            },
+            HashMap::from([(10, endpoint(10, "first")), (11, second), (12, internal)]),
         )]);
         let result = finalize_devices(
             vec![device],
@@ -1251,16 +1306,14 @@ mod tests {
         state.devices.borrow_mut().insert(7, device.clone());
         state.endpoints.borrow_mut().insert(
             7,
-            DeviceEndpoints {
-                nodes: device
-                    .endpoints
-                    .iter()
-                    .map(|node| (node.pipewire_id, node.clone()))
-                    .collect(),
-            },
+            device
+                .endpoints
+                .iter()
+                .map(|node| (node.pipewire_id, node.clone()))
+                .collect(),
         );
         state.remove(10);
-        assert_eq!(state.endpoints.borrow()[&7].nodes.len(), 1);
+        assert_eq!(state.endpoints.borrow()[&7].len(), 1);
         state.remove(7);
         assert!(state.devices.borrow().is_empty() && state.endpoints.borrow().is_empty());
     }
@@ -1307,6 +1360,31 @@ mod tests {
         assert!(node.internal);
         assert_eq!(node.codec.as_deref(), Some("lc3"));
         assert_eq!(node.priority, 100);
+    }
+
+    #[test]
+    fn route_confirmation_requires_a_write_and_matching_configured_and_effective_defaults() {
+        use super::{
+            DefaultRouteOutcome, EndpointKind, configured_default_key, effective_default_key,
+        };
+        let expected = Some(r#"{"name":"logical"}"#);
+        for kind in [EndpointKind::Sink, EndpointKind::Source] {
+            let mut outcome = DefaultRouteOutcome::default();
+            let configured = Some(configured_default_key(kind));
+            let effective = Some(effective_default_key(kind));
+            outcome.observe(kind, "logical", configured, expected);
+            for value in [None, Some("invalid JSON"), Some(r#"{"name":"other"}"#)] {
+                outcome.observe(kind, "logical", effective, value);
+                assert!(!outcome.confirmed(true));
+            }
+            outcome.observe(kind, "logical", effective, expected);
+            assert!(outcome.confirmed(true));
+            assert!(!outcome.confirmed(false));
+            outcome.observe(kind, "logical", Some("unrelated"), None);
+            assert!(outcome.confirmed(true));
+            outcome.observe(kind, "logical", None, None);
+            assert!(!outcome.configured && !outcome.effective);
+        }
     }
 
     fn audio_device() -> AudioDevice {

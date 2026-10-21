@@ -6,8 +6,7 @@ use async_trait::async_trait;
 use bluer::Address;
 use std::{
     collections::HashMap,
-    io::{self, BufRead, BufReader},
-    process::{Child, Command, Stdio},
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,50 +14,9 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Mutex;
-use zbus::connection::Builder;
 use zbus::{Connection, fdo};
 
-struct Bus {
-    child: Child,
-    address: String,
-    _dir: tempfile::TempDir,
-}
-impl Bus {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("bus.conf");
-        std::fs::write(&config, r#"<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen><auth>EXTERNAL</auth><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/></policy></busconfig>"#).unwrap();
-        let mut child = Command::new("dbus-daemon")
-            .arg("--config-file")
-            .arg(config)
-            .args(["--nofork", "--print-address=1"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut address = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut address)
-            .unwrap();
-        Self {
-            child,
-            address: address.trim().into(),
-            _dir: dir,
-        }
-    }
-    async fn connection(&self) -> Connection {
-        Builder::address(self.address.as_str())
-            .unwrap()
-            .build()
-            .await
-            .unwrap()
-    }
-}
-impl Drop for Bus {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+use crate::test_bus::Bus;
 
 #[derive(Default)]
 struct Fake {
@@ -97,8 +55,7 @@ impl Backend for Fake {
 }
 
 async fn serve(bus: &Bus, backend: Arc<dyn Backend>) -> Connection {
-    Builder::address(bus.address.as_str())
-        .unwrap()
+    bus.builder()
         .name(BUS)
         .unwrap()
         .serve_at(PATH, Helper::new(backend))
@@ -303,8 +260,8 @@ async fn system_backend_uses_polkit_bus_identity_and_bluez_connection_not_client
     let sender = connection.unique_name().unwrap().as_str();
     let allowed = Arc::new(AtomicBool::new(false));
     let connected = Arc::new(AtomicBool::new(false));
-    let _authority = Builder::address(bus.address.as_str())
-        .unwrap()
+    let _authority = bus
+        .builder()
         .name("org.freedesktop.PolicyKit1")
         .unwrap()
         .serve_at(
@@ -318,8 +275,8 @@ async fn system_backend_uses_polkit_bus_identity_and_bluez_connection_not_client
         .build()
         .await
         .unwrap();
-    let _bluez = Builder::address(bus.address.as_str())
-        .unwrap()
+    let _bluez = bus
+        .builder()
         .name("org.bluez")
         .unwrap()
         .serve_at(
