@@ -21,6 +21,7 @@ use crate::{
     },
     fast_pair::FastPairBatteryProvider,
     identity::DeviceIdentityRegistry,
+    maestro::MaestroBatteryProvider,
     management::{DevicePolicy, ManagementStore},
     model::Snapshot,
     rfkill,
@@ -54,6 +55,7 @@ pub struct BluezBackend {
     system_bus: zbus::Connection,
     fast_pair: Option<Arc<FastPairBatteryProvider>>,
     sony: Option<Arc<SonyControlProvider>>,
+    maestro: Option<Arc<MaestroBatteryProvider>>,
     management: Arc<ManagementStore>,
     tasks: crate::task::TaskGroup,
     sleeping: tokio::sync::watch::Sender<bool>,
@@ -113,9 +115,17 @@ impl BluezBackend {
                 None
             }
         };
+        let maestro = match MaestroBatteryProvider::start(session.clone(), changes.clone()).await {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                tracing::warn!(error = %error, "Pixel Buds Maestro battery provider is unavailable");
+                None
+            }
+        };
         tracing::info!(
             fast_pair = fast_pair.is_some(),
             sony = sony.is_some(),
+            maestro = maestro.is_some(),
             "BlueZ backend initialized"
         );
         Ok(Self {
@@ -130,6 +140,7 @@ impl BluezBackend {
             system_bus,
             fast_pair,
             sony,
+            maestro,
             management,
             tasks: crate::task::TaskGroup::default(),
             sleeping: tokio::sync::watch::channel(false).0,
@@ -144,6 +155,9 @@ impl BluezBackend {
             provider.shutdown().await;
         }
         if let Some(provider) = &self.sony {
+            provider.shutdown().await;
+        }
+        if let Some(provider) = &self.maestro {
             provider.shutdown().await;
         }
     }

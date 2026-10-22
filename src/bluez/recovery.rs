@@ -45,6 +45,9 @@ impl Drop for Candidate {
             if let Some(provider) = &self.backend.sony {
                 provider.abort();
             }
+            if let Some(provider) = &self.backend.maestro {
+                provider.abort();
+            }
         }
     }
 }

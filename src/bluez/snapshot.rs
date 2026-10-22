@@ -5,7 +5,7 @@ use bluer::{Adapter as BluezAdapter, Device as BluezDevice};
 use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::{
-    fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
+    fast_pair::{FAST_PAIR_SERVICE_UUID, MESSAGE_STREAM_UUID},
     identity::{DeviceIdentityRegistry, RememberedPresentationValues},
     model::{
         Adapter, Battery, Device, DeviceCapabilities, NoiseControl, RssiKind, Snapshot,
@@ -266,13 +266,7 @@ async fn device_snapshot(
         return Ok(None);
     }
     let metadata = DeviceMetadata::read(device).await?;
-    let observed_battery = device_batteries(
-        device,
-        identity,
-        state.connected,
-        backend.fast_pair.as_deref(),
-    )
-    .await?;
+    let observed_battery = device_batteries(device, identity, state.connected, backend).await?;
     let fast_pair_features = match backend.fast_pair.as_deref() {
         Some(provider) => provider.features(device, state.connected).await,
         None => None,
@@ -414,12 +408,15 @@ async fn device_batteries(
     device: &BluezDevice,
     identity: bluer::Address,
     connected: bool,
-    fast_pair: Option<&FastPairBatteryProvider>,
+    backend: &BluezBackend,
 ) -> Result<Vec<Battery>> {
-    let component_battery = match (connected, fast_pair) {
+    let mut component_battery = match (connected, backend.fast_pair.as_deref()) {
         (true, Some(provider)) => provider.batteries(identity).await,
         _ => Vec::new(),
     };
+    if let (true, Some(provider)) = (connected, backend.maestro.as_deref()) {
+        supplement_components(&mut component_battery, provider.batteries(identity).await);
+    }
     if !component_battery.is_empty() {
         return Ok(component_battery);
     }
@@ -429,6 +426,19 @@ async fn device_batteries(
             .into_iter()
             .collect(),
     )
+}
+
+/// Vendor channels only fill components Fast Pair left unknown, such as the
+/// Pixel Buds case.
+fn supplement_components(readings: &mut Vec<Battery>, vendor: Vec<Battery>) {
+    for battery in vendor {
+        if !readings
+            .iter()
+            .any(|reading| reading.component == battery.component)
+        {
+            readings.push(battery);
+        }
+    }
 }
 
 fn device_capabilities(

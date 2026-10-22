@@ -2,39 +2,38 @@
 //!
 //! Fast Pair carries battery on Sony models but not noise control, so this
 //! provider keeps a second, vendor channel open to connected Sony headphones.
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use bluer::{
-    Adapter, Address, Device, Session,
-    rfcomm::{Profile, ProfileHandle, ReqError, Role},
-};
-use futures::StreamExt;
+use async_trait::async_trait;
+use bluer::{Address, Session, rfcomm::Stream};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Mutex, RwLock, broadcast, mpsc, oneshot},
+    sync::{RwLock, broadcast, mpsc, oneshot},
 };
-use uuid::Uuid;
 
-use crate::model::NoiseControl;
+use crate::{
+    model::NoiseControl,
+    vendor_channel::{self, Channels},
+};
 
 mod protocol;
 use protocol::{Frame, FrameDecoder, NcAsm};
 
-/// RFCOMM service UUID of the Sony Headphones Connect control channel.
-pub const CONTROL_UUID: &str = "956c7b26-d49a-4ba8-b03f-b17d393cb6e2";
 const SOURCE: &str = "sony-headphones-control";
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const STATE_TIMEOUT: Duration = Duration::from_secs(1);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
-const STALE_CONNECT: Duration = Duration::from_secs(30);
-/// BlueZ reports busy while another profile (e.g. Fast Pair) is still connecting.
-const BUSY_RETRIES: u32 = 6;
+
+static SPEC: vendor_channel::Spec = vendor_channel::Spec {
+    // Sony Headphones Connect control channel.
+    uuid: "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+    profile_name: "Shelllist Sony headphones control",
+    label: "Sony control",
+    request_task: "sony-control-requests",
+    session_task: "sony-control-session",
+    reconciler_task: "sony-control-reconciler",
+    connect_task: "sony-control-connect",
+};
 
 struct Command {
     payload: Vec<u8>,
@@ -46,137 +45,43 @@ struct Channel {
     noise_control: Option<NcAsm>,
 }
 
-/// Connection attempts per peer, with exponential backoff that resets when the
-/// peer disconnects or a session stays up for a minute.
-#[derive(Default)]
-struct Links {
-    connecting: HashMap<Address, Instant>,
-    connected: HashMap<Address, Instant>,
-    retry: HashMap<Address, Retry>,
-}
-
-#[derive(Clone, Copy)]
-struct Retry {
-    failures: u32,
-    busy: u32,
-    after: Instant,
-}
-
-impl Links {
-    fn begin(&mut self, address: Address) -> bool {
-        let now = Instant::now();
-        let busy = self.connected.contains_key(&address)
-            || self
-                .connecting
-                .get(&address)
-                .is_some_and(|start| now.duration_since(*start) < STALE_CONNECT)
-            || self
-                .retry
-                .get(&address)
-                .is_some_and(|retry| retry.after > now);
-        if !busy {
-            self.connecting.insert(address, now);
-        }
-        !busy
-    }
-
-    fn accept(&mut self, address: Address) -> bool {
-        self.connecting.remove(&address);
-        if self.connected.contains_key(&address) {
-            return false;
-        }
-        self.connected.insert(address, Instant::now());
-        true
-    }
-
-    fn connect_failed(&mut self, address: Address, busy: bool) {
-        if self.connecting.remove(&address).is_none() {
-            return;
-        }
-        let retry = self.retry_state(address);
-        if busy && retry.busy < BUSY_RETRIES {
-            retry.busy += 1;
-            retry.after = Instant::now() + Duration::from_secs(1);
-        } else {
-            self.back_off(address);
-        }
-    }
-
-    fn ended(&mut self, address: Address) {
-        if let Some(start) = self.connected.remove(&address) {
-            if start.elapsed() >= Duration::from_secs(60) {
-                self.retry.remove(&address);
-            }
-            self.back_off(address);
-        }
-    }
-
-    fn reset(&mut self, address: Address) {
-        self.retry.remove(&address);
-    }
-
-    fn retry_state(&mut self, address: Address) -> &mut Retry {
-        self.retry.entry(address).or_insert(Retry {
-            failures: 0,
-            busy: 0,
-            after: Instant::now(),
-        })
-    }
-
-    fn back_off(&mut self, address: Address) {
-        let retry = self.retry_state(address);
-        let delay = Duration::from_secs((15_u64 << retry.failures.min(5)).min(300));
-        retry.failures += 1;
-        retry.after = Instant::now() + delay;
-    }
-}
-
 /// Keeps a control channel to each connected Sony headset and exposes its
 /// noise-cancelling/ambient-sound state as vendor-neutral noise control.
 pub struct SonyControlProvider {
-    session: Session,
-    uuid: Uuid,
-    links: Mutex<Links>,
+    links: Arc<Channels>,
     channels: RwLock<HashMap<Address, Channel>>,
     changes: broadcast::Sender<()>,
-    tasks: crate::task::TaskGroup,
+}
+
+#[async_trait]
+impl vendor_channel::Handler for SonyControlProvider {
+    async fn run(&self, address: Address, stream: Stream) -> Result<()> {
+        self.run_session(address, stream).await
+    }
+
+    async fn ended(&self, address: Address) {
+        if self.channels.write().await.remove(&address).is_some() {
+            let _ = self.changes.send(());
+        }
+    }
 }
 
 impl SonyControlProvider {
     pub async fn start(session: Session, changes: broadcast::Sender<()>) -> Result<Arc<Self>> {
-        let uuid: Uuid = CONTROL_UUID.parse().context("parse Sony control UUID")?;
-        let requests = session
-            .register_profile(Profile {
-                uuid,
-                name: Some("Shelllist Sony headphones control".to_string()),
-                role: Some(Role::Client),
-                require_authentication: Some(true),
-                require_authorization: Some(false),
-                auto_connect: Some(false),
-                ..Default::default()
-            })
-            .await
-            .context("register Sony control RFCOMM profile")?;
-        let provider = Arc::new(Self {
-            session,
-            uuid,
-            links: Mutex::default(),
+        Channels::start(session, &SPEC, &changes.clone(), |links| Self {
+            links,
             channels: RwLock::default(),
             changes,
-            tasks: crate::task::TaskGroup::default(),
-        });
-        Self::spawn_request_handler(Arc::clone(&provider), requests);
-        Self::spawn_reconciler(Arc::clone(&provider));
-        Ok(provider)
+        })
+        .await
     }
 
     pub(crate) fn abort(&self) {
-        self.tasks.abort();
+        self.links.abort();
     }
 
     pub async fn shutdown(&self) {
-        self.tasks.shutdown().await;
-        *self.links.lock().await = Links::default();
+        self.links.shutdown().await;
         self.channels.write().await.clear();
     }
 
@@ -241,50 +146,6 @@ impl SonyControlProvider {
             .get(&address)?
             .noise_control?
             .active_mode()
-    }
-
-    fn spawn_request_handler(provider: Arc<Self>, mut requests: ProfileHandle) {
-        let owner = Arc::clone(&provider);
-        owner.tasks.spawn("sony-control-requests", async move {
-            while let Some(request) = requests.next().await {
-                let address = request.device();
-                if !provider.links.lock().await.accept(address) {
-                    request.reject(ReqError::Rejected);
-                    continue;
-                }
-                match request.accept() {
-                    Ok(stream) => Self::spawn_session(Arc::clone(&provider), address, stream),
-                    Err(error) => {
-                        tracing::warn!(%address, %error, "could not accept Sony control channel");
-                        provider.links.lock().await.ended(address);
-                    }
-                }
-            }
-            tracing::warn!("Sony control profile request stream ended");
-        });
-    }
-
-    fn spawn_session<S>(provider: Arc<Self>, address: Address, stream: S)
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let owner = Arc::clone(&provider);
-        owner.tasks.spawn("sony-control-session", async move {
-            tracing::info!(%address, "Sony control channel started");
-            let result =
-                crate::task::catch("Sony control channel", provider.run_session(address, stream))
-                    .await;
-            match result {
-                Ok(()) => tracing::info!(%address, "Sony control channel closed"),
-                Err(error) => {
-                    tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "Sony control channel failed");
-                }
-            }
-            provider.links.lock().await.ended(address);
-            if provider.channels.write().await.remove(&address).is_some() {
-                let _ = provider.changes.send(());
-            }
-        });
     }
 
     async fn run_session<S>(&self, address: Address, stream: S) -> Result<()>
@@ -405,85 +266,6 @@ impl SonyControlProvider {
             _ => tracing::trace!(%address, payload = ?payload, "ignored Sony command"),
         }
     }
-
-    fn spawn_reconciler(provider: Arc<Self>) {
-        let mut changes = provider.changes.subscribe();
-        let owner = Arc::clone(&provider);
-        owner.tasks.spawn("sony-control-reconciler", async move {
-            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    result = changes.recv() => match result {
-                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            while changes.try_recv().is_ok() {}
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                provider.reconcile().await;
-            }
-        });
-    }
-
-    async fn reconcile(self: &Arc<Self>) {
-        let adapter_names = match self.session.adapter_names().await {
-            Ok(names) => names,
-            Err(error) => {
-                tracing::warn!(%error, "could not list adapters for Sony control");
-                return;
-            }
-        };
-        for adapter_name in adapter_names {
-            if let Err(error) = self.reconcile_adapter(&adapter_name).await {
-                tracing::warn!(%adapter_name, error = %error, error_chain = %format!("{error:#}"), "Sony control reconciliation failed");
-            }
-        }
-    }
-
-    async fn reconcile_adapter(self: &Arc<Self>, adapter_name: &str) -> Result<()> {
-        let adapter: Adapter = self.session.adapter(adapter_name)?;
-        for address in adapter.device_addresses().await? {
-            let device = adapter.device(address)?;
-            if !device.is_connected().await? {
-                self.links.lock().await.reset(address);
-                continue;
-            }
-            // A cached BR/EDR profile UUID is sufficient: ConnectProfile can
-            // finish resolution on reconnects where ServicesResolved stays false.
-            // Existing busy retries/backoff protect connections still settling.
-            if device
-                .uuids()
-                .await?
-                .is_some_and(|uuids| uuids.contains(&self.uuid))
-            {
-                self.ensure_connected(device).await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn ensure_connected(self: &Arc<Self>, device: Device) {
-        let address = device.address();
-        if !self.links.lock().await.begin(address) {
-            return;
-        }
-        let provider = Arc::clone(self);
-        self.tasks.spawn("sony-control-connect", async move {
-            // The stream itself arrives through the registered profile handler.
-            let result = tokio::time::timeout(CONNECT_TIMEOUT, device.connect_profile(&provider.uuid))
-                .await
-                .context("Sony control connection timed out")
-                .and_then(|result| result.context("Sony control profile connection failed"));
-            if let Err(error) = result {
-                tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "Sony control connection failed");
-                let busy = crate::fast_pair::is_connection_busy(&error);
-                provider.links.lock().await.connect_failed(address, busy);
-            }
-        });
-    }
 }
 
 struct Link {
@@ -557,7 +339,7 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, frame: Vec<u8>) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{BUSY_RETRIES, Command, Links, protocol, write_session};
+    use super::{Command, protocol, write_session};
     use protocol::{Frame, FrameDecoder};
     use tokio::{
         io::{AsyncReadExt, DuplexStream},
@@ -613,33 +395,5 @@ mod tests {
 
         drop(commands);
         writer.await.unwrap().unwrap();
-    }
-
-    #[test]
-    fn links_back_off_failures_but_retry_busy_connections_quickly() {
-        let peer = bluer::Address::default();
-        let mut links = Links::default();
-        assert!(links.begin(peer));
-        assert!(!links.begin(peer), "an attempt is already in flight");
-        for _ in 0..BUSY_RETRIES {
-            links.connect_failed(peer, true);
-            let retry = links.retry[&peer];
-            assert_eq!(retry.failures, 0);
-            assert!(retry.after <= std::time::Instant::now() + std::time::Duration::from_secs(1));
-            links.connecting.insert(peer, std::time::Instant::now());
-        }
-        links.connect_failed(peer, true);
-        assert_eq!(links.retry[&peer].failures, 1, "busy budget is bounded");
-        assert!(!links.begin(peer), "backing off");
-
-        links.reset(peer);
-        assert!(links.begin(peer));
-        assert!(links.accept(peer));
-        assert!(!links.accept(peer), "one channel per peer");
-        assert!(!links.begin(peer));
-        links.ended(peer);
-        assert_eq!(links.retry[&peer].failures, 1);
-        links.connect_failed(peer, false);
-        assert_eq!(links.retry[&peer].failures, 1, "no attempt was in flight");
     }
 }

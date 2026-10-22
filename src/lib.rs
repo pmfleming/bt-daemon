@@ -17,6 +17,7 @@ pub mod client;
 pub mod daemon;
 mod fast_pair;
 mod identity;
+mod maestro;
 mod management;
 /// Serialized snapshots, device capabilities and presentation metadata.
 pub mod model;
@@ -34,3 +35,4 @@ mod task;
 #[cfg(test)]
 mod test_bus;
 mod time;
+mod vendor_channel;

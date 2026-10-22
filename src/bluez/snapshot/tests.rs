@@ -1,6 +1,6 @@
-use super::{device_capabilities, fast_pair_capabilities, signal_level};
+use super::{device_capabilities, fast_pair_capabilities, signal_level, supplement_components};
 use crate::model::{
-    FastPairFeatures, FastPairMultipoint, FastPairNoiseControl, NoiseControl, RssiKind,
+    Battery, FastPairFeatures, FastPairMultipoint, FastPairNoiseControl, NoiseControl, RssiKind,
 };
 
 fn features() -> FastPairFeatures {
@@ -167,4 +167,50 @@ fn signal_level_buckets_both_units_without_treating_relative_zero_as_missing() {
         );
         assert_eq!(signal_level(rssi, None), expected, "untyped {rssi}");
     }
+}
+
+fn component(source: &str, component: &str, percentage: u8) -> Battery {
+    Battery {
+        id: format!("{source}-{component}"),
+        label: component.into(),
+        component: component.into(),
+        percentage,
+        charging: None,
+        source: source.into(),
+        confidence: "high".into(),
+    }
+}
+
+#[test]
+fn vendor_batteries_only_fill_components_fast_pair_left_unknown() {
+    let mut readings = vec![
+        component("fast-pair", "left", 90),
+        component("fast-pair", "right", 80),
+    ];
+    supplement_components(
+        &mut readings,
+        vec![
+            component("maestro", "left", 89),
+            component("maestro", "right", 81),
+            component("maestro", "case", 43),
+        ],
+    );
+    assert_eq!(
+        readings
+            .iter()
+            .map(|b| (b.id.as_str(), b.percentage))
+            .collect::<Vec<_>>(),
+        [
+            ("fast-pair-left", 90),
+            ("fast-pair-right", 80),
+            ("maestro-case", 43)
+        ]
+    );
+
+    let mut without_fast_pair = Vec::new();
+    supplement_components(
+        &mut without_fast_pair,
+        vec![component("maestro", "case", 43)],
+    );
+    assert_eq!(without_fast_pair.len(), 1);
 }
