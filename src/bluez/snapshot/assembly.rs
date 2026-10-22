@@ -1,7 +1,7 @@
 //! Snapshot construction from captured evidence; no clocks, locks or hardware I/O.
 use super::{
     BluezDeviceState, CachedDevice, DeviceMetadata, ResolvedPresentation, device_capabilities,
-    has_fast_pair_service, service_label, signal_strength,
+    has_fast_pair_service, service_label, signal_level, signal_strength,
 };
 use crate::{
     bluez::{link_signal, observations::Observation},
@@ -162,6 +162,7 @@ pub(super) fn build(
                 .rssi
                 .filter(|_| signal.kind != Some(RssiKind::BrEdrRelative))
                 .map(signal_strength),
+            signal_level: signal.rssi.map(|rssi| signal_level(rssi, signal.kind)),
             signal_live: signal.live,
             present: state.connected || signal.present,
             last_seen_ms: signal.last_seen_ms,

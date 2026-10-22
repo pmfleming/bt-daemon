@@ -1153,6 +1153,7 @@
               }
             ],
             "services_resolved": true,
+            "signal_level": null,
             "signal_live": false,
             "signal_strength": null,
             "trusted": true,

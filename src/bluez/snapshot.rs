@@ -8,7 +8,7 @@ use crate::{
     fast_pair::{FAST_PAIR_SERVICE_UUID, FastPairBatteryProvider, MESSAGE_STREAM_UUID},
     identity::{DeviceIdentityRegistry, RememberedPresentationValues},
     model::{
-        Adapter, Battery, Device, DeviceCapabilities, NoiseControl, Snapshot,
+        Adapter, Battery, Device, DeviceCapabilities, NoiseControl, RssiKind, Snapshot,
         presentation_components, presentation_type,
     },
 };
@@ -617,4 +617,19 @@ fn modalias_string(value: bluer::Modalias) -> String {
 
 fn signal_strength(rssi: i16) -> u8 {
     (((i32::from(rssi) + 100) * 100) / 60).clamp(0, 100) as u8
+}
+
+/// Bars for both units. Classic relative RSSI is zero inside the golden receive
+/// range (positive above it), so it maps to quality and never to a percentage.
+fn signal_level(rssi: i16, kind: Option<RssiKind>) -> u8 {
+    match (kind, rssi) {
+        (Some(RssiKind::BrEdrRelative), 0..) => 3,
+        (Some(RssiKind::BrEdrRelative), -10..) => 2,
+        (Some(RssiKind::BrEdrRelative), _) => 1,
+        _ => match signal_strength(rssi) {
+            67.. => 3,
+            34.. => 2,
+            _ => 1,
+        },
+    }
 }

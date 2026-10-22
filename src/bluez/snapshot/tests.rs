@@ -1,5 +1,7 @@
-use super::{device_capabilities, fast_pair_capabilities};
-use crate::model::{FastPairFeatures, FastPairMultipoint, FastPairNoiseControl, NoiseControl};
+use super::{device_capabilities, fast_pair_capabilities, signal_level};
+use crate::model::{
+    FastPairFeatures, FastPairMultipoint, FastPairNoiseControl, NoiseControl, RssiKind,
+};
 
 fn features() -> FastPairFeatures {
     FastPairFeatures {
@@ -148,4 +150,21 @@ fn vendor_noise_control_needs_a_paired_live_link_without_fast_pair() {
         !device_capabilities(true, true, false, None, false, None, Some(&sony))
             .can_set_noise_control
     );
+}
+
+#[test]
+fn signal_level_buckets_both_units_without_treating_relative_zero_as_missing() {
+    let relative = Some(RssiKind::BrEdrRelative);
+    for (rssi, expected) in [(5, 3), (0, 3), (-1, 2), (-10, 2), (-11, 1), (-60, 1)] {
+        assert_eq!(signal_level(rssi, relative), expected, "relative {rssi}");
+    }
+    // dBm keeps the strength heuristic's 67/34% boundaries.
+    for (rssi, expected) in [(-40, 3), (-59, 3), (-60, 2), (-79, 2), (-80, 1), (-100, 1)] {
+        assert_eq!(
+            signal_level(rssi, Some(RssiKind::Dbm)),
+            expected,
+            "dbm {rssi}"
+        );
+        assert_eq!(signal_level(rssi, None), expected, "untyped {rssi}");
+    }
 }

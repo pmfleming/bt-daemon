@@ -163,6 +163,8 @@ pub struct DevicePresentation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rssi_kind: Option<RssiKind>,
     pub signal_strength: Option<u8>,
+    /// Coarse 1–3 bar quality for either RSSI unit; null without a reading.
+    pub signal_level: Option<u8>,
     pub signal_live: bool,
     pub present: bool,
     pub last_seen_ms: Option<u64>,

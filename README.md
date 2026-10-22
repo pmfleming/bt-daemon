@@ -136,7 +136,13 @@ connected-device retention). No RSSI is persisted across daemon/BlueZ restarts.
 - `bredr-relative`: connected classic Bluetooth RSSI, in dB relative to the
   controller's golden receive-power range. Zero is a valid reading, not unknown
   or 100%. `signal_strength` is null because an absolute percentage cannot be
-  inferred. Shelllist shows relative dB without absolute-strength bars.
+  inferred.
+
+`signal_level` (1–3, null without RSSI) is a coarse bar quality for both units.
+For `dbm` it buckets `signal_strength` at 67/34%. For `bredr-relative`, at or
+above the golden range is 3, down to 10 dB below it is 2, and weaker is 1. It is
+a quality hint, not a percentage; Shelllist draws bars from it and labels
+relative readings Good/Fair/Weak, keeping the dB value in the label.
 
 An unavailable controller value (127) is never shown as a reading. Cached
 fallback preserves the original units and `signal_live=false`; lack of RSSI
