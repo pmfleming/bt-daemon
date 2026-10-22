@@ -66,6 +66,8 @@ const KEY_BASED_PAIRING_UUID: &str = "fe2c1234-8366-4814-8eb0-01de32100bea";
 const ACCOUNT_KEY_UUID: &str = "fe2c1236-8366-4814-8eb0-01de32100bea";
 const MAX_FRAME_PAYLOAD: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+// ConnectProfile may return successfully without delivering NewConnection.
+const STALE_CONNECT: Duration = Duration::from_secs(30);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,7 +382,7 @@ fn select_transport(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkState {
-    Connecting,
+    Connecting { attempt: u64, started: Instant },
     Connected,
 }
 
@@ -390,18 +392,50 @@ struct ConnectionState {
     writers: HashMap<Address, mpsc::Sender<Vec<u8>>>,
     retry: RetryPolicy,
     connected_since: HashMap<Address, Instant>,
+    next_attempt: u64,
 }
 
 impl ConnectionState {
-    fn begin(&mut self, address: Address, transport: MessageStreamTransport) -> bool {
+    fn begin(&mut self, address: Address, transport: MessageStreamTransport) -> Option<u64> {
+        if matches!(self.links.get(&address), Some(LinkState::Connecting { started, .. }) if started.elapsed() >= STALE_CONNECT)
+        {
+            self.links.remove(&address);
+            self.retry.failed(address);
+            tracing::warn!(%address, "Fast Pair connection expired without a stream; backing off");
+        }
         if self.links.contains_key(&address)
             || !self.retry.ready(address)
             || (transport == MessageStreamTransport::L2cap && !self.retry.l2cap_allowed(address))
         {
-            return false;
+            return None;
         }
-        self.links.insert(address, LinkState::Connecting);
-        true
+        self.next_attempt = self.next_attempt.wrapping_add(1);
+        let attempt = self.next_attempt;
+        self.links.insert(
+            address,
+            LinkState::Connecting {
+                attempt,
+                started: Instant::now(),
+            },
+        );
+        Some(attempt)
+    }
+
+    fn is_current_attempt(&self, address: Address, attempt: u64) -> bool {
+        matches!(self.links.get(&address), Some(LinkState::Connecting { attempt: current, .. }) if *current == attempt)
+    }
+
+    fn note_connection_change(&mut self, address: Address, connected: bool) {
+        self.retry.reset_session(address);
+        if !connected && matches!(self.links.get(&address), Some(LinkState::Connecting { .. })) {
+            self.links.remove(&address);
+        }
+        // A live reader still owns Connected and its teardown. Do not permit a
+        // replacement reader whose state could be removed by the old cleanup.
+    }
+
+    fn connect_completed(&mut self, address: Address, attempt: u64) -> bool {
+        self.is_current_attempt(address, attempt) && self.mark_connected(address)
     }
 
     fn ended(&mut self, address: Address) {
@@ -427,8 +461,8 @@ impl ConnectionState {
         true
     }
 
-    fn connection_failed(&mut self, address: Address, busy: bool) {
-        if self.links.get(&address) == Some(&LinkState::Connecting) {
+    fn connection_failed(&mut self, address: Address, attempt: u64, busy: bool) {
+        if self.is_current_attempt(address, attempt) {
             self.links.remove(&address);
             self.retry.connection_failed(address, busy);
         }
@@ -1009,10 +1043,14 @@ impl FastPairBatteryProvider {
         })
     }
 
-    pub async fn note_connection_change(&self, address: Address) {
-        // Observe real Connected transitions, including fast disconnect/reconnect
-        // cycles that the reconciler's sampled is_connected() could miss.
-        self.connections.lock().await.retry.reset_session(address);
+    pub async fn note_connection_change(&self, address: Address, connected: bool) {
+        // Observe real transitions, including cycles shorter than reconciliation.
+        // Retire pending attempts without letting late completions affect a new one.
+        self.connections
+            .lock()
+            .await
+            .note_connection_change(address, connected);
+        self.retry_changed.notify_one();
     }
 
     pub async fn note_pairing(&self, adapter: &str, address: Address, paired: bool) {
@@ -1383,16 +1421,10 @@ impl FastPairBatteryProvider {
             .context("read Fast Pair device connection state")?
         {
             self.remove_report(address).await;
-            self.connections.lock().await.retry.reset_session(address);
-            return Ok(());
-        }
-        // Connected becomes true before BlueZ finishes service/profile setup.
-        // ServicesResolved changes already wake this reconciler via `changes`.
-        if !device
-            .is_services_resolved()
-            .await
-            .context("read Fast Pair service readiness")?
-        {
+            self.connections
+                .lock()
+                .await
+                .note_connection_change(address, false);
             return Ok(());
         }
         let Some(uuids) = device
@@ -1407,6 +1439,18 @@ impl FastPairBatteryProvider {
             uuids.contains(&self.uuids.message_stream),
             uuids.contains(&self.uuids.service),
         ) {
+            // Cached BR/EDR UUIDs suffice for ConnectProfile, which can itself
+            // complete service resolution. Waiting for ServicesResolved here
+            // deadlocks some reconnects. Busy failures retain bounded backoff.
+            // BLE still needs resolved GATT services to read its dynamic PSM.
+            if transport == MessageStreamTransport::L2cap
+                && !device
+                    .is_services_resolved()
+                    .await
+                    .context("read Fast Pair GATT readiness")?
+            {
+                return Ok(());
+            }
             self.ensure_connected(device, transport).await;
         }
         Ok(())
@@ -1414,9 +1458,9 @@ impl FastPairBatteryProvider {
 
     async fn ensure_connected(self: &Arc<Self>, device: Device, transport: MessageStreamTransport) {
         let address = device.address();
-        if !self.connections.lock().await.begin(address, transport) {
+        let Some(attempt) = self.connections.lock().await.begin(address, transport) else {
             return;
-        }
+        };
         let provider = Arc::clone(self);
         self.tasks.spawn("fast-pair-connect", async move {
             let result = crate::task::catch("Fast Pair connection", async {
@@ -1425,14 +1469,14 @@ impl FastPairBatteryProvider {
                     .context("Fast Pair connection timed out")?
             }).await;
             match result {
-                Ok(Some(stream)) if provider.connections.lock().await.mark_connected(address) => {
+                Ok(Some(stream)) if provider.connections.lock().await.connect_completed(address, attempt) => {
                     tracing::debug!(%address, ?transport, "Fast Pair Message Stream connected");
                     Self::spawn_reader(Arc::clone(&provider), address, "BLE L2CAP", stream);
                 }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%address, ?transport, error = %error, error_chain = %format!("{error:#}"), "Fast Pair connection failed");
-                    provider.connections.lock().await.connection_failed(address, retry::is_connection_busy(&error));
+                    provider.connections.lock().await.connection_failed(address, attempt, retry::is_connection_busy(&error));
                     provider.retry_changed.notify_one();
                 }
             }

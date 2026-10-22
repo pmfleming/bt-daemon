@@ -16,6 +16,8 @@ use zbus::{Connection, Proxy, fdo, zvariant::ObjectPath};
 mod test_bus;
 use test_bus::{Bus, Process};
 
+mod profile_recovery;
+
 struct AgentManager {
     allowed: Arc<AtomicBool>,
     attempts: Arc<AtomicUsize>,

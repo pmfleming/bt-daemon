@@ -43,24 +43,24 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
             state.retry.connected(peer);
             assert_eq!(state.retry.l2cap_allowed(peer), attempt < 3);
         }
-        assert!(!state.begin(peer, ble));
-        assert!(state.begin(peer, rfcomm));
-        assert!(!state.begin(peer, rfcomm));
-        state.connection_failed(peer, false);
+        assert!(state.begin(peer, ble).is_none());
+        let attempt = state.begin(peer, rfcomm).unwrap();
+        assert!(state.begin(peer, rfcomm).is_none());
+        state.connection_failed(peer, attempt, false);
         assert!(!state.retry.ready(peer));
         assert!(state.retry.ready(other));
         tokio::time::advance(Duration::from_secs(360)).await;
-        assert!(state.begin(peer, rfcomm));
+        let attempt = state.begin(peer, rfcomm).unwrap();
         assert!(state.mark_connected(peer));
         assert!(state.retry.ready(peer));
         let (writer, mut receiver) = mpsc::channel(1);
         state.writers.insert(peer, writer);
-        state.connection_failed(peer, true); // A late busy failure must not tear down a live stream.
+        state.connection_failed(peer, attempt, true); // A late busy failure must not tear down a live stream.
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert!(!state.begin(peer, rfcomm));
+        assert!(state.begin(peer, rfcomm).is_none());
         tokio::time::advance(Duration::from_secs(seconds)).await;
         assert!(!state.mark_connected(peer)); // Duplicate notification must not reset stream age.
         state.ended(peer);
@@ -72,9 +72,71 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
         assert!(!state.retry.ready(peer));
         assert!(!state.mark_connected(other));
         state.retry.reset_session(peer);
-        assert!(state.begin(peer, ble));
+        assert!(state.begin(peer, ble).is_some());
         assert!(!state.retry.l2cap_allowed(other));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_profile_call_without_stream_expires_with_backoff() {
+    let peer = Address::default();
+    let mut state = ConnectionState::default();
+    let old = state.begin(peer, MessageStreamTransport::Rfcomm).unwrap();
+    // A successful ConnectProfile reply makes no state change: only the stream
+    // callback establishes Connected. Missing that callback must be bounded.
+    tokio::time::advance(super::STALE_CONNECT - Duration::from_millis(1)).await;
+    assert!(state.begin(peer, MessageStreamTransport::Rfcomm).is_none());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(state.begin(peer, MessageStreamTransport::Rfcomm).is_none());
+    assert!(!state.is_current_attempt(peer, old));
+    let deadline = state.retry.next_deadline().unwrap();
+    assert!(
+        (Duration::from_secs(15)..=Duration::from_secs(18))
+            .contains(&(deadline - tokio::time::Instant::now()))
+    );
+    assert!(state.begin(peer, MessageStreamTransport::Rfcomm).is_none());
+    assert_eq!(state.retry.next_deadline(), Some(deadline));
+    tokio::time::advance(deadline - tokio::time::Instant::now()).await;
+    let new = state.begin(peer, MessageStreamTransport::Rfcomm).unwrap();
+    assert_ne!(new, old);
+    state.connection_failed(peer, old, true);
+    assert!(!state.connect_completed(peer, old));
+    assert!(state.is_current_attempt(peer, new));
+    assert!(state.mark_connected(peer));
+    tokio::time::advance(Duration::from_secs(360)).await;
+    assert!(
+        state.begin(peer, MessageStreamTransport::Rfcomm).is_none(),
+        "live streams never expire as pending attempts"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn disconnect_clears_pending_attempts_and_fences_late_results() {
+    let peer = Address::default();
+    let other = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+    let mut state = ConnectionState::default();
+    let old = state.begin(peer, MessageStreamTransport::L2cap).unwrap();
+    let unrelated = state.begin(other, MessageStreamTransport::Rfcomm).unwrap();
+    state.retry.psm_unavailable(peer);
+    state.note_connection_change(peer, false);
+    state.note_connection_change(peer, true);
+    assert!(state.retry.l2cap_allowed(peer));
+    // No time advance: attempt identity cannot just be a timestamp.
+    let new = state.begin(peer, MessageStreamTransport::L2cap).unwrap();
+    assert_ne!(old, new);
+    state.connection_failed(peer, old, false);
+    assert!(!state.connect_completed(peer, old));
+    assert!(state.is_current_attempt(peer, new));
+    assert!(state.is_current_attempt(other, unrelated));
+    assert!(state.connect_completed(peer, new));
+    state.note_connection_change(peer, false);
+    assert!(
+        state.begin(peer, MessageStreamTransport::Rfcomm).is_none(),
+        "live reader retains teardown ownership"
+    );
+    state.ended(peer);
+    state.note_connection_change(peer, true);
+    assert!(state.begin(peer, MessageStreamTransport::Rfcomm).is_some());
 }
 
 #[tokio::test]

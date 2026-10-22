@@ -42,29 +42,60 @@ Follow-up acceptance on the same machine:
 
 ## Fast Pair reconnect latency regression
 
-Pending hardware validation after the retry/readiness fix:
+The original 2026-10-05 fix added fast busy retries and a blanket
+`ServicesResolved` gate. The latter caused a confirmed reconnect deadlock on
+2026-10-22: the WF-1000XM5 was connected with cached UUIDs and working audio, but
+BlueZ never changed `ServicesResolved` back to true. Both Fast Pair and the later
+Sony provider skipped it. Only BlueZ's aggregate 97% remained in the snapshot.
+The operator reported that manually calling `ConnectProfile` for the standard
+Fast Pair Message Stream restored left 99%, right 97%, case 26% within 300 ms;
+BlueZ then reported resolved services and Sony control recovered automatically.
+This is diagnostic evidence, not acceptance of the new automatic recovery code.
+
+Updated implementation: connected devices advertising a cached RFCOMM profile
+UUID can attempt it without service resolution. BLE L2CAP still requires resolved
+GATT services. Fast Pair pending attempts expire after 30 seconds on the next
+reconcile pass and enter normal exponential backoff if no stream arrived, even
+when `ConnectProfile` returned success. Observed disconnects retire pending
+attempts immediately; attempt IDs keep old outbound failures/completions from
+retiring or replacing a newer attempt. Live streams do not expire under this rule
+and retain reader-owned cleanup.
+
+Private-bus regression tests exercise the actual daemon reconcilers with cached
+Fast Pair/Sony UUIDs, `Connected=true`, and `ServicesResolved=false`. They also
+check disconnected/unadvertised peers are not contacted, unresolved BLE PSMs are
+not read, and GATT reads resume on resolution. Virtual-time lifecycle tests cover
+missing stream callbacks, bounded backoff, disconnect/reconnect, stale results,
+and preservation of live streams. No hardware or user services are touched.
+
+Pending post-deployment hardware validation:
 
 1. Rebuild/deploy `bt-daemon` and follow `journalctl --user -u bt-daemon.service -f`
    with `RUST_LOG=bt_daemon=debug` enabled.
 2. Disconnect/reconnect compatible earbuds through Shelllist. Compare the
    `BlueZ device services changed resolved=true`, operation completion,
    `Fast Pair battery stream started`, and `Fast Pair component battery updated`
-   timestamps. Outgoing stream attempts now wait for resolved services.
+   timestamps. For cached RFCOMM profiles, stream startup may now precede
+   `resolved=true`; service resolution must not be a permanent prerequisite.
 3. If BlueZ still returns `InProgress` / `br-connection-busy`, expect retries after
    250ms, 500ms, then 1s (at most six short retries per connection session), not
    the old 15–18s backoff followed by a 10s polling boundary. Persistent failures
    retain exponential backoff; its deadlines also wake the reconciler directly.
 4. Confirm left/right/case readings appear promptly after the first battery frame,
-   then disconnect and reconnect again. Check that a disconnected/unresolved
-   peer causes neither a retry loop nor duplicate live streams. Repeat with a
-   BLE-only Fast Pair device when available.
+   then disconnect and reconnect again, including an audio-only reconnect with
+   `Connected=true` and `ServicesResolved=false`. Verify cached RFCOMM profiles
+   recover without a manual `ConnectProfile` call. Disconnected peers must not be
+   contacted; failures must neither spin nor create duplicate live streams.
+   Repeat with a BLE-only Fast Pair device when available; its PSM read must still
+   wait for GATT resolution.
 
 The original 2026-10-05 journal showed connection completion at 13:44:02,
 `br-connection-busy` failures during setup, and the first component report at
 13:44:26. Snapshot publication took only about 85ms after that report. Automated
 virtual-time tests cover the bounded retry budget, error classification, deadline
 ordering/consumption, and preservation of live streams after late failures;
-post-fix hardware timing is not yet measured.
+post-fix automatic recovery timing is not yet measured. Do not restart services,
+re-pair devices, or disconnect active audio without operator approval.
 
 ## Connected-link RSSI
 

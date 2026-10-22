@@ -451,12 +451,13 @@ impl SonyControlProvider {
                 self.links.lock().await.reset(address);
                 continue;
             }
-            // Connected precedes service resolution; ServicesResolved wakes us via `changes`.
-            if device.is_services_resolved().await?
-                && device
-                    .uuids()
-                    .await?
-                    .is_some_and(|uuids| uuids.contains(&self.uuid))
+            // A cached BR/EDR profile UUID is sufficient: ConnectProfile can
+            // finish resolution on reconnects where ServicesResolved stays false.
+            // Existing busy retries/backoff protect connections still settling.
+            if device
+                .uuids()
+                .await?
+                .is_some_and(|uuids| uuids.contains(&self.uuid))
             {
                 self.ensure_connected(device).await;
             }

@@ -243,7 +243,7 @@ async fn handle_property(
                 .await
                 .invalidate(adapter, Some(address));
             if let Some(provider) = &backend.fast_pair {
-                provider.note_connection_change(address).await;
+                provider.note_connection_change(address, connected).await;
             }
             tracing::info!(%adapter, %address, connected, "BlueZ device connection changed");
         }
