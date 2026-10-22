@@ -76,7 +76,9 @@ services.bt-rssi-helper.enable = true;
 An optional `services.bt-rssi-helper.package` override must contain the matching
 helper binary and policies. The module creates the system user/group, installs
 D-Bus and Polkit policies and enables the system service. The helper has a system
-D-Bus activation file as well. Importing the module without enabling it does
+D-Bus activation file as well. The system-wide copy of the package drops the user
+daemon's session D-Bus activation file and user unit, so Home Manager remains
+the only owner of `org.laufan.BluetoothDaemon` on the session bus. Importing the module without enabling it does
 nothing; simply building/installing the user daemon does not grant privileges.
 
 Rebuild the coordinated source graph through `daemon-framework/tools/local-build`
