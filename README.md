@@ -1,5 +1,16 @@
 # bt-daemon
 
+The daemon also exposes same-user JSONL at `$XDG_RUNTIME_DIR/bt-daemon.sock`
+(0700 runtime directory and socket, peer UID checked). The socket uses the same
+service admission and coordinators as D-Bus. Connection closure releases only
+that connection's subscriptions, scans, operations and outgoing transfers;
+accepted effects are not treated as rolled back when a reply is lost.
+D-Bus and `bt-daemon client` remain supported. The Shelllist socket prototype is
+opt-in (`SHELLLIST_BT_SOCKET=1`); wider rollout is gated on real Quickshell,
+restart/backpressure, large-record and comparative performance evidence. See
+`../shelllist/docs/unix-socket-migration.md` and the framework's `docs/unix-jsonl.md`.
+
+
 Rust Bluetooth policy and API daemon for Shelllist.
 
 The project uses BlueZ (`bluetoothd`) as its system backend. It uses the official [`bluer`](https://github.com/bluez/bluer) Rust bindings and keeps `zbus` available for the session D-Bus API and BlueZ interfaces not covered by BlueR.

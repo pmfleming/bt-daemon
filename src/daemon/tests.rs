@@ -22,6 +22,7 @@ use super::{
 
 mod adapter;
 mod routing;
+mod socket;
 
 type ScanningCalls = Arc<StdMutex<Vec<(Option<String>, bool)>>>;
 

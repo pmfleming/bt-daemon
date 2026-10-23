@@ -187,6 +187,20 @@ impl OutgoingTransfers {
         self.cancel_owned(request_id, None).await
     }
 
+    pub(super) async fn cancel_owner(&self, owner: &str) {
+        let mut cancellations = self.cancellations.lock().await;
+        let ids = cancellations
+            .iter()
+            .filter(|(_, c)| c.owner.as_deref() == Some(owner))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(cancellation) = cancellations.remove(&id) {
+                let _ = cancellation.sender.send(());
+            }
+        }
+    }
+
     pub(super) async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> bool {
         let mut cancellations = self.cancellations.lock().await;
         if cancellations

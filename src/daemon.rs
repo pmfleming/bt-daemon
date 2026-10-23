@@ -24,6 +24,7 @@ mod audio;
 mod obex;
 mod operation;
 mod scan;
+mod socket;
 mod subscription;
 
 use self::{
@@ -325,7 +326,23 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
         object_path = OBJECT_PATH,
         "bt-daemon started"
     );
-    let result = shelllist_daemon_tokio::wait_for_shutdown().await;
+    let (socket_stop, stopped) = tokio::sync::oneshot::channel();
+    let mut socket_task = tokio::spawn(socket::listen(connection.clone(), async {
+        let _ = stopped.await;
+    }));
+    let (mut result, joined) = tokio::select! {
+        result = shelllist_daemon_tokio::wait_for_shutdown() => (result, false),
+        result = &mut socket_task => (result.context("join Bluetooth socket listener").and_then(|result| result), true),
+    };
+    let _ = socket_stop.send(());
+    if !joined {
+        result = result.and(
+            socket_task
+                .await
+                .context("join Bluetooth socket shutdown")
+                .and_then(|result| result),
+        );
+    }
     subscriptions.shutdown().await;
     tasks.shutdown().await;
     drop(connection);

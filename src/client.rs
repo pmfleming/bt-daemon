@@ -8,7 +8,7 @@ use crate::daemon::{BUS_NAME, INTERFACE, OBJECT_PATH};
 const ENDPOINT: DaemonEndpoint = DaemonEndpoint::new("bt-daemon", BUS_NAME, OBJECT_PATH, INTERFACE);
 
 #[derive(Debug, Clone, Copy)]
-struct BluetoothCorrelation;
+pub(crate) struct BluetoothCorrelation;
 
 impl CorrelationPolicy for BluetoothCorrelation {
     fn operation_id<'a>(&self, response: &'a Value) -> Option<&'a str> {

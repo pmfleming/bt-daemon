@@ -196,6 +196,20 @@ impl OperationCoordinator {
         true
     }
 
+    pub(super) async fn cancel_owner(&self, owner: &str) {
+        let ids = self
+            .state
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.owner.as_deref() == Some(owner))
+            .map(|(id, _)| id.to_owned())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.cancel_owned(&id, Some(owner)).await;
+        }
+    }
+
     async fn run(
         self: Arc<Self>,
         event: OperationEvent,

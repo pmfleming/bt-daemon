@@ -56,11 +56,51 @@ fn valid_streams(streams: &[String]) -> bool {
         })
 }
 
+#[derive(Clone)]
+enum Target {
+    Bus(SignalEmitter<'static>),
+    Socket(shelllist_daemon_tokio::SocketSession),
+}
+
 pub(super) async fn start(
     daemon: &BluetoothDaemon,
     streams: Vec<String>,
     owner: UniqueName<'static>,
     emitter: SignalEmitter<'_>,
+) -> String {
+    let monitor = daemon.subscriptions.owner_monitor(emitter.connection());
+    let watched = owner.to_string();
+    let target = Target::Bus(emitter.set_destination(owner.clone().into()).to_owned());
+    start_target(daemon, streams, owner.to_string(), target, async move {
+        if let Err(error) = monitor.wait(&watched).await {
+            tracing::warn!(%error, "subscription owner monitor failed");
+        }
+    })
+    .await
+}
+
+pub(super) async fn start_socket(
+    daemon: &BluetoothDaemon,
+    streams: Vec<String>,
+    session: &shelllist_daemon_tokio::SocketSession,
+) -> String {
+    let lifetime = session.clone();
+    start_target(
+        daemon,
+        streams,
+        session.owner().to_owned(),
+        Target::Socket(session.clone()),
+        async move { lifetime.closed().await },
+    )
+    .await
+}
+
+async fn start_target(
+    daemon: &BluetoothDaemon,
+    streams: Vec<String>,
+    owner: String,
+    signal_emitter: Target,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> String {
     if !valid_streams(&streams) {
         tracing::warn!(
@@ -76,8 +116,6 @@ pub(super) async fn start(
 
     let id = daemon.subscriptions.next_id("subscription");
     let subscription_id = id.clone();
-    let signal_emitter = emitter.set_destination(owner.clone().into()).to_owned();
-    let connection = signal_emitter.connection().clone();
     let snapshots = daemon.snapshots.subscribe();
     let audio_snapshots = daemon.audio_snapshots.subscribe();
     let pairing_events = daemon.pairing.subscribe();
@@ -129,10 +167,9 @@ pub(super) async fn start(
         forwarders.abort_all();
         tracing::info!(%subscription_id, "subscription ended");
     };
-    if let Err(error) =
-        daemon
-            .subscriptions
-            .spawn_for_owner(id, Some(owner.to_string()), &connection, events)
+    if let Err(error) = daemon
+        .subscriptions
+        .spawn_until(id, Some(owner), stop, events)
     {
         return api::error("subscription-unavailable", error.to_string()).to_string();
     }
@@ -141,7 +178,7 @@ pub(super) async fn start(
 
 async fn forward_events<T>(
     receiver: broadcast::Receiver<T>,
-    emitter: SignalEmitter<'static>,
+    emitter: Target,
     subscription_id: String,
     stream: &'static str,
     event_name: fn(&T) -> &str,
@@ -186,7 +223,7 @@ fn gap_fields(gap: Gap) -> (&'static str, EventBody) {
 
 async fn forward_snapshots<T: Clone>(
     receiver: watch::Receiver<T>,
-    emitter: SignalEmitter<'static>,
+    emitter: Target,
     subscription_id: String,
     stream: &'static str,
     fields: fn(T, &'static str) -> (&'static str, EventBody),
@@ -231,22 +268,34 @@ fn audio_fields(mut envelope: Value, event: &'static str) -> (&'static str, Even
 }
 
 async fn emit_event(
-    emitter: &SignalEmitter<'_>,
+    emitter: &Target,
     stream: &str,
     subscription_id: &str,
     event: &str,
     fields: EventBody,
 ) {
-    let result = shelllist_daemon_tokio::emit_event_body(
-        emitter,
-        INTERFACE,
-        shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
-        stream,
-        event,
-        shelllist_daemon_core::Correlation::Subscription(subscription_id),
-        fields,
-    )
-    .await;
+    let identity = shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32);
+    let correlation = shelllist_daemon_core::Correlation::Subscription(subscription_id);
+    let result: anyhow::Result<()> = match emitter {
+        Target::Bus(emitter) => shelllist_daemon_tokio::emit_event_body(
+            emitter,
+            INTERFACE,
+            identity,
+            stream,
+            event,
+            correlation,
+            fields,
+        )
+        .await
+        .map_err(Into::into),
+        Target::Socket(session) => match fields
+            .envelope(identity, stream, event, correlation)
+            .into_value()
+        {
+            Ok(value) => session.emit(stream, value).await,
+            Err(error) => Err(error.into()),
+        },
+    };
     if let Err(error) = result {
         tracing::warn!(%error, %stream, %subscription_id, "could not emit subscription event");
     }
