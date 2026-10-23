@@ -17,6 +17,8 @@ pub mod client;
 pub mod daemon;
 mod fast_pair;
 mod framing;
+#[cfg(test)]
+mod frontend_contract;
 mod identity;
 mod maestro;
 mod management;

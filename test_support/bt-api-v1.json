@@ -42,6 +42,16 @@
         {
           "active_profile_key": "audio-profile-active",
           "device_key": "device-opaque",
+          "endpoints": [
+            {
+              "codec": "AAC",
+              "is_default": true,
+              "key": "audio-endpoint-node",
+              "kind": "sink",
+              "ready": true,
+              "state": "idle"
+            }
+          ],
           "profiles": [
             {
               "available": true,
@@ -53,8 +63,10 @@
             }
           ],
           "sink": {
+            "codec": "AAC",
             "is_default": true,
             "key": "audio-endpoint-sink",
+            "kind": "sink",
             "ready": true,
             "state": "idle"
           },

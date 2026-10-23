@@ -1190,6 +1190,7 @@ fn finalize_devices(
 /// Logical input/output direction; internal transport nodes are not selectable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub enum EndpointKind {
     Sink,
     Source,

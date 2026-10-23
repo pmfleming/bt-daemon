@@ -49,6 +49,7 @@ impl Default for ManagementPolicy {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// Effective per-device policy after applying overrides to global defaults.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct DevicePolicy {
     pub reconnect_on_resume: bool,
     pub trust_after_pair: bool,

@@ -227,19 +227,26 @@ fn device_snapshot(pairing: &PairingBroker, device: audio::AudioDevice) -> Optio
     let profiles = device
         .profiles
         .into_iter()
-        .map(|profile| {
-            json!({
-                "key": audio::profile_key(&device_key, &profile.name),
-                "label": profile.description, "mode": profile.mode, "codec": profile.codec,
-                "available": profile.available, "priority": profile.priority,
-            })
+        .map(|profile| crate::model::audio_wire::Profile {
+            key: audio::profile_key(&device_key, &profile.name),
+            label: profile.description,
+            mode: profile.mode,
+            codec: profile.codec,
+            available: profile.available,
+            priority: profile.priority,
         })
         .collect::<Vec<_>>();
-    Some(json!({
-        "device_key": device_key, "active_profile_key": active_profile_key, "profiles": profiles,
-        "endpoints": device.endpoints.iter().map(|node| node_snapshot(node, node.key(&device_key))).collect::<Vec<_>>(),
-        "sink": endpoint_snapshot(&device_key, "sink", device.sink),
-        "source": endpoint_snapshot(&device_key, "source", device.source),
+    Some(json!(crate::model::audio_wire::Device {
+        endpoints: device
+            .endpoints
+            .iter()
+            .map(|node| node_snapshot(node, node.key(&device_key)))
+            .collect(),
+        sink: endpoint_snapshot(&device_key, "sink", device.sink),
+        source: endpoint_snapshot(&device_key, "source", device.source),
+        device_key,
+        active_profile_key,
+        profiles,
     }))
 }
 
@@ -247,16 +254,22 @@ fn endpoint_snapshot(
     device_key: &str,
     kind: &str,
     endpoint: Option<audio::AudioEndpoint>,
-) -> Option<Value> {
+) -> Option<crate::model::audio_wire::Endpoint> {
     endpoint.map(|endpoint| node_snapshot(&endpoint, audio::endpoint_key(device_key, kind)))
 }
 
-fn node_snapshot(endpoint: &audio::AudioEndpoint, key: String) -> Value {
-    json!({
-        "key": key, "kind": endpoint.kind, "codec": endpoint.codec,
-        "ready": !matches!(endpoint.state.as_str(), "creating" | "error"),
-        "state": endpoint.state, "is_default": endpoint.is_default,
-    })
+fn node_snapshot(
+    endpoint: &audio::AudioEndpoint,
+    key: String,
+) -> crate::model::audio_wire::Endpoint {
+    crate::model::audio_wire::Endpoint {
+        key,
+        kind: endpoint.kind,
+        codec: endpoint.codec.clone(),
+        ready: !matches!(endpoint.state.as_str(), "creating" | "error"),
+        state: endpoint.state.clone(),
+        is_default: endpoint.is_default,
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+pub(crate) mod audio_wire;
 mod icons;
 pub(crate) use icons::icon_id;
 
@@ -8,6 +9,7 @@ use crate::management::{DevicePolicy, ManagementPolicy, RuntimeState};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 /// A point-in-time bt-api view; cached presentation data is distinguished from live state.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Snapshot {
     pub radio: RadioState,
     pub management: ManagementPolicy,
@@ -35,6 +37,7 @@ impl From<&Snapshot> for RuntimeState {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 /// Adapter power combined with Linux soft/hard rfkill state.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct RadioState {
     pub available: bool,
     pub operational: bool,
@@ -47,6 +50,7 @@ pub struct RadioState {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 /// BlueZ adapter properties addressed by a stable opaque key.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Adapter {
     pub key: String,
     pub name: String,
@@ -65,6 +69,7 @@ pub struct Adapter {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// A device's identity, connection state, presentation, policy and permitted actions.
 /// The component structures are flattened when serialized for bt-api v1.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Device {
     pub key: String,
     pub adapter_key: String,
@@ -82,6 +87,7 @@ pub struct Device {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// Display and transport identity; clients should address operations using `Device::key`.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct DeviceIdentity {
     pub name: String,
     pub alias: String,
@@ -95,6 +101,7 @@ pub struct DeviceIdentity {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// Observed BlueZ connection and security properties; absent optional values are unknown.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct DeviceState {
     pub paired: bool,
     pub bonded: Option<bool>,
@@ -111,6 +118,7 @@ pub struct DeviceState {
 /// Stable BlueZ disconnect categories; unknown future reasons remain unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, derive(Deserialize))]
 pub enum DisconnectReason {
     Unknown,
     Timeout,
@@ -122,6 +130,7 @@ pub enum DisconnectReason {
 
 /// Session-local diagnostic report, not an inference about current connectivity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct DeviceDisconnect {
     pub reason: DisconnectReason,
     /// Bounded plain text from BlueZ; not a trusted identity or proof of multipoint switching.
@@ -131,6 +140,7 @@ pub struct DeviceDisconnect {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// Advertised service UUIDs and labels, with an explicit service-resolution flag.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct DeviceServices {
     pub services_resolved: bool,
     pub uuids: Vec<String>,
@@ -140,6 +150,7 @@ pub struct DeviceServices {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 /// RSSI units: classic connected RSSI is relative to the golden receive range,
 /// not absolute dBm and therefore cannot be converted to a strength percentage.
+#[cfg_attr(test, derive(Deserialize))]
 pub enum RssiKind {
     #[serde(rename = "dbm")]
     Dbm,
@@ -149,6 +160,7 @@ pub enum RssiKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// UI metadata with freshness flags so remembered batteries and RSSI are not presented as live.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct DevicePresentation {
     pub icon_id: String,
     pub battery: Vec<Battery>,
@@ -264,6 +276,7 @@ const TYPE_RULES: &[(&[&str], &str)] = &[
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// Observed Fast Pair capabilities and live control prerequisites.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct FastPairFeatures {
     pub model_id: Option<String>,
     /// Untrusted advertisement hints, not proof of ownership or seeker support.
@@ -285,6 +298,7 @@ pub struct FastPairFeatures {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 /// GFPS 3.3.1 capability-map hints. Unknown bits are intentionally not exposed.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct FastPairAdvertisementCapabilities {
     pub le_audio_sharing: bool,
     pub factory_new: bool,
@@ -292,6 +306,7 @@ pub struct FastPairAdvertisementCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 /// The most recent provider-reported audio switch and its observation time.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct FastPairSwitchEvent {
     pub reason: String,
     pub target: String,
@@ -301,6 +316,7 @@ pub struct FastPairSwitchEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 /// Multipoint support, configurability and current state reported by Audio Switch.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct FastPairMultipoint {
     pub version: u16,
     pub supported: bool,
@@ -311,6 +327,7 @@ pub struct FastPairMultipoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 /// Provider-advertised ANC modes; supported and settable modes may differ.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct FastPairNoiseControl {
     pub version: u8,
     pub available_modes: Vec<String>,
@@ -320,6 +337,7 @@ pub struct FastPairNoiseControl {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 /// Vendor-neutral noise control; `source` names the channel that set-noise-control uses.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct NoiseControl {
     pub source: String,
     pub available_modes: Vec<String>,
@@ -341,6 +359,7 @@ impl NoiseControl {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// Actions currently offered to clients, with reasons for unavailable operations.
 /// These are UI hints: backends revalidate state before performing an action.
+#[cfg_attr(test, derive(Deserialize))]
 pub struct DeviceCapabilities {
     pub can_pair: bool,
     pub can_connect: bool,
