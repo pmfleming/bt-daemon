@@ -1128,6 +1128,7 @@
             "connected": false,
             "device_type": "Headset",
             "icon": "audio-headset",
+            "icon_id": "headset",
             "key": "device-opaque",
             "last_seen_ms": null,
             "legacy_pairing": false,

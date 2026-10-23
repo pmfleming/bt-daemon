@@ -96,7 +96,7 @@ pub(super) fn build(
         vendor_noise_control,
         last_disconnect,
     } = reading;
-    let services = metadata
+    let services: Vec<Service> = metadata
         .uuids
         .iter()
         .map(|uuid| Service {
@@ -120,6 +120,13 @@ pub(super) fn build(
             .and_then(|features| features.noise_control.as_ref())
             .map(NoiseControl::from_fast_pair)
     });
+    let icon_id = crate::model::icon_id(
+        &presentation.device_type,
+        presentation.icon.as_deref(),
+        &presentation.battery,
+        &services,
+    )
+    .into();
     Device {
         key: context.key,
         adapter_key: context.adapter_key,
@@ -149,6 +156,7 @@ pub(super) fn build(
             services,
         },
         presentation: DevicePresentation {
+            icon_id,
             battery: presentation.battery,
             battery_live: presentation.battery_live,
             battery_last_known: presentation.battery_last_known,

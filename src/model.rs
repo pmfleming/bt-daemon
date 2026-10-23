@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+mod icons;
+pub(crate) use icons::icon_id;
 
 use serde::{Deserialize, Serialize};
 
@@ -148,6 +150,7 @@ pub enum RssiKind {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 /// UI metadata with freshness flags so remembered batteries and RSSI are not presented as live.
 pub struct DevicePresentation {
+    pub icon_id: String,
     pub battery: Vec<Battery>,
     pub battery_live: bool,
     pub battery_last_known: bool,
@@ -170,7 +173,7 @@ pub struct DevicePresentation {
     pub last_seen_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// An advertised UUID and its human-readable Bluetooth service label.
 pub struct Service {
     pub uuid: String,

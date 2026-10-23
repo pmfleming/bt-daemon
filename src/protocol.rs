@@ -311,6 +311,23 @@ pub fn contract_fixture() -> anyhow::Result<Value> {
 fn fixture_from(encoded: &str) -> anyhow::Result<Value> {
     use shelllist_daemon_core::{ApiIdentity, Correlation, wire::Event};
     let mut fixture: Value = serde_json::from_str(encoded).context("parse protocol fixture")?;
+    if let Some(devices) = fixture
+        .pointer_mut("/snapshot/data/snapshot/devices")
+        .and_then(Value::as_array_mut)
+    {
+        for device in devices {
+            let battery: Vec<crate::model::Battery> =
+                serde_json::from_value(device["battery"].clone()).context("fixture batteries")?;
+            let services: Vec<crate::model::Service> =
+                serde_json::from_value(device["services"].clone()).context("fixture services")?;
+            device["icon_id"] = json!(crate::model::icon_id(
+                device["device_type"].as_str().unwrap_or_default(),
+                device["icon"].as_str(),
+                &battery,
+                &services
+            ));
+        }
+    }
     for example in fixture
         .as_object_mut()
         .context("protocol fixture must be an object")?
