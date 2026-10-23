@@ -68,7 +68,7 @@ impl vendor_channel::Handler for SonyControlProvider {
 
 impl SonyControlProvider {
     pub async fn start(session: Session, changes: broadcast::Sender<()>) -> Result<Arc<Self>> {
-        Channels::start(session, &SPEC, &changes.clone(), |links| Self {
+        Channels::start(session, &SPEC, changes.subscribe(), |links| Self {
             links,
             channels: RwLock::default(),
             changes,

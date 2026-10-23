@@ -7,13 +7,6 @@ use tokio::time::Instant;
 // Exhaustion falls back to the normal failure policy until a new/stable session.
 const BUSY_RETRY_MS: [u64; 6] = [250, 500, 1000, 1000, 1000, 1000];
 
-pub(crate) fn is_connection_busy(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<bluer::Error>().is_some_and(|error| {
-        error.kind == bluer::ErrorKind::InProgress
-            || (error.kind == bluer::ErrorKind::Failed && error.message == "br-connection-busy")
-    })
-}
-
 pub(super) async fn wait_for_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -96,7 +89,8 @@ impl RetryPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUSY_RETRY_MS, RetryPolicy, is_connection_busy, wait_for_deadline};
+    use super::{BUSY_RETRY_MS, RetryPolicy, wait_for_deadline};
+    use crate::vendor_channel::is_connection_busy;
     use bluer::Address;
     use futures::FutureExt;
     use std::time::Duration;

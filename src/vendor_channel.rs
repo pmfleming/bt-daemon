@@ -18,6 +18,13 @@ use futures::StreamExt;
 use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
+pub(crate) fn is_connection_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<bluer::Error>().is_some_and(|error| {
+        error.kind == bluer::ErrorKind::InProgress
+            || (error.kind == bluer::ErrorKind::Failed && error.message == "br-connection-busy")
+    })
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 const STALE_CONNECT: Duration = Duration::from_secs(30);
@@ -145,7 +152,7 @@ impl Channels {
     pub async fn start<H: Handler>(
         session: Session,
         spec: &'static Spec,
-        changes: &broadcast::Sender<()>,
+        changes: broadcast::Receiver<()>,
         build: impl FnOnce(Arc<Self>) -> H,
     ) -> Result<Arc<H>> {
         let uuid: Uuid = spec
@@ -173,7 +180,7 @@ impl Channels {
         });
         let handler = Arc::new(build(Arc::clone(&channels)));
         channels.spawn_request_handler(requests, Arc::clone(&handler) as Arc<dyn Handler>);
-        channels.spawn_reconciler(changes.subscribe());
+        channels.spawn_reconciler(changes);
         Ok(handler)
     }
 
@@ -309,7 +316,7 @@ impl Channels {
                 });
             if let Err(error) = result {
                 tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "{label} connection failed");
-                let busy = crate::fast_pair::is_connection_busy(&error);
+                let busy = is_connection_busy(&error);
                 channels.links.lock().await.connect_failed(address, busy);
             }
         });

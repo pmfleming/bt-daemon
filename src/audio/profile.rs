@@ -65,19 +65,19 @@ impl ProfileValues {
 }
 
 pub(super) fn profile_mode(name: &str) -> &'static str {
-    if name.starts_with("a2dp-") {
-        "high-fidelity"
-    } else if name.starts_with("headset-") || name.starts_with("handsfree-") {
-        "headset"
-    } else if name.starts_with("bap-") {
-        "le-audio"
-    } else if name.starts_with("asha-") {
-        "hearing-aid"
-    } else if name == "off" {
-        "off"
-    } else {
-        "other"
+    if name == "off" {
+        return "off";
     }
+    [
+        ("a2dp-", "high-fidelity"),
+        ("headset-", "headset"),
+        ("handsfree-", "headset"),
+        ("bap-", "le-audio"),
+        ("asha-", "hearing-aid"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, mode)| name.starts_with(prefix).then_some(mode))
+    .unwrap_or("other")
 }
 
 #[cfg(test)]

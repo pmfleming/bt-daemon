@@ -107,7 +107,7 @@ impl vendor_channel::Handler for MaestroBatteryProvider {
 
 impl MaestroBatteryProvider {
     pub async fn start(session: Session, changes: broadcast::Sender<()>) -> Result<Arc<Self>> {
-        Channels::start(session, &SPEC, &changes.clone(), |links| Self {
+        Channels::start(session, &SPEC, changes.subscribe(), |links| Self {
             links,
             reports: RwLock::default(),
             changes,

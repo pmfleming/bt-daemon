@@ -34,8 +34,8 @@ mod audio_switch;
 mod capabilities;
 mod commands;
 mod retry;
+use crate::vendor_channel::is_connection_busy;
 use retry::RetryPolicy;
-pub(crate) use retry::is_connection_busy;
 mod keys;
 mod metadata;
 use commands::PendingCommands;
@@ -1476,7 +1476,7 @@ impl FastPairBatteryProvider {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%address, ?transport, error = %error, error_chain = %format!("{error:#}"), "Fast Pair connection failed");
-                    provider.connections.lock().await.connection_failed(address, attempt, retry::is_connection_busy(&error));
+                    provider.connections.lock().await.connection_failed(address, attempt, is_connection_busy(&error));
                     provider.retry_changed.notify_one();
                 }
             }

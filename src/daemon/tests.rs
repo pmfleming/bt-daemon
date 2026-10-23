@@ -293,6 +293,11 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
             recovered["recent"][0],
             serde_json::to_value(sequence.last().unwrap()).unwrap()
         );
+        assert_eq!(
+            start_operation(&daemon, "connect").await["ok"],
+            true,
+            "completion and cancellation both release the device"
+        );
     }
 }
 

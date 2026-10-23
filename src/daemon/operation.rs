@@ -1,9 +1,6 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 use serde::Serialize;
@@ -84,40 +81,27 @@ struct OperationTask {
     event: OperationEvent,
 }
 
-struct OperationState {
-    tasks: OwnedOperations<OperationTask>,
-    active_devices: HashMap<String, String>,
-}
-impl Default for OperationState {
-    fn default() -> Self {
-        Self {
-            tasks: OwnedOperations::new(OperationLimits {
-                total: 256,
-                per_owner: 64,
-            }),
-            active_devices: HashMap::new(),
-        }
-    }
-}
-
 pub(super) struct OperationCoordinator {
     backend: Arc<dyn BluetoothBackend>,
     sequence: AtomicU64,
-    state: Arc<Mutex<OperationState>>,
+    state: Mutex<OwnedOperations<OperationTask>>,
     events: broadcast::Sender<OperationEvent>,
-    recent: Arc<Mutex<RecentResults<OperationEvent>>>,
+    recent: Mutex<RecentResults<OperationEvent>>,
 }
 
 impl OperationCoordinator {
-    pub(super) fn new(backend: Arc<dyn BluetoothBackend>) -> Self {
+    pub(super) fn new(backend: Arc<dyn BluetoothBackend>) -> Arc<Self> {
         let (events, _) = broadcast::channel(32);
-        Self {
+        Arc::new(Self {
             backend,
             sequence: AtomicU64::new(1),
-            state: Arc::new(Mutex::new(OperationState::default())),
+            state: Mutex::new(OwnedOperations::new(OperationLimits {
+                total: 256,
+                per_owner: 64,
+            })),
             events,
-            recent: Arc::new(Mutex::new(RecentResults::new(64, None))),
-        }
+            recent: Mutex::new(RecentResults::new(64, None)),
+        })
     }
 
     pub(super) fn subscribe(&self) -> broadcast::Receiver<OperationEvent> {
@@ -129,7 +113,6 @@ impl OperationCoordinator {
             self.state
                 .lock()
                 .await
-                .tasks
                 .iter()
                 .map(|(_, task)| &task.value.event)
                 .collect::<Vec<_>>()
@@ -138,17 +121,25 @@ impl OperationCoordinator {
         json!({ "active": active, "recent": recent })
     }
 
-    pub(super) async fn start_owned(&self, params: Value, owner: Option<String>) -> Value {
+    pub(super) async fn start_owned(
+        self: &Arc<Self>,
+        params: Value,
+        owner: Option<String>,
+    ) -> Value {
         let (device_key, operation) = match api::typed_operation::<DeviceOperation>(&params) {
             Ok((key, operation)) => (key.to_owned(), operation),
             Err(error) => return api::error("validation-error", error.to_string()),
         };
 
         let mut state = self.state.lock().await;
-        if let Err(error) = state.tasks.admit(owner.as_deref()) {
+        if let Err(error) = state.admit(owner.as_deref()) {
             return api::error("operation-unavailable", error.to_string());
         }
-        if let Some(request_id) = state.active_devices.get(&device_key) {
+        // Admission caps this scan at 256 tasks; avoid a second device-to-task index.
+        if let Some((request_id, _)) = state
+            .iter()
+            .find(|(_, task)| task.value.event.device_key == device_key)
+        {
             tracing::warn!(%device_key, %request_id, "Bluetooth device operation rejected because the device is busy");
             return api::error(
                 "device-busy",
@@ -159,15 +150,9 @@ impl OperationCoordinator {
             "operation-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed)
         );
-        let queued =
-            OperationEvent::queued(request_id.clone(), device_key.clone(), operation.as_str());
         tracing::info!(%request_id, %device_key, %operation, "Bluetooth device operation queued");
-        let execution = OperationExecution {
-            backend: Arc::clone(&self.backend),
-            state: Arc::clone(&self.state),
-            events: self.events.clone(),
-            recent: Arc::clone(&self.recent),
-        };
+        let queued = OperationEvent::queued(request_id.clone(), device_key, operation.as_str());
+        let execution = Arc::clone(self);
         let response = api::success(json!({ "operation": queued }));
         let task_event = queued.clone();
         let (start_sender, start_receiver) = oneshot::channel();
@@ -177,8 +162,8 @@ impl OperationCoordinator {
                 .await;
         });
         let abort = handle.abort_handle();
-        if let Err(error) = state.tasks.insert(
-            request_id.clone(),
+        if let Err(error) = state.insert(
+            request_id,
             owner,
             OperationTask {
                 handle,
@@ -188,31 +173,20 @@ impl OperationCoordinator {
             abort.abort();
             return api::error("operation-unavailable", error.to_string());
         }
-        state.active_devices.insert(device_key, request_id);
         drop(state);
         let _ = start_sender.send(());
         response
     }
 
     pub(super) async fn cancel_owned(&self, request_id: &str, owner: Option<&str>) -> bool {
-        let task = {
-            let mut state = self.state.lock().await;
-            let Some(task) = state
-                .tasks
-                .claim_owned(request_id, owner)
-                .map(|entry| entry.value)
-            else {
-                return false;
-            };
-            if state
-                .active_devices
-                .get(&task.event.device_key)
-                .map(String::as_str)
-                == Some(request_id)
-            {
-                state.active_devices.remove(&task.event.device_key);
-            }
-            task
+        let Some(task) = self
+            .state
+            .lock()
+            .await
+            .claim_owned(request_id, owner)
+            .map(|entry| entry.value)
+        else {
+            return false;
         };
         task.handle.abort();
         tracing::info!(%request_id, "Bluetooth device operation cancelled");
@@ -221,18 +195,9 @@ impl OperationCoordinator {
         let _ = self.events.send(terminal);
         true
     }
-}
 
-struct OperationExecution {
-    backend: Arc<dyn BluetoothBackend>,
-    state: Arc<Mutex<OperationState>>,
-    events: broadcast::Sender<OperationEvent>,
-    recent: Arc<Mutex<RecentResults<OperationEvent>>>,
-}
-
-impl OperationExecution {
     async fn run(
-        self,
+        self: Arc<Self>,
         event: OperationEvent,
         operation: DeviceOperation,
         params: Value,
@@ -253,7 +218,8 @@ impl OperationExecution {
         )
         .await;
         log_operation_result(&event.request_id, &result);
-        if self.remove_active(&event).await {
+        let completed = self.state.lock().await.claim(&event.request_id).is_some();
+        if completed {
             let terminal = event.finished(result);
             retain_terminal(&self.recent, terminal.clone()).await;
             let _ = self.events.send(terminal);
@@ -263,7 +229,7 @@ impl OperationExecution {
     async fn publish_started(&self, event: &OperationEvent) -> bool {
         let started = event.clone().with_state("started", "running");
         let mut state = self.state.lock().await;
-        let Some(task) = state.tasks.get_mut(&event.request_id) else {
+        let Some(task) = state.get_mut(&event.request_id) else {
             return false;
         };
         task.event = started.clone();
@@ -271,30 +237,21 @@ impl OperationExecution {
         true
     }
 
-    fn progress_reporter(&self, event: &OperationEvent) -> Arc<dyn Fn(&'static str) + Send + Sync> {
-        let events = self.events.clone();
+    fn progress_reporter(
+        self: &Arc<Self>,
+        event: &OperationEvent,
+    ) -> Arc<dyn Fn(&'static str) + Send + Sync> {
         let event = event.clone();
-        let state = Arc::clone(&self.state);
+        let coordinator = Arc::clone(self);
         Arc::new(move |stage| {
             let update = event.progress(stage);
-            if let Ok(mut state) = state.try_lock()
-                && let Some(task) = state.tasks.get_mut(&event.request_id)
+            if let Ok(mut state) = coordinator.state.try_lock()
+                && let Some(task) = state.get_mut(&event.request_id)
             {
                 task.event = update.clone();
-                let _ = events.send(update);
+                let _ = coordinator.events.send(update);
             }
         })
-    }
-
-    async fn remove_active(&self, event: &OperationEvent) -> bool {
-        let mut state = self.state.lock().await;
-        if state.tasks.claim(&event.request_id).is_none() {
-            return false;
-        }
-        if state.active_devices.get(&event.device_key) == Some(&event.request_id) {
-            state.active_devices.remove(&event.device_key);
-        }
-        true
     }
 }
 

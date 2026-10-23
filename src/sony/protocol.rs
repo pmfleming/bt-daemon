@@ -6,11 +6,12 @@
 //! and newer; eight-byte init reply) is handled here.
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::framing::{self, DelimitedFrames};
+
 const START: u8 = 0x3e;
 const END: u8 = 0x3c;
 const ESCAPE: u8 = 0x3d;
 const ESCAPE_MASK: u8 = 0xef;
-const MAX_FRAME: usize = 4096;
 pub(super) const ACK: u8 = 0x01;
 pub(super) const COMMAND: u8 = 0x0c;
 pub(super) const COMMAND_2: u8 = 0x0e;
@@ -39,39 +40,18 @@ pub(super) fn encode(kind: u8, sequence: u8, payload: &[u8]) -> Result<Vec<u8>> 
     body.extend_from_slice(&length.to_be_bytes());
     body.extend_from_slice(payload);
     body.push(checksum(&body));
-    let mut frame = Vec::with_capacity(body.len() + 4);
-    frame.push(START);
-    for byte in body {
-        if matches!(byte, START | END | ESCAPE) {
-            frame.extend_from_slice(&[ESCAPE, byte & ESCAPE_MASK]);
-        } else {
-            frame.push(byte);
-        }
-    }
-    frame.push(END);
-    Ok(frame)
+    Ok(framing::escape(&body, (START, END), ESCAPE, |byte| {
+        byte & ESCAPE_MASK
+    }))
 }
 
 fn checksum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte))
 }
 
-fn unescape(escaped: &[u8]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(escaped.len());
-    let mut escaped = escaped.iter();
-    while let Some(&byte) = escaped.next() {
-        if byte == ESCAPE {
-            let next = escaped.next().context("Sony frame ends inside an escape")?;
-            bytes.push(next | !ESCAPE_MASK);
-        } else {
-            bytes.push(byte);
-        }
-    }
-    Ok(bytes)
-}
-
 fn decode(escaped: &[u8]) -> Result<Frame> {
-    let bytes = unescape(escaped)?;
+    let bytes = framing::unescape(escaped, ESCAPE, |byte| byte | !ESCAPE_MASK)
+        .context("decode Sony frame escaping")?;
     let Some((&received, body)) = bytes.split_last() else {
         bail!("empty Sony frame");
     };
@@ -94,31 +74,11 @@ fn decode(escaped: &[u8]) -> Result<Frame> {
 
 /// Splits the byte stream on start/end markers; bytes outside a frame are noise.
 #[derive(Default)]
-pub(super) struct FrameDecoder {
-    buffered: Vec<u8>,
-}
+pub(super) struct FrameDecoder(DelimitedFrames);
 
 impl FrameDecoder {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Result<Frame>> {
-        self.buffered.extend_from_slice(bytes);
-        let mut frames = Vec::new();
-        loop {
-            let Some(start) = self.buffered.iter().position(|byte| *byte == START) else {
-                self.buffered.clear();
-                break;
-            };
-            self.buffered.drain(..start);
-            let Some(end) = self.buffered.iter().position(|byte| *byte == END) else {
-                if self.buffered.len() > MAX_FRAME {
-                    self.buffered.clear();
-                    frames.push(Err(anyhow::anyhow!("Sony frame exceeds {MAX_FRAME} bytes")));
-                }
-                break;
-            };
-            frames.push(decode(&self.buffered[1..end]));
-            self.buffered.drain(..=end);
-        }
-        frames
+        self.0.push(bytes, (START, END), "Sony", decode)
     }
 }
 
@@ -239,6 +199,17 @@ mod tests {
         assert!(decoder.push(&corrupt)[0].is_err());
         assert!(decoder.push(&[0x3e, 0x0c, 0x3c])[0].is_err());
         assert!(decoder.push(&[0x3e, 0x0c, 0x3d, 0x3c])[0].is_err());
+        assert!(
+            decoder.push(&[0x3e, 0x3c])[0].is_err(),
+            "empty Sony frames are invalid"
+        );
+        assert!(decoder.push(&[0x3e]).is_empty());
+        assert!(decoder.push(&[0; 4095]).is_empty());
+        assert!(decoder.push(&[0])[0].is_err(), "bound incomplete frames");
+        assert_eq!(
+            decoder.push(&escaped)[0].as_ref().unwrap().payload,
+            [0x3e, 0xef]
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod client;
 /// Session D-Bus service, request ownership and subscriptions.
 pub mod daemon;
 mod fast_pair;
+mod framing;
 mod identity;
 mod maestro;
 mod management;

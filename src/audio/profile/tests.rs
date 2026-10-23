@@ -34,6 +34,9 @@ fn profile_pods_expose_typed_metadata_and_reject_invalid_shapes() {
         ("handsfree-head-unit", "headset", "codec ", None),
         ("off", "off", "codec )", None),
         ("", "other", "", None),
+        ("a2dp", "other", "Bare prefix", None),
+        ("off-extra", "other", "Not off", None),
+        ("A2DP-sink", "other", "Case-sensitive identifier", None),
     ] {
         let availability = if name == "off" {
             sys::SPA_PARAM_AVAILABILITY_no

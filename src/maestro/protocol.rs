@@ -7,11 +7,12 @@
 //! 65599 hashes of their names. Field numbers follow pbpctrl's maestro_pw.proto.
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::framing::{self, DelimitedFrames};
+
 const FLAG: u8 = 0x7e;
 const ESCAPE: u8 = 0x7d;
 const ESCAPE_MASK: u8 = 0x20;
 const UNNUMBERED_INFORMATION: u8 = 0x03;
-const MAX_FRAME: usize = 4096;
 
 const REQUEST: u32 = 0;
 const RESPONSE: u32 = 1;
@@ -275,17 +276,20 @@ fn encode_packet(packet: &Packet) -> Vec<u8> {
 fn decode_packet(bytes: &[u8]) -> Result<Packet> {
     let mut packet = Packet::default();
     for field in fields(bytes)? {
-        let number = |value: u64| u32::try_from(value).context("pw_rpc packet field is too large");
-        match field {
-            (1, Value::Varint(value)) => packet.kind = number(value)?,
-            (2, Value::Varint(value)) => packet.channel = number(value)?,
-            (3, Value::Fixed32(value)) => packet.service = value,
-            (4, Value::Fixed32(value)) => packet.method = value,
-            (5, Value::Bytes(value)) => packet.payload = value.to_vec(),
-            (6, Value::Varint(value)) => packet.status = number(value)?,
-            (7, Value::Varint(value)) => packet.call = number(value)?,
-            _ => {}
-        }
+        let (target, value) = match field {
+            (1, Value::Varint(value)) => (&mut packet.kind, value),
+            (2, Value::Varint(value)) => (&mut packet.channel, value),
+            (3, Value::Fixed32(value)) => (&mut packet.service, u64::from(value)),
+            (4, Value::Fixed32(value)) => (&mut packet.method, u64::from(value)),
+            (5, Value::Bytes(value)) => {
+                packet.payload = value.to_vec();
+                continue;
+            }
+            (6, Value::Varint(value)) => (&mut packet.status, value),
+            (7, Value::Varint(value)) => (&mut packet.call, value),
+            _ => continue,
+        };
+        *target = u32::try_from(value).context("pw_rpc packet field is too large")?;
     }
     Ok(packet)
 }
@@ -318,32 +322,12 @@ fn encode_frame(address: u32, data: &[u8]) -> Vec<u8> {
     body.push(UNNUMBERED_INFORMATION);
     body.extend_from_slice(data);
     body.extend_from_slice(&crc32(&body).to_le_bytes());
-    let mut frame = Vec::with_capacity(body.len() + 4);
-    frame.push(FLAG);
-    for byte in body {
-        if matches!(byte, FLAG | ESCAPE) {
-            frame.extend_from_slice(&[ESCAPE, byte ^ ESCAPE_MASK]);
-        } else {
-            frame.push(byte);
-        }
-    }
-    frame.push(FLAG);
-    frame
+    framing::escape(&body, (FLAG, FLAG), ESCAPE, |byte| byte ^ ESCAPE_MASK)
 }
 
 fn decode_frame(escaped: &[u8]) -> Result<Packet> {
-    let mut body = Vec::with_capacity(escaped.len());
-    let mut escaped = escaped.iter();
-    while let Some(&byte) = escaped.next() {
-        if byte == ESCAPE {
-            let next = escaped
-                .next()
-                .context("Maestro frame ends inside an escape")?;
-            body.push(next ^ ESCAPE_MASK);
-        } else {
-            body.push(byte);
-        }
-    }
+    let body = framing::unescape(escaped, ESCAPE, |byte| byte ^ ESCAPE_MASK)
+        .context("decode Maestro frame escaping")?;
     ensure!(body.len() >= 6, "Maestro frame is truncated");
     let (content, received) = body.split_at(body.len() - 4);
     ensure!(
@@ -366,35 +350,11 @@ fn decode_frame(escaped: &[u8]) -> Result<Packet> {
 
 /// Splits the byte stream on flags; a closing flag may also open the next frame.
 #[derive(Default)]
-pub(super) struct FrameDecoder {
-    buffered: Vec<u8>,
-}
+pub(super) struct FrameDecoder(DelimitedFrames);
 
 impl FrameDecoder {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Result<Packet>> {
-        self.buffered.extend_from_slice(bytes);
-        let mut packets = Vec::new();
-        loop {
-            let Some(start) = self.buffered.iter().position(|byte| *byte == FLAG) else {
-                self.buffered.clear();
-                break;
-            };
-            self.buffered.drain(..start);
-            let Some(end) = self.buffered[1..].iter().position(|byte| *byte == FLAG) else {
-                if self.buffered.len() > MAX_FRAME {
-                    self.buffered.clear();
-                    packets.push(Err(anyhow::anyhow!(
-                        "Maestro frame exceeds {MAX_FRAME} bytes"
-                    )));
-                }
-                break;
-            };
-            if end > 0 {
-                packets.push(decode_frame(&self.buffered[1..=end]));
-            }
-            self.buffered.drain(..=end);
-        }
-        packets
+        self.0.push(bytes, (FLAG, FLAG), "Maestro", decode_frame)
     }
 }
 
@@ -611,5 +571,12 @@ mod tests {
         assert!(decoder.push(&corrupt)[0].is_err());
         assert!(decoder.push(&[0x7e, 0x01, 0x03, 0x7e])[0].is_err());
         assert!(decoder.push(&[0x7e, 0x7d, 0x7e])[0].is_err());
+        assert!(
+            decoder.push(&[0x7e, 0x7e]).is_empty(),
+            "idle flags are not packets"
+        );
+        assert!(decoder.push(&[0; 4095]).is_empty());
+        assert!(decoder.push(&[0])[0].is_err(), "bound incomplete frames");
+        assert!(decoder.push(&frame)[0].is_ok(), "recover after overflow");
     }
 }

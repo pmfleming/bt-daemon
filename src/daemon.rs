@@ -39,7 +39,7 @@ pub struct BluetoothDaemon {
     subscriptions: Arc<OwnedTaskRegistry>,
     scan_owner_watches: Arc<Mutex<HashSet<String>>>,
     tasks: Arc<shelllist_daemon_tokio::TaskGroup>,
-    operations: OperationCoordinator,
+    operations: Arc<OperationCoordinator>,
     scans: ScanCoordinator,
     snapshots: watch::Sender<SharedSnapshot>,
     audio_snapshots: watch::Sender<Value>,

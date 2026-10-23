@@ -276,12 +276,14 @@ impl RememberedPresentation {
         if observed.is_empty() {
             return false;
         }
-        let previous = self.components.clone();
-        self.components.extend(observed);
-        self.components
-            .sort_by_key(|component| presentation_component_order(component));
-        self.components.dedup();
-        self.components != previous
+        let mut components = self.components.iter().chain(&observed).collect::<Vec<_>>();
+        components.sort_by_key(|component| presentation_component_order(component));
+        components.dedup();
+        if components.iter().copied().eq(&self.components) {
+            return false;
+        }
+        self.components = components.into_iter().cloned().collect();
+        true
     }
 
     fn update_battery(&mut self, battery: &[Battery]) -> bool {
@@ -354,6 +356,20 @@ mod tests {
             source: "test".into(),
             confidence: "standard".into(),
         }]
+    }
+
+    #[test]
+    fn component_updates_reuse_unchanged_strings_and_normalize_loaded_order() {
+        let mut remembered = super::RememberedPresentation::default();
+        let left = component_battery("left", 80);
+        assert!(remembered.update_components(&left));
+        let allocation = remembered.components[0].as_ptr();
+        assert!(!remembered.update_components(&left));
+        assert_eq!(remembered.components[0].as_ptr(), allocation);
+        remembered.components = vec!["right".into(), "left".into(), "left".into()];
+        assert!(remembered.update_components(&left));
+        assert_eq!(remembered.components, ["left", "right"]);
+        assert!(!remembered.update_components(&[]));
     }
 
     #[tokio::test]

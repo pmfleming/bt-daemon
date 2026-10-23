@@ -41,6 +41,14 @@ pub use recovery::RecoveringBackend;
 
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
+fn optional_provider<T>(result: Result<T>, name: &str) -> Option<T> {
+    result
+        .inspect_err(|error| {
+            tracing::warn!(%error, "{name} provider is unavailable");
+        })
+        .ok()
+}
+
 /// Live BlueZ session with identity, management policy and observation caches.
 /// Use `RecoveringBackend` when the session must survive BlueZ restarts.
 pub struct BluezBackend {
@@ -94,34 +102,24 @@ impl BluezBackend {
                 .backend_context("read stable adapter identity")?;
             identities.register_adapter(&name, &address.to_string());
         }
-        let fast_pair = match FastPairBatteryProvider::start(
-            session.clone(),
-            Arc::clone(&identities),
-            Arc::clone(&management),
-            changes.clone(),
-        )
-        .await
-        {
-            Ok(provider) => Some(provider),
-            Err(error) => {
-                tracing::warn!(error = %error, "Fast Pair component battery provider is unavailable");
-                None
-            }
-        };
-        let sony = match SonyControlProvider::start(session.clone(), changes.clone()).await {
-            Ok(provider) => Some(provider),
-            Err(error) => {
-                tracing::warn!(error = %error, "Sony headphones control provider is unavailable");
-                None
-            }
-        };
-        let maestro = match MaestroBatteryProvider::start(session.clone(), changes.clone()).await {
-            Ok(provider) => Some(provider),
-            Err(error) => {
-                tracing::warn!(error = %error, "Pixel Buds Maestro battery provider is unavailable");
-                None
-            }
-        };
+        let fast_pair = optional_provider(
+            FastPairBatteryProvider::start(
+                session.clone(),
+                Arc::clone(&identities),
+                Arc::clone(&management),
+                changes.clone(),
+            )
+            .await,
+            "Fast Pair component battery",
+        );
+        let sony = optional_provider(
+            SonyControlProvider::start(session.clone(), changes.clone()).await,
+            "Sony headphones control",
+        );
+        let maestro = optional_provider(
+            MaestroBatteryProvider::start(session.clone(), changes.clone()).await,
+            "Pixel Buds Maestro battery",
+        );
         tracing::info!(
             fast_pair = fast_pair.is_some(),
             sony = sony.is_some(),
