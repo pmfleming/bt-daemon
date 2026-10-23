@@ -10,6 +10,14 @@ opt-in (`SHELLLIST_BT_SOCKET=1`); wider rollout is gated on real Quickshell,
 restart/backpressure, large-record and comparative performance evidence. See
 `../shelllist/docs/unix-socket-migration.md` and the framework's `docs/unix-jsonl.md`.
 
+The explicit ignored `unix_socket_acceptance_probe` test uses a private bus and
+in-memory backend, real Quickshell, and a matching `bt-daemon client` binary. It
+records p50/p99, process-group PSS, fragmented/large records, blocked writes,
+no-replay and service-recreation evidence. Set `SHELLLIST_SOURCE`, `BT_DAEMON_BIN`
+and `SOCKET_PROBE_REPORT`; the Shelllist migration document has the full command
+and checked evidence. Ordinary tests do not run this experiment. Its debug,
+isolated results do not establish whole-desktop or OS-process-crash acceptance;
+the cross-daemon stream revision contract and wider rollout remain unfinished.
 
 Rust Bluetooth policy and API daemon for Shelllist.
 

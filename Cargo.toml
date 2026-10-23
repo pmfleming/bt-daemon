@@ -39,4 +39,4 @@ path = "test_support/session_recovery.rs"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["test-util", "process"] }

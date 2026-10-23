@@ -12,6 +12,8 @@ use tokio::{
     sync::oneshot,
 };
 
+mod probe;
+
 struct Rig {
     bus: Bus,
     directory: tempfile::TempDir,
