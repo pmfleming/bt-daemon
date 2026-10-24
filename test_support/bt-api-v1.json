@@ -72,7 +72,11 @@
           },
           "source": null
         }
-      ]
+      ],
+      "state": {
+        "epoch": "fixture-audio",
+        "revision": 1
+      }
     },
     "ok": true,
     "protocol": "bt-api",
@@ -165,7 +169,23 @@
     "compatibility": {
       "event_recovery_method": "bluetooth.requests.snapshot",
       "request_unknown_fields": "method-dependent",
-      "response_unknown_fields": "ignore"
+      "response_unknown_fields": "ignore",
+      "snapshot_ordering": {
+        "coalescing": "revision-skips-allowed",
+        "epoch": "opaque-publisher-lifetime",
+        "mutation_snapshots": "unwatermarked-observations-not-live-state",
+        "reads": [
+          "bluetooth.snapshot",
+          "bluetooth.audio.snapshot"
+        ],
+        "revision": "exact-positive-integer",
+        "semantics": "full-replacement",
+        "streams": [
+          "bluetooth.changed",
+          "bluetooth.audio.changed"
+        ],
+        "watermark": "data.state"
+      }
     },
     "errors": [
       {
@@ -1003,6 +1023,7 @@
         "events": [
           "subscribed",
           "changed",
+          "loading",
           "unavailable"
         ],
         "name": "bluetooth.changed"
@@ -1194,11 +1215,240 @@
           "rfkill_present": true,
           "soft_blocked": false
         }
+      },
+      "state": {
+        "epoch": "fixture-radio",
+        "revision": 2
       }
     },
     "ok": true,
     "protocol": "bt-api",
     "version": 2
+  },
+  "snapshot_ordering": {
+    "audio_event": {
+      "data": {
+        "audio_devices": [],
+        "state": {
+          "epoch": "fixture-audio",
+          "revision": 1
+        }
+      },
+      "event": "subscribed",
+      "protocol": "bt-api",
+      "stream": "bluetooth.audio.changed",
+      "subscription_id": "ordering-subscription",
+      "version": 2
+    },
+    "audio_read": {
+      "data": {
+        "audio_devices": [],
+        "state": {
+          "epoch": "fixture-audio",
+          "revision": 1
+        }
+      },
+      "ok": true,
+      "protocol": "bt-api",
+      "version": 2
+    },
+    "baseline": {
+      "data": {
+        "snapshot": {
+          "adapters": [],
+          "devices": [],
+          "management": {
+            "launch_state": "remember",
+            "preferred_adapter_key": "",
+            "reconnect_on_resume": true,
+            "show_blocked_devices": false,
+            "show_recent_devices": false,
+            "trust_after_pair": true,
+            "version": 1
+          },
+          "radio": {
+            "adapter_count": 0,
+            "available": false,
+            "hard_blocked": false,
+            "operational": false,
+            "powered": false,
+            "rfkill_present": false,
+            "soft_blocked": false
+          }
+        },
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 2
+        }
+      },
+      "event": "changed",
+      "protocol": "bt-api",
+      "stream": "bluetooth.changed",
+      "subscription_id": "ordering-subscription",
+      "version": 2
+    },
+    "changed": {
+      "data": {
+        "snapshot": {
+          "adapters": [],
+          "devices": [],
+          "management": {
+            "launch_state": "remember",
+            "preferred_adapter_key": "",
+            "reconnect_on_resume": true,
+            "show_blocked_devices": false,
+            "show_recent_devices": false,
+            "trust_after_pair": true,
+            "version": 1
+          },
+          "radio": {
+            "adapter_count": 0,
+            "available": false,
+            "hard_blocked": false,
+            "operational": false,
+            "powered": true,
+            "rfkill_present": false,
+            "soft_blocked": false
+          }
+        },
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 3
+        }
+      },
+      "event": "changed",
+      "protocol": "bt-api",
+      "stream": "bluetooth.changed",
+      "subscription_id": "ordering-subscription",
+      "version": 2
+    },
+    "latest_read": {
+      "data": {
+        "snapshot": {
+          "adapters": [],
+          "devices": [],
+          "management": {
+            "launch_state": "remember",
+            "preferred_adapter_key": "",
+            "reconnect_on_resume": true,
+            "show_blocked_devices": false,
+            "show_recent_devices": false,
+            "trust_after_pair": true,
+            "version": 1
+          },
+          "radio": {
+            "adapter_count": 0,
+            "available": false,
+            "hard_blocked": false,
+            "operational": false,
+            "powered": true,
+            "rfkill_present": false,
+            "soft_blocked": false
+          }
+        },
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 3
+        }
+      },
+      "ok": true,
+      "protocol": "bt-api",
+      "version": 2
+    },
+    "loading": {
+      "data": {
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 1
+        },
+        "status": "loading"
+      },
+      "event": "loading",
+      "protocol": "bt-api",
+      "stream": "bluetooth.changed",
+      "subscription_id": "ordering-subscription",
+      "version": 2
+    },
+    "loading_read": {
+      "data": {
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 1
+        }
+      },
+      "error": {
+        "code": "snapshot-loading",
+        "message": "Bluetooth snapshot is loading"
+      },
+      "ok": false,
+      "protocol": "bt-api",
+      "version": 2
+    },
+    "old_read": {
+      "data": {
+        "snapshot": {
+          "adapters": [],
+          "devices": [],
+          "management": {
+            "launch_state": "remember",
+            "preferred_adapter_key": "",
+            "reconnect_on_resume": true,
+            "show_blocked_devices": false,
+            "show_recent_devices": false,
+            "trust_after_pair": true,
+            "version": 1
+          },
+          "radio": {
+            "adapter_count": 0,
+            "available": false,
+            "hard_blocked": false,
+            "operational": false,
+            "powered": false,
+            "rfkill_present": false,
+            "soft_blocked": false
+          }
+        },
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 2
+        }
+      },
+      "ok": true,
+      "protocol": "bt-api",
+      "version": 2
+    },
+    "unavailable": {
+      "data": {
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 4
+        }
+      },
+      "error": {
+        "code": "bluez-unavailable",
+        "message": "Unavailable"
+      },
+      "event": "unavailable",
+      "protocol": "bt-api",
+      "stream": "bluetooth.changed",
+      "subscription_id": "ordering-subscription",
+      "version": 2
+    },
+    "unavailable_read": {
+      "data": {
+        "state": {
+          "epoch": "fixture-radio",
+          "revision": 4
+        }
+      },
+      "error": {
+        "code": "bluez-unavailable",
+        "message": "Unavailable"
+      },
+      "ok": false,
+      "protocol": "bt-api",
+      "version": 2
+    }
   },
   "version": 2
 }

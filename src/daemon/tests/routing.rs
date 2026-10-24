@@ -18,9 +18,7 @@ async fn dispatch_validates_commands_and_routes_supported_methods() {
             "{method}: {response}"
         );
     }
-    daemon
-        .snapshots
-        .send_replace(crate::daemon::SharedSnapshot::Loading);
+    crate::daemon::Published::update(&daemon.snapshots, crate::daemon::SharedSnapshot::Loading);
     let loading = daemon
         .dispatch_call("bluetooth.snapshot", json!({}), None, None)
         .await;

@@ -171,9 +171,12 @@ fn daemon(
     let scans = ScanCoordinator::new(Arc::clone(&backend));
     let scan_receiver = scans.subscribe();
     let obex = ObexCoordinator::new(Arc::clone(&backend));
-    let (snapshots, _) = watch::channel(SharedSnapshot::Available(Arc::new(Snapshot::default())));
-    let (audio_snapshots, _) =
-        watch::channel(json!({ "ok": true, "data": { "audio_devices": [] } }));
+    let (snapshots, _) = watch::channel(super::Published::new(SharedSnapshot::Available(
+        Arc::new(Snapshot::default()),
+    )));
+    let (audio_snapshots, _) = watch::channel(super::Published::new(
+        json!({ "ok": true, "data": { "audio_devices": [] } }),
+    ));
     (
         BluetoothDaemon {
             boundary: shelllist_daemon_tokio::ServiceBoundary::new(

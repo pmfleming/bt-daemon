@@ -20,6 +20,30 @@ fn frontend_contract_owned_snapshot_audio_and_adapter_outcomes() {
             .key
             .is_empty()
     );
+    let ordering = &f["snapshot_ordering"];
+    for (event, read) in [
+        ("baseline", "old_read"),
+        ("changed", "latest_read"),
+        ("unavailable", "unavailable_read"),
+        ("loading", "loading_read"),
+        ("audio_event", "audio_read"),
+    ] {
+        assert_eq!(
+            ordering[event]["data"]["state"],
+            ordering[read]["data"]["state"]
+        );
+    }
+    assert_eq!(ordering["old_read"]["data"]["state"]["revision"], 2);
+    assert_eq!(ordering["latest_read"]["data"]["state"]["revision"], 3);
+    assert_eq!(ordering["unavailable_read"]["ok"], false);
+    assert_eq!(
+        f["snapshot"]["data"]["state"],
+        ordering["old_read"]["data"]["state"]
+    );
+    assert_ne!(
+        f["snapshot"]["data"]["state"]["epoch"],
+        f["audio_snapshot"]["data"]["state"]["epoch"]
+    );
     let methods = f["registry"]["methods"].as_array().unwrap();
     assert!(
         methods

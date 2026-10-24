@@ -8,7 +8,7 @@ accepted effects are not treated as rolled back when a reply is lost.
 D-Bus and `bt-daemon client` remain supported. The Shelllist socket prototype is
 opt-in (`SHELLLIST_BT_SOCKET=1`); wider rollout is gated on real Quickshell,
 restart/backpressure, large-record and comparative performance evidence. See
-`../shelllist/docs/unix-socket-migration.md` and the framework's `docs/unix-jsonl.md`.
+`../shelllist/contracts/unix-jsonl-stream-recovery.md` and the framework's `docs/unix-jsonl.md`.
 
 The explicit ignored `unix_socket_acceptance_probe` test uses a private bus and
 in-memory backend, real Quickshell, and a matching `bt-daemon client` binary. It
@@ -18,6 +18,20 @@ and `SOCKET_PROBE_REPORT`; the Shelllist migration document has the full command
 and checked evidence. Ordinary tests do not run this experiment. Its debug,
 isolated results do not establish whole-desktop or OS-process-crash acceptance;
 the cross-daemon stream revision contract and wider rollout remain unfinished.
+
+`bluetooth.changed` and `bluetooth.audio.changed` now carry `data.state` with an
+opaque publisher epoch and an exact positive state revision. Their cached snapshot
+RPCs capture the same value/watermark atomically, including loading/unavailable
+errors. Each publisher is independent; unchanged observations do not advance and
+watch coalescing may skip revisions. Counter exhaustion starts a fresh epoch at 1.
+Mutation acknowledgements and embedded operation/scan snapshots are **not** part
+of this publication order: consumers must reconcile through the authoritative
+watch/read rather than overwrite live state with those observations. Old clients
+may ignore additive metadata; ordering-aware Shelllist requires matched builds.
+This does not yet order request/pairing/OBEX recovery or qualify quiet terminal
+loss, process crashes, sustained load or rollout. Native tests cover captured reads,
+coalescing, rollover, errors and real socket/D-Bus watermark parity; the offline
+fixture uses the live state/event constructors (only epochs normalized).
 
 Rust Bluetooth policy and API daemon for Shelllist.
 

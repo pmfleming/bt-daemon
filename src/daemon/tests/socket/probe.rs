@@ -245,14 +245,15 @@ async fn native_qt_cases(root: &Path, rig: &mut Rig) -> Value {
             .unwrap();
         rig.connection.clone().close().await.unwrap();
         let (fresh, _, _) = daemon(false);
-        fresh
-            .snapshots
-            .send_replace(crate::daemon::subscription::SharedSnapshot::Available(
-                Arc::new(crate::model::Snapshot {
+        crate::daemon::Published::update(
+            &fresh.snapshots,
+            crate::daemon::subscription::SharedSnapshot::Available(Arc::new(
+                crate::model::Snapshot {
                     adapters: vec![super::super::test_adapter("restarted-generation")],
                     ..Default::default()
-                }),
-            ));
+                },
+            )),
+        );
         rig.connection = rig
             .bus
             .builder()

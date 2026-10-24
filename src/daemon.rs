@@ -23,13 +23,14 @@ pub use crate::protocol::stream::{
 mod audio;
 mod obex;
 mod operation;
+mod published;
 mod scan;
 mod socket;
 mod subscription;
 
 use self::{
-    obex::ObexCoordinator, operation::OperationCoordinator, scan::ScanCoordinator,
-    subscription::SharedSnapshot,
+    obex::ObexCoordinator, operation::OperationCoordinator, published::Published,
+    scan::ScanCoordinator, subscription::SharedSnapshot,
 };
 
 /// Owns request coordinators and cached snapshots shared by session-bus clients.
@@ -42,8 +43,8 @@ pub struct BluetoothDaemon {
     tasks: Arc<shelllist_daemon_tokio::TaskGroup>,
     operations: Arc<OperationCoordinator>,
     scans: ScanCoordinator,
-    snapshots: watch::Sender<SharedSnapshot>,
-    audio_snapshots: watch::Sender<Value>,
+    snapshots: watch::Sender<Published<SharedSnapshot>>,
+    audio_snapshots: watch::Sender<Published<Value>>,
     obex: Arc<ObexCoordinator>,
 }
 
@@ -68,7 +69,7 @@ impl BluetoothDaemon {
             }
             "bluetooth.obex.respond" => obex::respond(&self.obex.incoming, &params).await,
             "bluetooth.obex.snapshot" => self.obex.snapshot().await,
-            "bluetooth.audio.snapshot" => self.audio_snapshots.borrow().clone(),
+            "bluetooth.audio.snapshot" => self.audio_snapshots.borrow().response(),
             "bluetooth.audio.setProfile" => {
                 let backend = Arc::clone(&self.backend);
                 audio::apply_change(
@@ -257,7 +258,7 @@ impl BluetoothDaemon {
 /// Returns an error if service registration or monitor startup fails.
 pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>) -> Result<()> {
     let mut changes = backend.subscribe_changes();
-    let (snapshots, _) = watch::channel(SharedSnapshot::Loading);
+    let (snapshots, _) = watch::channel(Published::new(SharedSnapshot::Loading));
 
     let (audio_events, _) = broadcast::channel(32);
     let operations = OperationCoordinator::new(Arc::clone(&backend));
@@ -265,10 +266,10 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     let obex = ObexCoordinator::new(Arc::clone(&backend));
     audio::start_monitor(audio_events.clone())?;
     let mut audio_changes = audio_events.subscribe();
-    let (audio_snapshots, _) = watch::channel(api::error(
+    let (audio_snapshots, _) = watch::channel(Published::new(api::error(
         "snapshot-loading",
         "Bluetooth audio snapshot is loading".to_string(),
-    ));
+    )));
     let subscriptions = Arc::new(OwnedTaskRegistry::default());
     let tasks = Arc::new(shelllist_daemon_tokio::TaskGroup::default());
     let connection = connection::Builder::session()
@@ -310,15 +311,15 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     // connect immediately and observe a typed loading state while snapshots
     // are populated in the background.
     tasks.spawn("bluetooth-snapshots", async move {
-        snapshots.send_replace(backend.snapshot().await.into());
+        Published::update(&snapshots, backend.snapshot().await.into());
         while receive_refresh(&mut changes, std::time::Duration::from_millis(80)).await {
-            send_changed(&snapshots, backend.snapshot().await.into());
+            Published::update(&snapshots, backend.snapshot().await.into());
         }
     });
     tasks.spawn("bluetooth-audio-snapshots", async move {
-        audio_snapshots.send_replace(audio::snapshot(&pairing).await);
+        Published::update(&audio_snapshots, audio::snapshot(&pairing).await);
         while receive_refresh(&mut audio_changes, std::time::Duration::from_millis(150)).await {
-            send_changed(&audio_snapshots, audio::snapshot(&pairing).await);
+            Published::update(&audio_snapshots, audio::snapshot(&pairing).await);
         }
     });
     tracing::info!(
@@ -349,15 +350,8 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
     result
 }
 
-fn send_changed<T: PartialEq>(sender: &watch::Sender<T>, next: T) {
-    // Do not serialize and send an identical full snapshot to every frontend.
-    sender.send_if_modified(|current| {
-        if *current == next {
-            return false;
-        }
-        *current = next;
-        true
-    });
+pub(crate) fn snapshot_ordering_fixture() -> Value {
+    subscription::snapshot_ordering_fixture()
 }
 
 async fn receive_refresh(

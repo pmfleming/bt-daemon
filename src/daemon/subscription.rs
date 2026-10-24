@@ -17,7 +17,7 @@ use crate::{api, model::Snapshot, protocol};
 
 use super::{
     AUDIO_STREAM, BluetoothDaemon, CHANGED_STREAM, INTERFACE, OBEX_STREAM, OPERATION_STREAM,
-    PAIRING_STREAM, SCAN_STREAM,
+    PAIRING_STREAM, SCAN_STREAM, published::Published,
 };
 
 /// One captured state feeds both request responses and subscription events.
@@ -44,6 +44,12 @@ impl SharedSnapshot {
             Self::Available(snapshot) => api::success(json!({ "snapshot": snapshot })),
             Self::Unavailable(error) => api::error("bluez-unavailable", error.to_string()),
         }
+    }
+}
+
+impl Published<SharedSnapshot> {
+    pub(super) fn response(&self) -> Value {
+        self.stamp(self.value.response())
     }
 }
 
@@ -235,8 +241,12 @@ async fn forward_snapshots<T: Clone>(
     .await;
 }
 
-fn snapshot_fields(snapshot: SharedSnapshot, event: &'static str) -> (&'static str, EventBody) {
-    match snapshot {
+fn snapshot_fields(
+    state: Published<SharedSnapshot>,
+    event: &'static str,
+) -> (&'static str, EventBody) {
+    let watermark = state.watermark();
+    let (event, mut body) = match state.value {
         SharedSnapshot::Loading => ("loading", EventBody::data(json!({"status": "loading"}))),
         SharedSnapshot::Available(snapshot) => {
             (event, EventBody::data(json!({"snapshot": snapshot})))
@@ -245,11 +255,14 @@ fn snapshot_fields(snapshot: SharedSnapshot, event: &'static str) -> (&'static s
             "unavailable",
             EventBody::error(ApiError::new("bluez-unavailable", error.as_str())),
         ),
-    }
+    };
+    body.data["state"] = watermark;
+    (event, body)
 }
 
-fn audio_fields(mut envelope: Value, event: &'static str) -> (&'static str, EventBody) {
-    if envelope["ok"].as_bool() == Some(true) {
+fn audio_fields(state: Published<Value>, event: &'static str) -> (&'static str, EventBody) {
+    let mut envelope = state.response();
+    let (event, mut body) = if envelope["ok"].as_bool() == Some(true) {
         let devices = envelope
             .pointer_mut("/data/audio_devices")
             .map(Value::take)
@@ -264,7 +277,71 @@ fn audio_fields(mut envelope: Value, event: &'static str) -> (&'static str, Even
         )
         .unwrap_or_else(|_| ApiError::new("audio-unavailable", "Invalid audio response"));
         ("unavailable", EventBody::error(error))
+    };
+    body.data["state"] = envelope["data"]["state"].take();
+    (event, body)
+}
+
+/// Offline witnesses use the same captured state and serializers as both ingress paths.
+/// Only generated epoch identities are normalized; no alternate fixture wire model.
+pub(super) fn snapshot_ordering_fixture() -> Value {
+    fn event(state: Published<SharedSnapshot>) -> Value {
+        let (name, body) = snapshot_fields(state, "changed");
+        body.envelope(
+            shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
+            CHANGED_STREAM,
+            name,
+            shelllist_daemon_core::Correlation::Subscription("ordering-subscription"),
+        )
+        .into_value()
+        .expect("serializable snapshot event")
     }
+    let (sender, _) = watch::channel(Published::new(SharedSnapshot::Loading));
+    let loading = event(sender.borrow().clone());
+    let loading_read = sender.borrow().response();
+    Published::update(
+        &sender,
+        SharedSnapshot::Available(Arc::new(Snapshot::default())),
+    );
+    let baseline = event(sender.borrow().clone());
+    let old_read = sender.borrow().response();
+    let mut next = Snapshot::default();
+    next.radio.powered = true;
+    Published::update(&sender, SharedSnapshot::Available(Arc::new(next)));
+    let changed = event(sender.borrow().clone());
+    let latest_read = sender.borrow().response();
+    Published::update(
+        &sender,
+        SharedSnapshot::Unavailable(Arc::new("Unavailable".into())),
+    );
+    let unavailable = event(sender.borrow().clone());
+    let unavailable_read = sender.borrow().response();
+    let audio = Published::new(api::success(json!({"audio_devices": []})));
+    let audio_read = audio.response();
+    let (name, body) = audio_fields(audio, "subscribed");
+    let audio_event = body
+        .envelope(
+            shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
+            AUDIO_STREAM,
+            name,
+            shelllist_daemon_core::Correlation::Subscription("ordering-subscription"),
+        )
+        .into_value()
+        .expect("serializable audio event");
+    let mut fixture = json!({
+        "loading": loading, "loading_read": loading_read, "baseline": baseline,
+        "old_read": old_read, "changed": changed, "latest_read": latest_read,
+        "unavailable": unavailable, "unavailable_read": unavailable_read,
+        "audio_read": audio_read, "audio_event": audio_event,
+    });
+    for (name, record) in fixture.as_object_mut().expect("object fixture") {
+        record["data"]["state"]["epoch"] = json!(if name.starts_with("audio_") {
+            "fixture-audio"
+        } else {
+            "fixture-radio"
+        });
+    }
+    fixture
 }
 
 async fn emit_event(

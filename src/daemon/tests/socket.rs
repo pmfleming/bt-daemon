@@ -111,6 +111,75 @@ async fn call(client: &mut BufReader<UnixStream>, method: &str, params: Value) -
 }
 
 #[tokio::test]
+async fn snapshot_reads_and_events_share_atomic_state_on_both_transports() {
+    let mut rig = Rig::new().await;
+    let bus_client = rig.bus.connection().await;
+    let proxy = zbus::Proxy::new(
+        &bus_client,
+        api_daemon::BUS_NAME,
+        api_daemon::OBJECT_PATH,
+        api_daemon::INTERFACE,
+    )
+    .await
+    .unwrap();
+    for (stream, method) in [
+        (api_daemon::CHANGED_STREAM, "bluetooth.snapshot"),
+        (api_daemon::AUDIO_STREAM, "bluetooth.audio.snapshot"),
+    ] {
+        let mut peer = rig.client().await;
+        send(
+            &mut peer,
+            json!({"op":"subscribe","id":"sub","streams":[stream]}),
+        )
+        .await;
+        assert_eq!(next(&mut peer).await["kind"], "response");
+        let initial = next(&mut peer).await;
+        let captured_read = call(&mut peer, method, json!({})).await;
+        assert_eq!(
+            captured_read["data"]["state"],
+            initial["event"]["data"]["state"]
+        );
+        let interface = rig
+            .connection
+            .object_server()
+            .interface::<_, api_daemon::BluetoothDaemon>(api_daemon::OBJECT_PATH)
+            .await
+            .unwrap();
+        {
+            let daemon = interface.get().await;
+            if stream == api_daemon::CHANGED_STREAM {
+                api_daemon::Published::update(
+                    &daemon.snapshots,
+                    api_daemon::SharedSnapshot::Unavailable(Arc::new("test-unavailable".into())),
+                );
+            } else {
+                api_daemon::Published::update(
+                    &daemon.audio_snapshots,
+                    crate::api::error("audio-unavailable", "test-unavailable".into()),
+                );
+            }
+        }
+        let update = next(&mut peer).await;
+        assert_eq!(update["event"]["event"], "unavailable");
+        let read = call(&mut peer, method, json!({})).await;
+        let bus_read: String = proxy.call("Call", &(method, "{}")).await.unwrap();
+        assert_eq!(read, serde_json::from_str::<Value>(&bus_read).unwrap());
+        assert_eq!(read["data"]["state"], update["event"]["data"]["state"]);
+        assert_eq!(
+            read["data"]["state"]["epoch"],
+            captured_read["data"]["state"]["epoch"]
+        );
+        assert_eq!(
+            read["data"]["state"]["revision"].as_u64().unwrap(),
+            captured_read["data"]["state"]["revision"].as_u64().unwrap() + 1
+        );
+        assert_eq!(captured_read["ok"], true);
+        assert_eq!(read["ok"], false);
+    }
+    rig.stop().await;
+}
+
+#[tokio::test]
 async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_work() {
     let mut rig = Rig::new().await;
     let bus_client = rig.bus.connection().await;

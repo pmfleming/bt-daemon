@@ -92,7 +92,7 @@ macro_rules! stream_registry {
 
 /// Stream names and supported lifecycle event names.
 pub const STREAMS: &[(&str, &[&str])] = stream_registry! {
-    stream::CHANGED => ["subscribed", "changed", "unavailable"];
+    stream::CHANGED => ["subscribed", "changed", "loading", "unavailable"];
     stream::PAIRING => ["requested", "display", "answered", "cancelled", "gap"];
     stream::OPERATION => ["started", "progress", "completed", "failed", "cancelled", "gap"];
     stream::SCAN => ["started", "completed", "failed", "cancelled", "gap"];
@@ -299,6 +299,16 @@ pub fn registry() -> Value {
             "request_unknown_fields": "method-dependent",
             "response_unknown_fields": "ignore",
             "event_recovery_method": "bluetooth.requests.snapshot",
+            "snapshot_ordering": {
+                "streams": [stream::CHANGED, stream::AUDIO],
+                "reads": ["bluetooth.snapshot", "bluetooth.audio.snapshot"],
+                "watermark": "data.state",
+                "semantics": "full-replacement",
+                "epoch": "opaque-publisher-lifetime",
+                "revision": "exact-positive-integer",
+                "coalescing": "revision-skips-allowed",
+                "mutation_snapshots": "unwatermarked-observations-not-live-state"
+            },
         },
     })
 }
@@ -351,6 +361,11 @@ fn fixture_from(encoded: &str) -> anyhow::Result<Value> {
             .context("serialize protocol event fixture")?;
         }
     }
+    fixture["snapshot_ordering"] = crate::daemon::snapshot_ordering_fixture();
+    fixture["snapshot"]["data"]["state"] =
+        fixture["snapshot_ordering"]["old_read"]["data"]["state"].clone();
+    fixture["audio_snapshot"]["data"]["state"] =
+        fixture["snapshot_ordering"]["audio_read"]["data"]["state"].clone();
     fixture["version"] = json!(VERSION);
     fixture["registry"] = registry();
     Ok(fixture)
