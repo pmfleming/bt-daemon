@@ -667,10 +667,15 @@ pub fn set_profile(target: &AudioDevice, index: u32) -> Result<()> {
     let session = pipewire_session()?;
     let registry = &session.registry;
     let registry_weak = registry.downgrade();
-    let target = Rc::new(DeviceIdentity::from(target));
     let completion = Completion::new(&session.main_loop);
     let _core_listener = completion.watch_core(&session.core);
-    let confirmed_for_registry = completion.clone();
+    let change = Rc::new(ProfileChange {
+        target: DeviceIdentity::from(target),
+        index,
+        bytes,
+        completion: completion.clone(),
+        written: Cell::new(false),
+    });
     let target_id = Rc::new(Cell::new(None));
     let removed_id = target_id.clone();
     let removed = completion.clone();
@@ -679,7 +684,7 @@ pub fn set_profile(target: &AudioDevice, index: u32) -> Result<()> {
         .add_listener_local()
         .global(move |global| {
             if global.type_ != ObjectType::Device
-                || !object_matches(global, target.id, target.serial)
+                || !object_matches(global, change.target.id, change.target.serial)
             {
                 return;
             }
@@ -687,16 +692,10 @@ pub fn set_profile(target: &AudioDevice, index: u32) -> Result<()> {
                 return;
             };
             target_id.set(Some(global.id));
-            if let Err(error) = apply_profile(
-                &registry,
-                global,
-                &bytes,
-                &target,
-                index,
-                confirmed_for_registry.clone(),
-                &objects,
-            ) {
-                confirmed_for_registry.fail(format!("apply PipeWire Bluetooth profile: {error:#}"));
+            if let Err(error) = apply_profile(&registry, global, &change, &objects) {
+                change
+                    .completion
+                    .fail(format!("apply PipeWire Bluetooth profile: {error:#}"));
             }
         })
         .global_remove(move |id| {
@@ -731,13 +730,58 @@ fn profile_parameter(index: u32) -> Result<Vec<u8>> {
         .into_inner())
 }
 
+// One operation state is shared by all bindings/callbacks. A write is recorded
+// only after the writer runs successfully; any terminal failure prevents replay.
+struct ProfileChange {
+    target: DeviceIdentity,
+    index: u32,
+    bytes: Vec<u8>,
+    completion: Completion,
+    written: Cell<bool>,
+}
+
+impl ProfileChange {
+    fn info(
+        &self,
+        properties: Option<&pw::spa::utils::dict::DictRef>,
+        write: impl FnOnce() -> Result<()>,
+    ) {
+        if self.completion.failed() {
+            return;
+        }
+        let Some(properties) = properties else { return };
+        if !device_properties_match(&self.target.adapter, &self.target.address, properties) {
+            self.completion
+                .fail("PipeWire Bluetooth device changed identity");
+            return;
+        }
+        if self.written.get() {
+            return;
+        }
+        match write() {
+            Ok(()) => self.written.set(true),
+            Err(error) => self
+                .completion
+                .fail(format!("write PipeWire profile: {error:#}")),
+        }
+    }
+
+    fn observe(&self, parameter: pw::spa::param::ParamType, pod: Option<&pw::spa::pod::Pod>) {
+        if self.written.get()
+            && parameter == pw::spa::param::ParamType::Profile
+            && pod
+                .and_then(parse_profile)
+                .is_some_and(|profile| profile.index == self.index)
+        {
+            self.completion.succeed();
+        }
+    }
+}
+
 fn apply_profile(
     registry: &pw::registry::RegistryRc,
     global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
-    bytes: &[u8],
-    target: &Rc<DeviceIdentity>,
-    requested_index: u32,
-    confirmed: Completion,
+    change: &Rc<ProfileChange>,
     objects: &RefCell<Objects>,
 ) -> Result<()> {
     let device = Rc::new(
@@ -745,44 +789,26 @@ fn apply_profile(
             .bind::<Device, _>(global)
             .context("bind PipeWire device for profile change")?,
     );
-    pw::spa::pod::Pod::from_bytes(bytes).context("decode serialized PipeWire profile parameter")?;
-    let bytes = bytes.to_vec();
-    let target = Rc::clone(target);
     let weak = Rc::downgrade(&device);
-    let checked = confirmed.clone();
-    let written = Rc::new(Cell::new(false));
-    let applied = written.clone();
+    let checked = Rc::clone(change);
+    let applied = Rc::clone(change);
     let listener = device
         .add_listener_local()
         .info(move |info| {
-            let Some(properties) = info.props() else {
-                return;
-            };
-            if !device_properties_match(&target.adapter, &target.address, properties) {
-                checked.fail("PipeWire Bluetooth device changed identity");
-                return;
-            }
-            if written.replace(true) {
-                return;
-            }
-            if let Some(device) = weak.upgrade()
-                && let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes)
-            {
-                device.subscribe_params(&[pw::spa::param::ParamType::Profile]);
+            checked.info(info.props(), || {
+                let device = weak
+                    .upgrade()
+                    .context("PipeWire profile device disappeared")?;
+                let pod = pw::spa::pod::Pod::from_bytes(&checked.bytes)
+                    .context("decode serialized PipeWire profile parameter")?;
                 device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
-            }
+                Ok(())
+            })
         })
-        .param(move |_, parameter, _, _, pod| {
-            if applied.get()
-                && parameter == pw::spa::param::ParamType::Profile
-                && pod
-                    .and_then(parse_profile)
-                    .is_some_and(|profile| profile.index == requested_index)
-            {
-                confirmed.succeed();
-            }
-        })
+        .param(move |_, parameter, _, _, pod| applied.observe(parameter, pod))
         .register();
+    // Rebinding must retain observations even after this operation has written.
+    device.subscribe_params(&[pw::spa::param::ParamType::Profile]);
     objects.borrow_mut().retain(global.id, device, listener);
     Ok(())
 }
@@ -1428,6 +1454,95 @@ mod tests {
         assert!(node.internal);
         assert_eq!(node.codec.as_deref(), Some("lc3"));
         assert_eq!(node.priority, 100);
+    }
+
+    #[test]
+    fn profile_callbacks_require_a_write_and_fail_closed_without_replaying() -> anyhow::Result<()> {
+        use super::{Cell, Completion, DeviceIdentity, Duration, ProfileChange, profile_parameter};
+        use pipewire::{
+            main_loop::MainLoopRc,
+            spa::{param::ParamType, pod::Pod},
+        };
+
+        super::initialize();
+        let main_loop = MainLoopRc::new(None)?;
+        let valid = pipewire::properties::properties! {
+            "api.bluez5.address" => "aa:bb:cc:dd:ee:ff",
+            "api.bluez5.path" => "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+        };
+        let wrong = pipewire::properties::properties! {
+            "api.bluez5.address" => "aa:bb:cc:dd:ee:ff",
+            "api.bluez5.path" => "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF",
+        };
+        let new_change = || ProfileChange {
+            target: DeviceIdentity::from(&audio_device()),
+            index: 2,
+            bytes: profile_parameter(2).unwrap(),
+            completion: Completion::new(&main_loop),
+            written: Cell::new(false),
+        };
+        let change = new_change();
+        let matching = Pod::from_bytes(&change.bytes).unwrap();
+        let deadline = Duration::from_millis(1);
+        change.observe(ParamType::Profile, Some(matching));
+        assert!(
+            !change.completion.wait(deadline)?,
+            "pre-write observation is not confirmation"
+        );
+        let writes = Cell::new(0);
+        let write = || {
+            writes.set(writes.get() + 1);
+            Ok(())
+        };
+        change.info(None, write);
+        assert_eq!(writes.get(), 0);
+        change.info(Some(valid.dict()), write);
+        change.info(Some(valid.dict()), write);
+        assert_eq!(writes.get(), 1);
+        change.observe(ParamType::EnumProfile, Some(matching));
+        change.observe(ParamType::Profile, None);
+        let other = profile_parameter(3)?;
+        change.observe(ParamType::Profile, Pod::from_bytes(&other));
+        assert!(!change.completion.wait(deadline)?);
+        change.observe(ParamType::Profile, Some(matching));
+        assert!(change.completion.wait(deadline)?);
+        change.info(Some(wrong.dict()), write);
+        change.info(Some(valid.dict()), write);
+        change.observe(ParamType::Profile, Some(matching));
+        assert!(
+            change.completion.failed(),
+            "late identity failure overrides success"
+        );
+        assert_eq!(writes.get(), 1);
+
+        for (properties, write_ok, pre_failed, expected_writes) in [
+            (valid.dict(), false, false, 1),
+            (wrong.dict(), true, false, 0),
+            (valid.dict(), true, true, 0),
+        ] {
+            let failed = new_change();
+            let attempts = Cell::new(0);
+            if pre_failed {
+                failed
+                    .completion
+                    .fail("core disconnected or target removed");
+            }
+            failed.info(Some(properties), || {
+                attempts.set(attempts.get() + 1);
+                anyhow::ensure!(write_ok, "write unavailable");
+                Ok(())
+            });
+            failed.info(Some(valid.dict()), || {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            });
+            failed.observe(ParamType::Profile, Some(matching));
+            assert_eq!(attempts.get(), expected_writes);
+            assert!(!failed.written.get());
+            assert!(failed.completion.failed());
+        }
+        assert!(profile_parameter(u32::MAX).is_err());
+        Ok(())
     }
 
     #[test]
