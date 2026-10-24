@@ -1134,17 +1134,21 @@ fn finalize_devices(
     defaults: &Defaults,
 ) -> Vec<AudioDevice> {
     for device in &mut devices {
-        device
-            .profiles
-            .sort_by_key(|profile| std::cmp::Reverse(profile.priority));
-        if let Some(device_endpoints) = endpoints.remove(&device.pipewire_id) {
-            let (internal, public): (Vec<_>, Vec<_>) = device_endpoints
-                .into_values()
-                .partition(|node| node.internal);
-            device.internal_endpoints = internal;
-            device.endpoints = public;
+        if let Some(nodes) = endpoints.remove(&device.pipewire_id) {
+            (device.internal_endpoints, device.endpoints) =
+                nodes.into_values().partition(|node| node.internal);
         }
-        for endpoint in &mut device.endpoints {
+        device.finalize(defaults);
+    }
+    devices.sort_by_cached_key(|device| (device.name.to_lowercase(), device.pipewire_id));
+    devices
+}
+
+impl AudioDevice {
+    fn finalize(&mut self, defaults: &Defaults) {
+        self.profiles
+            .sort_by_key(|profile| (std::cmp::Reverse(profile.priority), profile.index));
+        for endpoint in &mut self.endpoints {
             endpoint.is_default = endpoint.name
                 == match endpoint.kind {
                     EndpointKind::Sink => &defaults.sink,
@@ -1152,36 +1156,36 @@ fn finalize_devices(
                 }
                 .as_str();
         }
-        // Never let registry iteration order choose the compatibility endpoint.
-        device.endpoints.sort_by(|a, b| {
+        // The ID breaks ties even when PipeWire publishes duplicate node names.
+        self.endpoints.sort_by(|a, b| {
             b.is_default
                 .cmp(&a.is_default)
                 .then_with(|| b.priority.cmp(&a.priority))
                 .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.pipewire_id.cmp(&b.pipewire_id))
         });
-        [device.sink, device.source] = [EndpointKind::Sink, EndpointKind::Source].map(|kind| {
-            device
-                .endpoints
+        [self.sink, self.source] = [EndpointKind::Sink, EndpointKind::Source].map(|kind| {
+            self.endpoints
                 .iter()
                 .find(|node| node.kind == kind)
                 .cloned()
         });
-        let codecs: HashSet<_> = device
-            .endpoints
-            .iter()
-            .filter_map(|node| node.codec.as_deref())
-            .collect();
-        if codecs.len() == 1
-            && let Some(active) = device
+        if let Some(codec) = common_codec(&self.endpoints)
+            && let Some(active) = self
                 .profiles
                 .iter_mut()
-                .find(|profile| Some(profile.index) == device.active_profile)
+                .find(|profile| Some(profile.index) == self.active_profile)
         {
-            active.codec = codecs.into_iter().next().map(str::to_owned);
+            active.codec = Some(codec.to_owned());
         }
     }
-    devices.sort_by_key(|device| device.name.to_lowercase());
-    devices
+}
+
+// Unknown readings do not disagree; only a single known codec can refine a profile.
+fn common_codec(endpoints: &[AudioEndpoint]) -> Option<&str> {
+    let mut codecs = endpoints.iter().filter_map(|node| node.codec.as_deref());
+    let first = codecs.next()?;
+    codecs.all(|codec| codec == first).then_some(first)
 }
 
 /// Logical input/output direction; internal transport nodes are not selectable.
@@ -1277,13 +1281,14 @@ mod tests {
         let mut internal = endpoint(12, "transport");
         internal.internal = true;
         internal.priority = 9999;
+        internal.codec = Some("internal-only".into());
         let mut second = endpoint(11, "second");
         second.priority = 100;
         let mut endpoints = HashMap::from([(
             7,
             HashMap::from([(10, endpoint(10, "first")), (11, second), (12, internal)]),
         )]);
-        let result = finalize_devices(
+        let mut result = finalize_devices(
             vec![device],
             &mut endpoints,
             &Defaults {
@@ -1291,7 +1296,7 @@ mod tests {
                 source: String::new(),
             },
         );
-        let device = &result[0];
+        let mut device = result.pop().unwrap();
         assert_eq!(device.endpoints.len(), 2);
         assert_eq!(device.internal_endpoints.len(), 1);
         assert_eq!(device.sink.as_ref().unwrap().name, "first");
@@ -1301,19 +1306,84 @@ mod tests {
             device.endpoints[1].key("peer")
         );
         let state = super::ProbeState::default();
-        state.devices.borrow_mut().insert(7, device.clone());
         state.endpoints.borrow_mut().insert(
             7,
             device
                 .endpoints
-                .iter()
-                .map(|node| (node.pipewire_id, node.clone()))
+                .drain(..)
+                .map(|node| (node.pipewire_id, node))
                 .collect(),
         );
+        state.devices.borrow_mut().insert(7, device);
         state.remove(10);
         assert_eq!(state.endpoints.borrow()[&7].len(), 1);
         state.remove(7);
         assert!(state.devices.borrow().is_empty() && state.endpoints.borrow().is_empty());
+    }
+
+    #[test]
+    fn finalization_is_deterministic_and_only_refines_unambiguous_active_codecs() {
+        for (codecs, active, expected) in [
+            ([None, None, None], Some(2), "configured"),
+            ([Some("lc3"), None, Some("lc3")], Some(2), "lc3"),
+            ([Some("lc3"), Some("aac"), None], Some(2), "configured"),
+            ([Some("lc3"), None, None], None, "configured"),
+            ([Some("lc3"), None, None], Some(999), "configured"),
+        ] {
+            let mut device = audio_device();
+            device.active_profile = active;
+            device.profiles = vec![audio_profile(2, 10), audio_profile(1, 10)];
+            device.profiles[0].codec = Some("configured".into());
+            device.endpoints = codecs
+                .into_iter()
+                .enumerate()
+                .map(|(id, codec)| {
+                    let mut node = endpoint(id as u32, "same-name");
+                    node.codec = codec.map(Into::into);
+                    node.kind = [
+                        super::EndpointKind::Sink,
+                        super::EndpointKind::Sink,
+                        super::EndpointKind::Source,
+                    ][id];
+                    node
+                })
+                .collect();
+            let defaults = Defaults {
+                sink: "same-name".into(),
+                source: String::new(),
+            };
+            device.finalize(&defaults);
+            device.endpoints.reverse();
+            device.finalize(&defaults);
+            assert_eq!(
+                device.profiles.iter().map(|p| p.index).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert_eq!(device.profiles[1].codec.as_deref(), Some(expected));
+            assert_eq!(device.sink.as_ref().unwrap().pipewire_id, 0);
+            assert!(device.sink.as_ref().unwrap().is_default);
+            assert_eq!(device.source.as_ref().unwrap().pipewire_id, 2);
+            assert!(!device.source.as_ref().unwrap().is_default);
+        }
+        let mut first = audio_device();
+        first.pipewire_id = 1;
+        let ordered = finalize_devices(
+            vec![audio_device(), first],
+            &mut HashMap::new(),
+            &Defaults::default(),
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|device| device.pipewire_id)
+                .collect::<Vec<_>>(),
+            [1, 7]
+        );
+        assert!(
+            ordered
+                .iter()
+                .all(|device| device.sink.is_none() && device.source.is_none())
+        );
     }
 
     #[test]
