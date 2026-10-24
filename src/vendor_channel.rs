@@ -2,11 +2,7 @@
 //!
 //! BlueZ hands each stream over through a registered client profile; a
 //! reconciler requests it with ConnectProfile while the device is connected.
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -15,7 +11,10 @@ use bluer::{
     rfcomm::{Profile, ProfileHandle, ReqError, Role, Stream},
 };
 use futures::StreamExt;
-use tokio::sync::{Mutex, broadcast};
+use tokio::{
+    sync::{Mutex, broadcast},
+    time::Instant,
+};
 use uuid::Uuid;
 
 pub(crate) fn is_connection_busy(error: &anyhow::Error) -> bool {
@@ -56,12 +55,17 @@ pub(crate) trait Handler: Send + Sync + 'static {
 /// peer disconnects or a session stays up for a minute.
 #[derive(Default)]
 struct Links {
-    connecting: HashMap<Address, Instant>,
+    connecting: HashMap<Address, Attempt>,
     connected: HashMap<Address, Instant>,
     retry: HashMap<Address, Retry>,
+    next_attempt: u64,
 }
 
-#[derive(Clone, Copy)]
+struct Attempt {
+    id: u64,
+    started: Instant,
+}
+
 struct Retry {
     failures: u32,
     busy: u32,
@@ -69,21 +73,36 @@ struct Retry {
 }
 
 impl Links {
-    fn begin(&mut self, address: Address) -> bool {
+    fn begin(&mut self, address: Address) -> Option<u64> {
         let now = Instant::now();
-        let busy = self.connected.contains_key(&address)
-            || self
-                .connecting
-                .get(&address)
-                .is_some_and(|start| now.duration_since(*start) < STALE_CONNECT)
+        if self
+            .connecting
+            .get(&address)
+            .is_some_and(|attempt| now.duration_since(attempt.started) >= STALE_CONNECT)
+        {
+            // A successful ConnectProfile call is not a stream. Bound missing
+            // callbacks and back off, rather than retrying forever at a fixed rate.
+            self.connecting.remove(&address);
+            self.back_off(address);
+        }
+        if self.connected.contains_key(&address)
+            || self.connecting.contains_key(&address)
             || self
                 .retry
                 .get(&address)
-                .is_some_and(|retry| retry.after > now);
-        if !busy {
-            self.connecting.insert(address, now);
+                .is_some_and(|retry| retry.after > now)
+        {
+            return None;
         }
-        !busy
+        self.next_attempt = self.next_attempt.checked_add(1)?;
+        self.connecting.insert(
+            address,
+            Attempt {
+                id: self.next_attempt,
+                started: now,
+            },
+        );
+        Some(self.next_attempt)
     }
 
     fn accept(&mut self, address: Address) -> bool {
@@ -95,10 +114,15 @@ impl Links {
         true
     }
 
-    fn connect_failed(&mut self, address: Address, busy: bool) {
-        if self.connecting.remove(&address).is_none() {
+    fn connect_failed(&mut self, address: Address, attempt: u64, busy: bool) {
+        if self
+            .connecting
+            .get(&address)
+            .is_none_or(|current| current.id != attempt)
+        {
             return;
         }
+        self.connecting.remove(&address);
         let retry = self.retry_state(address);
         if busy && retry.busy < BUSY_RETRIES {
             retry.busy += 1;
@@ -119,6 +143,8 @@ impl Links {
 
     fn reset(&mut self, address: Address) {
         self.retry.remove(&address);
+        self.connecting.remove(&address);
+        // An accepted stream retains teardown ownership until its reader ends.
     }
 
     fn retry_state(&mut self, address: Address) -> &mut Retry {
@@ -132,7 +158,7 @@ impl Links {
     fn back_off(&mut self, address: Address) {
         let retry = self.retry_state(address);
         let delay = Duration::from_secs((15_u64 << retry.failures.min(5)).min(300));
-        retry.failures += 1;
+        retry.failures = retry.failures.saturating_add(1);
         retry.after = Instant::now() + delay;
     }
 }
@@ -235,8 +261,10 @@ impl Channels {
                     tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "{label} channel failed");
                 }
             }
-            channels.links.lock().await.ended(address);
+            // Clear the old handler's state before permitting a replacement
+            // stream; otherwise its delayed cleanup could erase the new state.
             handler.ended(address).await;
+            channels.links.lock().await.ended(address);
         });
     }
 
@@ -301,9 +329,9 @@ impl Channels {
 
     async fn ensure_connected(self: &Arc<Self>, device: Device) {
         let address = device.address();
-        if !self.links.lock().await.begin(address) {
+        let Some(attempt) = self.links.lock().await.begin(address) else {
             return;
-        }
+        };
         let channels = Arc::clone(self);
         self.tasks.spawn(self.spec.connect_task, async move {
             let label = channels.spec.label;
@@ -317,7 +345,7 @@ impl Channels {
             if let Err(error) = result {
                 tracing::warn!(%address, error = %error, error_chain = %format!("{error:#}"), "{label} connection failed");
                 let busy = is_connection_busy(&error);
-                channels.links.lock().await.connect_failed(address, busy);
+                channels.links.lock().await.connect_failed(address, attempt, busy);
             }
         });
     }
@@ -325,33 +353,112 @@ impl Channels {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUSY_RETRIES, Links};
+    use super::{BUSY_RETRIES, Duration, Instant, Links, STALE_CONNECT};
 
-    #[test]
-    fn links_back_off_failures_but_retry_busy_connections_quickly() {
+    #[tokio::test(start_paused = true)]
+    async fn links_bound_busy_retries_and_reset_only_after_a_stable_stream() {
         let peer = bluer::Address::default();
         let mut links = Links::default();
-        assert!(links.begin(peer));
-        assert!(!links.begin(peer), "an attempt is already in flight");
+        let mut attempt = links.begin(peer).unwrap();
+        assert!(links.begin(peer).is_none());
         for _ in 0..BUSY_RETRIES {
-            links.connect_failed(peer, true);
-            let retry = links.retry[&peer];
-            assert_eq!(retry.failures, 0);
-            assert!(retry.after <= std::time::Instant::now() + std::time::Duration::from_secs(1));
-            links.connecting.insert(peer, std::time::Instant::now());
+            links.connect_failed(peer, attempt, true);
+            assert_eq!(links.retry[&peer].failures, 0);
+            assert_eq!(
+                links.retry[&peer].after - Instant::now(),
+                Duration::from_secs(1)
+            );
+            assert!(links.begin(peer).is_none());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            attempt = links.begin(peer).unwrap();
         }
-        links.connect_failed(peer, true);
-        assert_eq!(links.retry[&peer].failures, 1, "busy budget is bounded");
-        assert!(!links.begin(peer), "backing off");
+        links.connect_failed(peer, attempt, true);
+        assert_eq!(links.retry[&peer].failures, 1);
+        assert!(links.begin(peer).is_none());
+        links.retry.get_mut(&peer).unwrap().failures = u32::MAX;
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let attempt = links.begin(peer).unwrap();
+        links.connect_failed(peer, attempt, false);
+        assert_eq!(links.retry[&peer].failures, u32::MAX);
+        assert_eq!(
+            links.retry[&peer].after - Instant::now(),
+            Duration::from_secs(300)
+        );
 
+        for (seconds, failures) in [(59, 2), (60, 1)] {
+            links.reset(peer);
+            let attempt = links.begin(peer).unwrap();
+            links.connect_failed(peer, attempt, false);
+            assert!(links.accept(peer));
+            tokio::time::advance(Duration::from_secs(seconds)).await;
+            assert!(
+                !links.accept(peer),
+                "duplicate acceptance must not restart stream age"
+            );
+            assert!(links.begin(peer).is_none());
+            links.ended(peer);
+            assert_eq!(links.retry[&peer].failures, failures);
+            links.connect_failed(peer, attempt, false);
+            assert_eq!(
+                links.retry[&peer].failures, failures,
+                "no attempt was in flight"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_and_disconnected_attempts_cannot_mutate_replacements_or_live_streams() {
+        let peer = bluer::Address::default();
+        let other = bluer::Address::new([1; 6]);
+        let mut links = Links::default();
+        let old = links.begin(peer).unwrap();
+        let unrelated = links.begin(other).unwrap();
+        tokio::time::advance(STALE_CONNECT - Duration::from_nanos(1)).await;
+        assert!(links.begin(peer).is_none());
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(links.begin(peer).is_none(), "missing stream must back off");
+        let after = links.retry[&peer].after;
+        assert_eq!(after - Instant::now(), Duration::from_secs(15));
+        assert!(links.begin(peer).is_none());
+        assert_eq!(
+            links.retry[&peer].after, after,
+            "polling must not postpone retry"
+        );
+        tokio::time::advance(after - Instant::now()).await;
+        let replacement = links.begin(peer).unwrap();
+        assert_ne!(replacement, old);
+        for busy in [false, true] {
+            links.connect_failed(peer, old, busy);
+            assert_eq!(links.connecting[&peer].id, replacement);
+            assert_eq!(links.retry[&peer].failures, 1);
+        }
         links.reset(peer);
-        assert!(links.begin(peer));
+        let current = links.begin(peer).unwrap();
+        assert_ne!(
+            current, replacement,
+            "same-clock reconnect needs a new generation"
+        );
+        links.connect_failed(peer, replacement, false);
+        assert_eq!(links.connecting[&peer].id, current);
+        assert_eq!(links.connecting[&other].id, unrelated);
+        assert!(!links.retry.contains_key(&peer));
         assert!(links.accept(peer));
-        assert!(!links.accept(peer), "one channel per peer");
-        assert!(!links.begin(peer));
+        links.connect_failed(peer, current, true);
+        links.reset(peer);
+        assert!(links.begin(peer).is_none(), "live reader owns teardown");
         links.ended(peer);
         assert_eq!(links.retry[&peer].failures, 1);
-        links.connect_failed(peer, false);
-        assert_eq!(links.retry[&peer].failures, 1, "no attempt was in flight");
+        links.connect_failed(other, unrelated, false);
+        assert_eq!(links.retry[&other].failures, 1);
+
+        let mut exhausted = Links {
+            next_attempt: u64::MAX,
+            ..Links::default()
+        };
+        assert!(
+            exhausted.begin(peer).is_none(),
+            "never wrap into an old generation"
+        );
+        assert!(exhausted.connecting.is_empty());
     }
 }
