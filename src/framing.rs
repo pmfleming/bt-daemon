@@ -45,6 +45,7 @@ where
     }
 }
 
+// Opening delimiter plus encoded body; the closing delimiter is not counted.
 const MAX_FRAME: usize = 4096;
 
 pub(crate) fn escape(
@@ -80,7 +81,10 @@ pub(crate) fn unescape(bytes: &[u8], escape: u8, decode: impl Fn(u8) -> u8) -> R
 }
 
 #[derive(Default)]
-pub(crate) struct DelimitedFrames(Vec<u8>);
+pub(crate) struct DelimitedFrames {
+    body: Vec<u8>,
+    open: bool,
+}
 
 impl DelimitedFrames {
     pub(crate) fn push<T>(
@@ -90,24 +94,62 @@ impl DelimitedFrames {
         label: &str,
         decode: impl Fn(&[u8]) -> Result<T>,
     ) -> Vec<Result<T>> {
-        self.0.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        while let Some(begin) = self.0.iter().position(|byte| *byte == start) {
-            self.0.drain(..begin);
-            let Some(close) = self.0[1..].iter().position(|byte| *byte == end) else {
-                if self.0.len() > MAX_FRAME {
-                    self.0.clear();
-                    frames.push(Err(anyhow!("{label} frame exceeds {MAX_FRAME} bytes")));
-                }
-                return frames;
-            };
-            // HDLC closing flags also open the next frame; consecutive flags are idle.
-            if start != end || close > 0 {
-                frames.push(decode(&self.0[1..=close]));
+        for &byte in bytes {
+            if !self.open {
+                self.open = byte == start;
+                continue;
             }
-            self.0.drain(..close + 1 + usize::from(start != end));
+            if byte == end {
+                // HDLC closing flags also open the next frame; consecutive flags are idle.
+                if start != end || !self.body.is_empty() {
+                    frames.push(decode(&self.body));
+                }
+                self.body.clear();
+                self.open = start == end;
+            } else if self.body.len() < MAX_FRAME - 1 {
+                self.body.push(byte);
+            } else {
+                self.body.clear();
+                self.open = false;
+                frames.push(Err(anyhow!("{label} frame exceeds {MAX_FRAME} bytes")));
+            }
         }
-        self.0.clear(); // Noise outside a frame does not carry over to the next read.
         frames
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DelimitedFrames, MAX_FRAME};
+
+    #[test]
+    fn limits_and_recovery_do_not_depend_on_chunking_or_delimiter_style() {
+        for markers @ (start, end) in [(0x3e, 0x3c), (0x7e, 0x7e)] {
+            for length in [MAX_FRAME - 2, MAX_FRAME - 1, MAX_FRAME, MAX_FRAME + 1] {
+                let wire = [vec![start], vec![0; length], vec![end]].concat();
+                for chunk_size in [1, 512, wire.len()] {
+                    let mut decoder = DelimitedFrames::default();
+                    let mut frames = Vec::new();
+                    for chunk in wire.chunks(chunk_size) {
+                        frames.extend(decoder.push(chunk, markers, "test", |body| Ok(body.len())));
+                        assert!(decoder.body.len() < MAX_FRAME);
+                    }
+                    assert_eq!(
+                        frames.len(),
+                        1,
+                        "markers={markers:?}, length={length}, chunk={chunk_size}"
+                    );
+                    assert_eq!(
+                        frames[0].as_ref().ok().copied(),
+                        (length < MAX_FRAME).then_some(length)
+                    );
+                    let recovered =
+                        decoder.push(&[start, 1, end], markers, "test", |body| Ok(body.to_vec()));
+                    assert_eq!(recovered.len(), 1);
+                    assert_eq!(recovered[0].as_ref().unwrap(), &[1]);
+                }
+            }
+        }
     }
 }

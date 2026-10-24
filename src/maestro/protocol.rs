@@ -559,8 +559,9 @@ mod tests {
             decoder.push(&[0x7e, 0x7e]).is_empty(),
             "idle flags are not packets"
         );
-        assert!(decoder.push(&[0; 4095]).is_empty());
-        assert!(decoder.push(&[0])[0].is_err(), "bound incomplete frames");
-        assert!(decoder.push(&frame)[0].is_ok(), "recover after overflow");
+        assert!(
+            decoder.push(&frame)[0].is_ok(),
+            "recover after invalid frames"
+        );
     }
 }

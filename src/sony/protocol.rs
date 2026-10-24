@@ -203,9 +203,6 @@ mod tests {
             decoder.push(&[0x3e, 0x3c])[0].is_err(),
             "empty Sony frames are invalid"
         );
-        assert!(decoder.push(&[0x3e]).is_empty());
-        assert!(decoder.push(&[0; 4095]).is_empty());
-        assert!(decoder.push(&[0])[0].is_err(), "bound incomplete frames");
         assert_eq!(
             decoder.push(&escaped)[0].as_ref().unwrap().payload,
             [0x3e, 0xef]
