@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bluer::{Address, Session, rfcomm::Stream};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{RwLock, broadcast, mpsc, oneshot},
 };
 
@@ -181,27 +181,20 @@ impl SonyControlProvider {
         }
     }
 
-    async fn read_session<R>(&self, address: Address, mut reader: R, link: &Link) -> Result<()>
+    async fn read_session<R>(&self, address: Address, reader: R, link: &Link) -> Result<()>
     where
         R: AsyncRead + Unpin,
     {
-        let mut bytes = [0_u8; 512];
         let mut decoder = FrameDecoder::default();
-        loop {
-            let count = reader
-                .read(&mut bytes)
-                .await
-                .context("read Sony control channel")?;
-            if count == 0 {
-                return Ok(());
-            }
-            for frame in decoder.push(&bytes[..count]) {
-                match frame {
-                    Ok(frame) => self.apply_frame(address, frame, link).await?,
-                    Err(error) => tracing::warn!(%address, %error, "ignored invalid Sony frame"),
-                }
-            }
+        let mut frames = crate::framing::Reader::new(
+            reader,
+            move |bytes| decoder.push(bytes),
+            |error| tracing::warn!(%address, %error, "ignored invalid Sony frame"),
+        );
+        while let Some(frame) = frames.next().await.context("read Sony control channel")? {
+            self.apply_frame(address, frame, link).await?;
         }
+        Ok(())
     }
 
     async fn apply_frame(&self, address: Address, frame: Frame, link: &Link) -> Result<()> {
@@ -340,21 +333,8 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, frame: Vec<u8>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{Command, protocol, write_session};
-    use protocol::{Frame, FrameDecoder};
-    use tokio::{
-        io::{AsyncReadExt, DuplexStream},
-        sync::{mpsc, oneshot},
-    };
-
-    async fn next_frame(remote: &mut DuplexStream, decoder: &mut FrameDecoder) -> Frame {
-        let mut bytes = [0_u8; 64];
-        loop {
-            let count = remote.read(&mut bytes).await.unwrap();
-            if let Some(frame) = decoder.push(&bytes[..count]).pop() {
-                return frame.unwrap();
-            }
-        }
-    }
+    use protocol::FrameDecoder;
+    use tokio::sync::{mpsc, oneshot};
 
     fn command(payload: &[u8]) -> (Command, oneshot::Receiver<anyhow::Result<()>>) {
         let (done, result) = oneshot::channel();
@@ -367,21 +347,26 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn writer_serializes_commands_on_acks_and_answers_headphone_messages() {
-        let (local, mut remote) = tokio::io::duplex(256);
+        let (local, remote) = tokio::io::duplex(256);
         let (commands, commands_rx) = mpsc::channel(4);
         let (acks, acks_rx) = mpsc::channel(4);
         let (acked, acked_rx) = mpsc::channel(4);
         let writer = tokio::spawn(write_session(local, commands_rx, acks_rx, acked_rx));
         let mut decoder = FrameDecoder::default();
+        let mut frames = crate::framing::Reader::new(
+            remote,
+            move |bytes| decoder.push(bytes),
+            |error| panic!("invalid outgoing frame: {error}"),
+        );
 
         let (query, queried) = command(&[0x66, 0x17]);
         commands.send(query).await.unwrap();
-        let frame = next_frame(&mut remote, &mut decoder).await;
+        let frame = frames.next().await.unwrap().unwrap();
         assert_eq!((frame.kind, frame.sequence), (protocol::COMMAND, 0));
         assert_eq!(frame.payload, [0x66, 0x17]);
         // A notification arriving before our ACK is acknowledged immediately.
         acks.send(0).await.unwrap();
-        let ack = next_frame(&mut remote, &mut decoder).await;
+        let ack = frames.next().await.unwrap().unwrap();
         assert_eq!((ack.kind, ack.sequence), (protocol::ACK, 1));
         acked.send(1).await.unwrap();
         queried.await.unwrap().unwrap();
@@ -389,11 +374,12 @@ mod tests {
         // The next command continues from the acknowledged sequence.
         let (set, unacknowledged) = command(&[0x68]);
         commands.send(set).await.unwrap();
-        let frame = next_frame(&mut remote, &mut decoder).await;
+        let frame = frames.next().await.unwrap().unwrap();
         assert_eq!(frame.sequence, 1);
         assert!(unacknowledged.await.unwrap().is_err());
 
         drop(commands);
         writer.await.unwrap().unwrap();
+        assert!(frames.next().await.unwrap().is_none());
     }
 }

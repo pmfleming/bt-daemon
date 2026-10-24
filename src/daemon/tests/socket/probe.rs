@@ -1,20 +1,30 @@
 //! Explicit, isolated acceptance experiment. Never starts a real Bluetooth backend.
-use super::*;
+use super::{Rig, daemon};
+use crate::daemon as api_daemon;
+use rustix::process::{Pid, Signal, kill_process_group};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, io::Read, path::Path, process::Stdio, time::Instant};
-use tokio::{io::AsyncReadExt, net::UnixListener, process::Command};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    path::Path,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::UnixListener,
+    process::Command,
+};
 
 // The leader remains owned/unreaped while armed. Never signal a process group
 // after wait has reaped its leader: a subsequently reused PID is not ours.
-struct ProbeGroup(Option<u32>);
+struct ProbeGroup(Option<Pid>);
 impl ProbeGroup {
     fn terminate(&mut self) {
         if let Some(pid) = self.0.take() {
-            // SAFETY: Command::process_group(0) created this child's private
-            // group; it contains only this fixture and its descendants.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+            let _ = kill_process_group(pid, Signal::KILL);
         }
     }
 }
@@ -130,7 +140,12 @@ async fn quickshell(root: &Path, runtime: &Path, bus: &str, mode: &str, path: &P
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let mut group = ProbeGroup(child.id());
+    let mut group = ProbeGroup(
+        child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(Pid::from_raw),
+    );
     let stdout = tokio::spawn(bounded_output(child.stdout.take().unwrap()));
     let stderr = tokio::spawn(bounded_output(child.stderr.take().unwrap()));
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait()).await;

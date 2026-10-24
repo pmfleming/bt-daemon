@@ -102,10 +102,10 @@ pub(super) fn advertisement(data: &[u8]) -> Option<Advertisement> {
     let mut capabilities = None;
     while let Some((&header, rest)) = fields.split_first() {
         let length = usize::from(header >> 4);
-        if length == 0 || rest.len() < length {
+        if length == 0 {
             return None;
         }
-        let (value, remaining) = rest.split_at(length);
+        let (value, remaining) = rest.split_at_checked(length)?;
         fields = remaining;
         let duplicate = match header & 0x0f {
             // Account-key filters (show/hide UI) are not discoverable Model IDs.

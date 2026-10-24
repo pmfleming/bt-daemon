@@ -34,7 +34,6 @@ mod audio_switch;
 mod capabilities;
 mod commands;
 mod retry;
-use crate::vendor_channel::is_connection_busy;
 use retry::RetryPolicy;
 mod keys;
 mod metadata;
@@ -245,7 +244,7 @@ fn decode_message_stream_psm(value: &[u8]) -> Result<PsmAvailability> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Frame {
     group: u8,
     code: u8,
@@ -380,10 +379,9 @@ fn select_transport(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkState {
     Connecting { attempt: u64, started: Instant },
-    Connected,
+    Connected(Instant),
 }
 
 #[derive(Default)]
@@ -391,7 +389,6 @@ struct ConnectionState {
     links: HashMap<Address, LinkState>,
     writers: HashMap<Address, mpsc::Sender<Vec<u8>>>,
     retry: RetryPolicy,
-    connected_since: HashMap<Address, Instant>,
     next_attempt: u64,
 }
 
@@ -439,12 +436,9 @@ impl ConnectionState {
     }
 
     fn ended(&mut self, address: Address) {
-        self.links.remove(&address);
+        let previous = self.links.remove(&address);
         self.writers.remove(&address);
-        if self
-            .connected_since
-            .remove(&address)
-            .is_some_and(|start| start.elapsed() >= Duration::from_secs(60))
+        if matches!(previous, Some(LinkState::Connected(start)) if start.elapsed() >= Duration::from_secs(60))
         {
             self.retry.reset_session(address);
         }
@@ -452,19 +446,19 @@ impl ConnectionState {
     }
 
     fn mark_connected(&mut self, address: Address) -> bool {
-        if self.links.get(&address) == Some(&LinkState::Connected) {
+        if matches!(self.links.get(&address), Some(LinkState::Connected(_))) {
             return false;
         }
-        self.links.insert(address, LinkState::Connected);
+        self.links
+            .insert(address, LinkState::Connected(Instant::now()));
         self.retry.connected(address);
-        self.connected_since.insert(address, Instant::now());
         true
     }
 
-    fn connection_failed(&mut self, address: Address, attempt: u64, busy: bool) {
+    fn connection_failed(&mut self, address: Address, attempt: u64, error: &anyhow::Error) {
         if self.is_current_attempt(address, attempt) {
             self.links.remove(&address);
-            self.retry.connection_failed(address, busy);
+            self.retry.connection_failed(address, error);
         }
     }
 }
@@ -1476,7 +1470,7 @@ impl FastPairBatteryProvider {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%address, ?transport, error = %error, error_chain = %format!("{error:#}"), "Fast Pair connection failed");
-                    provider.connections.lock().await.connection_failed(address, attempt, is_connection_busy(&error));
+                    provider.connections.lock().await.connection_failed(address, attempt, &error);
                     provider.retry_changed.notify_one();
                 }
             }

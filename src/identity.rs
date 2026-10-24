@@ -65,7 +65,7 @@ pub struct DeviceIdentityRegistry {
 impl DeviceIdentityRegistry {
     pub fn load_default() -> Result<Arc<Self>> {
         let path = state::directory()?.join("device-identities.json");
-        Self::load(Some(path))
+        Self::load(path)
     }
 
     #[cfg(test)]
@@ -79,12 +79,8 @@ impl DeviceIdentityRegistry {
         })
     }
 
-    fn load(path: Option<PathBuf>) -> Result<Arc<Self>> {
-        let stored: Option<RegistryFile> = path
-            .as_deref()
-            .map(|path| state::read_json(path, "identity registry"))
-            .transpose()?
-            .flatten();
+    fn load(path: PathBuf) -> Result<Arc<Self>> {
+        let stored: Option<RegistryFile> = state::read_json(&path, "identity registry")?;
         let state = match stored {
             Some(state) if state.version != REGISTRY_VERSION => bail!(
                 "unsupported Bluetooth identity registry version {}",
@@ -97,7 +93,7 @@ impl DeviceIdentityRegistry {
             },
         };
         Ok(Arc::new(Self {
-            writer: path.map(persistence::Writer::new).transpose()?,
+            writer: Some(persistence::Writer::new(path)?),
             state: Mutex::new(state),
         }))
     }
@@ -162,16 +158,12 @@ impl DeviceIdentityRegistry {
         battery: &[Battery],
     ) -> RememberedPresentationValues {
         let mut state = self.state();
-        let (changed, remembered) = {
-            let presentation = state
-                .presentations
-                .entry(device_key.to_string())
-                .or_default();
-            (
-                presentation.update(icon, model_id, battery),
-                presentation.values(),
-            )
-        };
+        let presentation = state
+            .presentations
+            .entry(device_key.to_string())
+            .or_default();
+        let changed = presentation.update(icon, model_id, battery);
+        let remembered = presentation.values();
         self.persist_if(changed, &state);
         remembered
     }
@@ -377,7 +369,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("identities.json");
         let address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let registry = DeviceIdentityRegistry::load(Some(path.clone())).unwrap();
+        for invalid in [r#"{"version":2,"devices":{}}"#, "invalid JSON"] {
+            fs::write(&path, invalid).unwrap();
+            assert!(DeviceIdentityRegistry::load(path.clone()).is_err());
+        }
+        fs::remove_file(&path).unwrap();
+        let registry = DeviceIdentityRegistry::load(path.clone()).unwrap();
         registry.register_adapter("hci0", "00:11:22:33:44:55");
         let key = registry.device_key("hci0", address);
         registry.flush().await.unwrap();
@@ -400,7 +397,7 @@ mod tests {
                 .unwrap()
                 .contains("AA:BB:CC:DD:EE:FF")
         );
-        let registry = DeviceIdentityRegistry::load(Some(path)).unwrap();
+        let registry = DeviceIdentityRegistry::load(path).unwrap();
         assert_eq!(key, registry.device_key("hci0", address));
         registry.register_adapter("hci1", "00:11:22:33:44:55");
         assert_eq!(key, registry.device_key("hci1", address));

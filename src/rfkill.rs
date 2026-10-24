@@ -77,3 +77,37 @@ fn read_bluetooth_state(root: impl AsRef<Path>) -> io::Result<(bool, bool, bool)
 fn read_flag(path: &Path) -> io::Result<bool> {
     Ok(fs::read_to_string(path)?.trim() == "1")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::read_bluetooth_state;
+    use std::fs;
+
+    #[test]
+    fn sysfs_aggregates_bluetooth_only_and_distinguishes_missing_from_unreadable()
+    -> std::io::Result<()> {
+        let root = tempfile::tempdir()?;
+        assert_eq!(read_bluetooth_state(root.path())?, (false, false, false));
+        for (name, kind, soft, hard) in [
+            ("a", "bluetooth\n", "1\n", "0\n"),
+            ("b", "bluetooth", "0", "1"),
+            ("wifi", "wlan", "1", "1"),
+        ] {
+            let path = root.path().join(name);
+            fs::create_dir(&path)?;
+            for (field, value) in [("type", kind), ("soft", soft), ("hard", hard)] {
+                fs::write(path.join(field), value)?;
+            }
+        }
+        fs::remove_file(root.path().join("wifi/soft"))?;
+        assert_eq!(read_bluetooth_state(root.path())?, (true, true, true));
+        fs::remove_file(root.path().join("b/hard"))?;
+        assert!(read_bluetooth_state(root.path()).is_err());
+        assert!(read_bluetooth_state(root.path().join("a/type")).is_err());
+        assert_eq!(
+            read_bluetooth_state(root.path().join("absent"))?,
+            (false, false, false)
+        );
+        Ok(())
+    }
+}

@@ -78,7 +78,7 @@ fn classify(kind: &str, icon: &str, earbuds: bool, services: &str) -> &'static s
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::classify;
     #[test]
     fn precedence_and_unknown_metadata_do_not_invent_device_types() {
         assert_eq!(classify("Headset", "", true, ""), "earbuds");

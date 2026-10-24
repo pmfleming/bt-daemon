@@ -3,6 +3,8 @@ use bluer::Address;
 use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
 
+use crate::vendor_channel::is_connection_busy;
+
 // A connection still settling in BlueZ gets at most 4.75s of quick retries.
 // Exhaustion falls back to the normal failure policy until a new/stable session.
 const BUSY_RETRY_MS: [u64; 6] = [250, 500, 1000, 1000, 1000, 1000];
@@ -52,9 +54,11 @@ impl RetryPolicy {
             peer.after = peer.after.filter(|deadline| *deadline > now);
         }
     }
-    pub fn connection_failed(&mut self, address: Address, busy: bool) {
+    pub fn connection_failed(&mut self, address: Address, error: &anyhow::Error) {
         let peer = self.0.entry(address).or_default();
-        if busy && let Some(&millis) = BUSY_RETRY_MS.get(peer.busy_attempts) {
+        if is_connection_busy(error)
+            && let Some(&millis) = BUSY_RETRY_MS.get(peer.busy_attempts)
+        {
             peer.busy_attempts += 1;
             peer.after = Some(Instant::now() + Duration::from_millis(millis));
         } else {
@@ -90,7 +94,6 @@ impl RetryPolicy {
 #[cfg(test)]
 mod tests {
     use super::{BUSY_RETRY_MS, RetryPolicy, wait_for_deadline};
-    use crate::vendor_channel::is_connection_busy;
     use bluer::Address;
     use futures::FutureExt;
     use std::time::Duration;
@@ -106,20 +109,15 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
-        let busy = is_connection_busy(
-            &anyhow::Error::new(bluer::Error {
-                kind: bluer::ErrorKind::Failed,
-                message: "br-connection-busy".into(),
-            })
-            .context("connect"),
-        );
-        retry.connection_failed(
-            other,
-            is_connection_busy(&anyhow::anyhow!("br-connection-busy")),
-        );
+        let busy = anyhow::Error::new(bluer::Error {
+            kind: bluer::ErrorKind::Failed,
+            message: "br-connection-busy".into(),
+        })
+        .context("connect");
+        retry.connection_failed(other, &anyhow::anyhow!("br-connection-busy"));
         let later = retry.next_deadline().unwrap();
         for _ in BUSY_RETRY_MS {
-            retry.connection_failed(peer, busy);
+            retry.connection_failed(peer, &busy);
             assert!(retry.next_deadline().unwrap() < later);
             assert!(!retry.ready(peer));
             wait_for_deadline(retry.next_deadline()).await;
@@ -129,13 +127,13 @@ mod tests {
             assert!(!retry.ready(other));
         }
         retry.reset_session(other);
-        retry.connection_failed(peer, true);
+        retry.connection_failed(peer, &busy);
         let delay = retry.next_deadline().unwrap() - Instant::now();
         let quick_limit = Duration::from_millis(*BUSY_RETRY_MS.iter().max().unwrap());
         assert!(delay > quick_limit);
         // A briefly connected stream must not replenish either retry budget.
         retry.connected(peer);
-        retry.connection_failed(peer, true);
+        retry.connection_failed(peer, &busy);
         let delay = retry.next_deadline().unwrap() - Instant::now();
         assert!(delay > quick_limit);
         // Expiry preserves failure history, but never creates an unbounded wait.
@@ -154,7 +152,7 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
-        retry.connection_failed(peer, true);
+        retry.connection_failed(peer, &busy);
         assert_eq!(
             retry.next_deadline(),
             Some(Instant::now() + Duration::from_millis(BUSY_RETRY_MS[0]))

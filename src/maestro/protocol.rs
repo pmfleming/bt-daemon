@@ -53,7 +53,7 @@ const fn id(name: &str) -> u32 {
     hash
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Packet {
     kind: u32,
     channel: u32,
@@ -459,14 +459,13 @@ mod tests {
         assert_eq!(&request[..4], [0x7e, 0x80, 0x4d, 0x03]);
         let decoded = decode_frame(&request[1..request.len() - 1]).unwrap();
         assert_eq!(
-            (
-                decoded.kind,
-                decoded.channel,
-                decoded.service,
-                decoded.method,
-                decoded.call
-            ),
-            (0, 26, MAESTRO_SERVICE, SUBSCRIBE_RUNTIME_INFO, 0)
+            decoded,
+            Packet {
+                channel: 26,
+                service: MAESTRO_SERVICE,
+                method: SUBSCRIBE_RUNTIME_INFO,
+                ..Packet::default()
+            }
         );
 
         for ignored in [
@@ -496,17 +495,12 @@ mod tests {
             (2, reading(100, 2)),
             (3, reading(100, 2)),
         ]));
-        let buds = Some(Reading {
-            level: 100,
-            charging: Some(true),
-        });
+        let observed = |level, charging| Some(Reading { level, charging });
+        let buds = observed(100, Some(true));
         assert_eq!(
             subscription_update(&docked, channel).unwrap(),
             Update::Batteries(Batteries {
-                case: Some(Reading {
-                    level: 43,
-                    charging: Some(false)
-                }),
+                case: observed(43, Some(false)),
                 left: buds,
                 right: buds,
             })
@@ -517,34 +511,24 @@ mod tests {
             panic!("expected a battery update");
         };
         assert_eq!(worn.case, None);
-        assert_eq!(
-            worn.right,
-            Some(Reading {
-                level: 88,
-                charging: None
-            })
-        );
+        assert_eq!(worn.right, observed(88, None));
 
         assert_eq!(
             subscription_update(&runtime_stream(vec![0x10, 0x01]), channel).unwrap(),
             Update::Ignored,
             "runtime info without battery_info"
         );
-        let other_channel = Packet {
-            channel: 21,
-            ..docked.clone()
-        };
+        let mut packet = docked;
+        packet.channel = 21;
         assert_eq!(
-            subscription_update(&other_channel, channel).unwrap(),
+            subscription_update(&packet, channel).unwrap(),
             Update::Ignored
         );
-        let ended = Packet {
-            kind: 5,
-            status: 12,
-            ..docked
-        };
+        packet.channel = channel.id;
+        packet.kind = 5;
+        packet.status = 12;
         assert_eq!(
-            subscription_update(&ended, channel).unwrap(),
+            subscription_update(&packet, channel).unwrap(),
             Update::Ended(12)
         );
         let invalid = runtime_stream(runtime_info(&[(1, reading(101, 1))]));
@@ -564,7 +548,7 @@ mod tests {
         let (first, rest) = stream.split_at(6);
         assert!(decoder.push(first).is_empty());
         let packets: Vec<_> = decoder.push(rest).into_iter().map(Result::unwrap).collect();
-        assert_eq!(packets, [packet.clone(), packet]);
+        assert_eq!(packets.iter().collect::<Vec<_>>(), [&packet, &packet]);
 
         let mut corrupt = frame.clone();
         corrupt[5] ^= 1;

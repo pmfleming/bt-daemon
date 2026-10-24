@@ -26,7 +26,7 @@ pub(super) const NC_ASM_NOTIFY: u8 = 0x69;
 const NC_ASM_TYPES: [u8; 2] = [0x15, 0x17];
 pub(super) const MODES: [&str; 3] = ["transparent", "off", "noise-cancelling"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct Frame {
     pub kind: u8,
     pub sequence: u8,
@@ -213,40 +213,37 @@ mod tests {
     }
 
     #[test]
-    fn nc_asm_reports_and_commands_match_wf_1000xm5() {
-        let state = decode_nc_asm(&XM5_NC).unwrap();
-        assert_eq!(state.active_mode(), Some("noise-cancelling"));
-        for (mode, expected) in [
-            ("transparent", [0x68, 0x17, 0x01, 0x01, 0x01, 0x00, 0x14]),
-            ("off", [0x68, 0x17, 0x01, 0x00, 0x00, 0x00, 0x14]),
-            (
-                "noise-cancelling",
-                [0x68, 0x17, 0x01, 0x01, 0x00, 0x00, 0x14],
-            ),
+    fn nc_asm_modes_preserve_layout_voice_and_level_and_reject_invalid_reports() {
+        for (report, active, tail) in [
+            (&XM5_NC[..], Some("noise-cancelling"), &[0, 20][..]),
+            (&[0x69, 0x17, 1, 1, 0, 3, 1, 10], None, &[2, 1, 10]),
+            (&[0x69, 0x17, 1, 1, 0, 5, 1, 10], None, &[2, 1, 10]),
+            (&[0x67, 0x15, 1, 0, 1, 0, 20], Some("off"), &[0, 20]),
         ] {
-            assert_eq!(nc_asm_payload(&state, mode).unwrap(), expected);
-            let mut echoed = expected;
-            echoed[0] = 0x69;
-            assert_eq!(decode_nc_asm(&echoed).unwrap().active_mode(), Some(mode));
+            let state = decode_nc_asm(report).unwrap();
+            assert_eq!(state.active_mode(), active);
+            for (mode, enabled, ambient) in [
+                ("transparent", 1, 1),
+                ("off", 0, 0),
+                ("noise-cancelling", 1, 0),
+            ] {
+                let mut expected = vec![0x68, report[1], 1, enabled, ambient];
+                expected.extend_from_slice(tail);
+                assert_eq!(nc_asm_payload(&state, mode).unwrap(), expected);
+                expected[0] = 0x69;
+                assert_eq!(decode_nc_asm(&expected).unwrap().active_mode(), Some(mode));
+            }
+            assert!(nc_asm_payload(&state, "adaptive").is_err());
         }
-        assert!(nc_asm_payload(&state, "adaptive").is_err());
-    }
-
-    #[test]
-    fn nc_asm_preserves_wind_layout_and_rejects_unknown_reports() {
-        let wind = decode_nc_asm(&[0x69, 0x17, 0x01, 0x01, 0x00, 0x03, 0x01, 0x0a]).unwrap();
-        assert_eq!(wind.active_mode(), None);
-        assert_eq!(
-            nc_asm_payload(&wind, "transparent").unwrap(),
-            [0x68, 0x17, 0x01, 0x01, 0x01, 0x02, 0x01, 0x0a]
-        );
         for invalid in [
-            &[0x67, 0x17, 0x01, 0x01, 0x00, 0x00][..],
-            &[0x67, 0x22, 0x01, 0x01, 0x00, 0x00, 0x14],
-            &[0x67, 0x17, 0x01, 0x02, 0x00, 0x00, 0x14],
-            &[0x67, 0x17, 0x01, 0x01, 0x00, 0x00, 0x15],
+            &[0x67, 0x17, 1, 1, 0, 0][..],
+            &[0x67, 0x22, 1, 1, 0, 0, 20],
+            &[0x67, 0x17, 1, 2, 0, 0, 20],
+            &[0x67, 0x17, 1, 1, 2, 0, 20],
+            &[0x67, 0x17, 1, 1, 0, 2, 20],
+            &[0x67, 0x17, 1, 1, 0, 0, 21],
         ] {
-            assert!(decode_nc_asm(invalid).is_err());
+            assert!(decode_nc_asm(invalid).is_err(), "accepted {invalid:?}");
         }
     }
 }

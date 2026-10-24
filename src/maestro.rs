@@ -4,13 +4,13 @@
 //! docked, but their Maestro runtime-info stream reports it whenever a bud is
 //! in the case. The case has no radio, so the last docked reading is kept for
 //! the rest of the session and marked as last-known.
-use std::{collections::HashMap, collections::VecDeque, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bluer::{Address, Session, rfcomm::Stream};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{RwLock, broadcast},
 };
 
@@ -20,7 +20,7 @@ use crate::{
 };
 
 mod protocol;
-use protocol::{Batteries, FrameDecoder, Packet, Reading, Update};
+use protocol::{Batteries, FrameDecoder, Reading, Update};
 
 const SOURCE: &str = "google-maestro";
 /// The buds announce their RPC channel as soon as the RFCOMM link opens.
@@ -166,10 +166,15 @@ where
     Fut: Future<Output = ()>,
 {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut packets = Packets::new(address, reader);
+    let mut decoder = FrameDecoder::default();
+    let mut packets = crate::framing::Reader::new(
+        reader,
+        move |bytes| decoder.push(bytes),
+        |error| tracing::debug!(%address, %error, "ignored invalid Maestro frame"),
+    );
     let channel = tokio::time::timeout(ANNOUNCE_TIMEOUT, async {
         loop {
-            let Some(packet) = packets.next().await? else {
+            let Some(packet) = packets.next().await.context("read Maestro channel")? else {
                 bail!("Maestro channel closed before announcing an RPC channel");
             };
             if let Some(channel) = protocol::announced_channel(&packet) {
@@ -185,7 +190,7 @@ where
         .context("write Maestro runtime-info subscription")?;
     writer.flush().await.context("flush Maestro subscription")?;
     tracing::debug!(%address, channel = channel.id, "subscribed to Maestro runtime info");
-    while let Some(packet) = packets.next().await? {
+    while let Some(packet) = packets.next().await.context("read Maestro channel")? {
         match protocol::subscription_update(&packet, channel) {
             Ok(Update::Batteries(batteries)) => store(batteries).await,
             Ok(Update::Ended(status)) => {
@@ -196,50 +201,6 @@ where
         }
     }
     Ok(())
-}
-
-/// Reads whole RPC packets, skipping corrupt frames.
-struct Packets<R> {
-    address: Address,
-    reader: R,
-    decoder: FrameDecoder,
-    pending: VecDeque<Packet>,
-}
-
-impl<R: AsyncRead + Unpin> Packets<R> {
-    fn new(address: Address, reader: R) -> Self {
-        Self {
-            address,
-            reader,
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
-    }
-
-    async fn next(&mut self) -> Result<Option<Packet>> {
-        let mut bytes = [0_u8; 512];
-        loop {
-            if let Some(packet) = self.pending.pop_front() {
-                return Ok(Some(packet));
-            }
-            let count = self
-                .reader
-                .read(&mut bytes)
-                .await
-                .context("read Maestro channel")?;
-            if count == 0 {
-                return Ok(None);
-            }
-            for packet in self.decoder.push(&bytes[..count]) {
-                match packet {
-                    Ok(packet) => self.pending.push_back(packet),
-                    Err(error) => {
-                        tracing::debug!(address = %self.address, %error, "ignored invalid Maestro frame")
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -311,54 +272,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_subscribes_on_the_announced_channel_and_stores_reports() {
-        let (local, mut remote) = tokio::io::duplex(1024);
-        let (stored_tx, mut stored) = tokio::sync::mpsc::unbounded_channel();
-        let session = tokio::spawn(subscribe(
-            bluer::Address::default(),
-            local,
-            move |batteries| {
-                let stored_tx = stored_tx.clone();
-                async move {
-                    let _ = stored_tx.send(batteries);
-                }
-            },
-        ));
-
-        // Unrelated traffic before the announcement is skipped.
-        let unrelated = fixtures::runtime_stream(Vec::new());
-        remote
-            .write_all(&fixtures::frame(&unrelated))
-            .await
-            .unwrap();
-        let announcement = fixtures::announcement();
-        remote
-            .write_all(&fixtures::frame(&announcement))
-            .await
-            .unwrap();
-        let mut request = [0_u8; 64];
-        let count = remote.read(&mut request).await.unwrap();
-        let channel = protocol::announced_channel(&announcement).unwrap();
-        assert_eq!(request[..count], protocol::subscribe_runtime_info(channel));
-
-        let docked = fixtures::runtime_info(&[(1, fixtures::reading(43, 1))]);
-        remote
-            .write_all(&fixtures::frame(&fixtures::runtime_stream(docked)))
-            .await
-            .unwrap();
-        assert_eq!(stored.recv().await.unwrap().case, reading(43, false));
-
-        drop(remote);
-        session.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn session_fails_when_the_buds_close_before_announcing() {
+    async fn session_requires_an_announcement_and_drains_reports_before_eof() {
         let (local, remote) = tokio::io::duplex(64);
         drop(remote);
         let error = subscribe(bluer::Address::default(), local, |_| async {})
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("before announcing"));
+
+        let (local, mut remote) = tokio::io::duplex(1024);
+        let (stored_tx, mut stored) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(subscribe(
+            bluer::Address::default(),
+            local,
+            move |batteries| {
+                let _ = stored_tx.send(batteries);
+                std::future::ready(())
+            },
+        ));
+
+        // One read can contain corrupt/unrelated frames, the announcement, and
+        // a report. The reader must retain the report across the subscription write.
+        let announcement = fixtures::announcement();
+        let docked = fixtures::runtime_info(&[(1, fixtures::reading(43, 1))]);
+        let mut traffic = vec![0x7e, 0x01, 0x7e];
+        for packet in [
+            fixtures::runtime_stream(Vec::new()),
+            announcement,
+            fixtures::runtime_stream(docked),
+        ] {
+            traffic.extend(fixtures::frame(&packet));
+        }
+        remote.write_all(&traffic).await.unwrap();
+        let mut request = [0_u8; 64];
+        let count = remote.read(&mut request).await.unwrap();
+        let channel = protocol::announced_channel(&fixtures::announcement()).unwrap();
+        assert_eq!(request[..count], protocol::subscribe_runtime_info(channel));
+
+        drop(remote);
+        session.await.unwrap().unwrap();
+        assert_eq!(stored.recv().await.unwrap().case, reading(43, false));
+        assert!(
+            stored.recv().await.is_none(),
+            "exactly one report before EOF"
+        );
     }
 }

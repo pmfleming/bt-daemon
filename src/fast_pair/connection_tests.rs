@@ -6,6 +6,14 @@ use bluer::Address;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+fn busy_error() -> anyhow::Error {
+    bluer::Error {
+        kind: bluer::ErrorKind::InProgress,
+        message: String::new(),
+    }
+    .into()
+}
+
 #[tokio::test(start_paused = true)]
 async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_stable_streams() {
     let peer = Address::default();
@@ -46,7 +54,7 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
         assert!(state.begin(peer, ble).is_none());
         let attempt = state.begin(peer, rfcomm).unwrap();
         assert!(state.begin(peer, rfcomm).is_none());
-        state.connection_failed(peer, attempt, false);
+        state.connection_failed(peer, attempt, &anyhow::anyhow!("failed"));
         assert!(!state.retry.ready(peer));
         assert!(state.retry.ready(other));
         tokio::time::advance(Duration::from_secs(360)).await;
@@ -55,7 +63,7 @@ async fn connection_lifecycle_scopes_failures_and_resets_suppression_only_after_
         assert!(state.retry.ready(peer));
         let (writer, mut receiver) = mpsc::channel(1);
         state.writers.insert(peer, writer);
-        state.connection_failed(peer, attempt, true); // A late busy failure must not tear down a live stream.
+        state.connection_failed(peer, attempt, &busy_error()); // A late busy failure must not tear down a live stream.
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -99,7 +107,7 @@ async fn successful_profile_call_without_stream_expires_with_backoff() {
     tokio::time::advance(deadline - tokio::time::Instant::now()).await;
     let new = state.begin(peer, MessageStreamTransport::Rfcomm).unwrap();
     assert_ne!(new, old);
-    state.connection_failed(peer, old, true);
+    state.connection_failed(peer, old, &busy_error());
     assert!(!state.connect_completed(peer, old));
     assert!(state.is_current_attempt(peer, new));
     assert!(state.mark_connected(peer));
@@ -124,7 +132,7 @@ async fn disconnect_clears_pending_attempts_and_fences_late_results() {
     // No time advance: attempt identity cannot just be a timestamp.
     let new = state.begin(peer, MessageStreamTransport::L2cap).unwrap();
     assert_ne!(old, new);
-    state.connection_failed(peer, old, false);
+    state.connection_failed(peer, old, &anyhow::anyhow!("failed"));
     assert!(!state.connect_completed(peer, old));
     assert!(state.is_current_attempt(peer, new));
     assert!(state.is_current_attempt(other, unrelated));

@@ -1159,16 +1159,13 @@ fn finalize_devices(
                 .then_with(|| b.priority.cmp(&a.priority))
                 .then_with(|| a.name.cmp(&b.name))
         });
-        device.sink = device
-            .endpoints
-            .iter()
-            .find(|node| node.kind == EndpointKind::Sink)
-            .cloned();
-        device.source = device
-            .endpoints
-            .iter()
-            .find(|node| node.kind == EndpointKind::Source)
-            .cloned();
+        [device.sink, device.source] = [EndpointKind::Sink, EndpointKind::Source].map(|kind| {
+            device
+                .endpoints
+                .iter()
+                .find(|node| node.kind == kind)
+                .cloned()
+        });
         let codecs: HashSet<_> = device
             .endpoints
             .iter()

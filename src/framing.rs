@@ -1,5 +1,49 @@
 //! Shared byte-stuffing and delimiter handling; payload validation stays vendor-specific.
 use anyhow::{Context, Result, anyhow};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+/// Buffers decoded messages across reads. Corrupt frames are reported and skipped;
+/// transport errors propagate, and queued messages are delivered before EOF.
+/// Keeping the decoder and error policy in the caller preserves vendor semantics.
+pub(crate) struct Reader<R, T, D, E> {
+    reader: R,
+    decode: D,
+    invalid: E,
+    pending: std::vec::IntoIter<Result<T>>,
+}
+
+impl<R, T, D, E> Reader<R, T, D, E>
+where
+    R: AsyncRead + Unpin,
+    D: FnMut(&[u8]) -> Vec<Result<T>>,
+    E: FnMut(anyhow::Error),
+{
+    pub(crate) fn new(reader: R, decode: D, invalid: E) -> Self {
+        Self {
+            reader,
+            decode,
+            invalid,
+            pending: Vec::new().into_iter(),
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<T>> {
+        let mut bytes = [0_u8; 512];
+        loop {
+            if let Some(frame) = self
+                .pending
+                .find_map(|frame| frame.map_err(&mut self.invalid).ok())
+            {
+                return Ok(Some(frame));
+            }
+            let count = self.reader.read(&mut bytes).await?;
+            if count == 0 {
+                return Ok(None);
+            }
+            self.pending = (self.decode)(&bytes[..count]).into_iter();
+        }
+    }
+}
 
 const MAX_FRAME: usize = 4096;
 

@@ -239,8 +239,11 @@ fn device_snapshot(pairing: &PairingBroker, device: audio::AudioDevice) -> Optio
     Some(json!(crate::model::audio_wire::Device {
         endpoints: device
             .endpoints
-            .iter()
-            .map(|node| node_snapshot(node, node.key(&device_key)))
+            .into_iter()
+            .map(|node| {
+                let key = node.key(&device_key);
+                node_snapshot(node, key)
+            })
             .collect(),
         sink: endpoint_snapshot(&device_key, "sink", device.sink),
         source: endpoint_snapshot(&device_key, "source", device.source),
@@ -255,19 +258,19 @@ fn endpoint_snapshot(
     kind: &str,
     endpoint: Option<audio::AudioEndpoint>,
 ) -> Option<crate::model::audio_wire::Endpoint> {
-    endpoint.map(|endpoint| node_snapshot(&endpoint, audio::endpoint_key(device_key, kind)))
+    endpoint.map(|endpoint| node_snapshot(endpoint, audio::endpoint_key(device_key, kind)))
 }
 
 fn node_snapshot(
-    endpoint: &audio::AudioEndpoint,
+    endpoint: audio::AudioEndpoint,
     key: String,
 ) -> crate::model::audio_wire::Endpoint {
     crate::model::audio_wire::Endpoint {
         key,
         kind: endpoint.kind,
-        codec: endpoint.codec.clone(),
+        codec: endpoint.codec,
         ready: !matches!(endpoint.state.as_str(), "creating" | "error"),
-        state: endpoint.state.clone(),
+        state: endpoint.state,
         is_default: endpoint.is_default,
     }
 }
