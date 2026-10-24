@@ -2,6 +2,7 @@
 use super::{AgentManager, Bus, Process};
 use std::{
     collections::HashMap,
+    os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -120,6 +121,8 @@ impl Psm {
 #[tokio::test]
 async fn cached_rfcomm_profiles_connect_without_service_resolution_but_ble_waits() {
     let state = tempfile::tempdir().unwrap();
+    // The socket listener enforces the XDG runtime directory contract.
+    std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let bus = Bus::new();
     let calls = Calls::default();
     let psm_reads = Arc::new(AtomicUsize::new(0));
@@ -173,7 +176,7 @@ async fn cached_rfcomm_profiles_connect_without_service_resolution_but_ble_waits
             .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
             .env("BT_DAEMON_STATE_DIR", state.path())
             .env_remove("BT_DAEMON_OBEX_INCOMING")
-            .env("XDG_RUNTIME_DIR", state.path())
+            .env("XDG_RUNTIME_DIR", state.path().canonicalize().unwrap())
             .env("PIPEWIRE_REMOTE", "bt-daemon-test-no-server")
             .env("RUST_LOG", "error")
             .stdout(Stdio::null())

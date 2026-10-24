@@ -1,5 +1,6 @@
 //! End-to-end regressions on a private bus, with no host BlueZ or PipeWire access.
 use std::{
+    os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -83,6 +84,8 @@ async fn snapshot_when(proxy: &Proxy<'_>, predicate: impl Fn(&Value) -> bool) ->
 async fn startup_recovery_and_policy_changes_reach_existing_clients() {
     for initially_present in [false, true] {
         let state = tempfile::tempdir().unwrap();
+        // The socket listener enforces the XDG runtime directory contract.
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let bus = Bus::new();
         let address = bus.address.as_str();
         let incoming_registrations = Arc::new(AtomicUsize::new(0));
@@ -112,7 +115,7 @@ async fn startup_recovery_and_policy_changes_reach_existing_clients() {
                 .env("DBUS_SYSTEM_BUS_ADDRESS", address)
                 .env("BT_DAEMON_STATE_DIR", state.path())
                 .env_remove("BT_DAEMON_OBEX_INCOMING")
-                .env("XDG_RUNTIME_DIR", state.path())
+                .env("XDG_RUNTIME_DIR", state.path().canonicalize().unwrap())
                 .env("PIPEWIRE_REMOTE", "bt-daemon-test-no-server")
                 .env("RUST_LOG", "error")
                 .stdout(Stdio::null())
