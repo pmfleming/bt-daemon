@@ -193,8 +193,11 @@ enum Value<'a> {
 fn fields(mut bytes: &[u8]) -> Result<Vec<(u32, Value<'_>)>> {
     let mut fields = Vec::new();
     while !bytes.is_empty() {
-        let key = read_varint(&mut bytes)?;
-        let field = u32::try_from(key >> 3).context("protobuf field number is too large")?;
+        // A protobuf key has a 29-bit, nonzero field number and a 3-bit wire type.
+        let key =
+            u32::try_from(read_varint(&mut bytes)?).context("protobuf field key is too large")?;
+        let field = key >> 3;
+        ensure!(field != 0, "protobuf field number is zero");
         let value = match key & 0x07 {
             0 => Value::Varint(read_varint(&mut bytes)?),
             1 => {
@@ -215,25 +218,27 @@ fn fields(mut bytes: &[u8]) -> Result<Vec<(u32, Value<'_>)>> {
 }
 
 fn take<'a>(bytes: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
-    ensure!(bytes.len() >= length, "protobuf field is truncated");
-    let (taken, rest) = bytes.split_at(length);
+    let (taken, rest) = bytes
+        .split_at_checked(length)
+        .context("protobuf field is truncated")?;
     *bytes = rest;
     Ok(taken)
 }
 
 fn read_varint(bytes: &mut &[u8]) -> Result<u64> {
     let mut value = 0_u64;
-    for shift in (0..64).step_by(7) {
-        let (&byte, rest) = bytes
-            .split_first()
-            .context("protobuf varint is truncated")?;
-        *bytes = rest;
+    for shift in (0..63).step_by(7) {
+        let byte = take(bytes, 1)?[0];
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
         }
     }
-    bail!("protobuf varint is too long")
+    // Only bit 63 remains. Shifting a larger tenth byte would silently discard
+    // its high bits and could turn malformed input into a valid battery/packet.
+    let last = take(bytes, 1)?[0];
+    ensure!(last <= 1, "protobuf varint exceeds u64");
+    Ok(value | (u64::from(last) << 63))
 }
 
 fn put_varint(bytes: &mut Vec<u8>, mut value: u64) {
@@ -429,6 +434,47 @@ mod tests {
         fixtures::{announcement, frame, reading, runtime_info, runtime_stream},
         id, subscribe_runtime_info, subscription_update,
     };
+
+    #[test]
+    fn protobuf_boundaries_reject_overflow_without_rejecting_unknown_fields() {
+        for value in [0, 127, 128, u64::from(u32::MAX), u64::MAX] {
+            let mut bytes = Vec::new();
+            super::put_varint(&mut bytes, value);
+            let mut input = bytes.as_slice();
+            assert_eq!(super::read_varint(&mut input).unwrap(), value);
+            assert!(input.is_empty());
+        }
+        for last in [2, 127, 128, 255] {
+            let mut invalid = vec![0x08]; // packet kind
+            invalid.extend([0x80; 9]);
+            invalid.push(last);
+            let frames = FrameDecoder::default().push(&encode_frame(1, &invalid));
+            assert!(frames[0].is_err(), "accepted overflowing tenth byte {last}");
+        }
+        for invalid in [
+            &[0, 0][..],                        // field zero
+            &[0x80, 0x80, 0x80, 0x80, 0x10, 0], // field 2^29
+            &[0x08, 0x80],                      // truncated varint
+            &[0x1d, 0, 0, 0],                   // truncated fixed32
+            &[0x41, 0, 0],                      // truncated unknown fixed64
+            &[0x2a, 3, 1, 2],                   // truncated bytes
+            &[0x0b],
+            &[0x0c],
+            &[0x0e],
+            &[0x0f], // unsupported wire types
+        ] {
+            assert!(
+                super::decode_packet(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        // Unknown fixed64 and the largest legal field number are skipped, not
+        // rejected; a non-minimal but in-range varint remains compatible.
+        let valid = [
+            0x41, 0, 0, 0, 0, 0, 0, 0, 0, 0xf8, 0xff, 0xff, 0xff, 0x0f, 0, 0x08, 0x80, 0,
+        ];
+        assert_eq!(super::decode_packet(&valid).unwrap(), Packet::default());
+    }
 
     #[test]
     fn ids_and_checksums_match_pw_rpc_and_pw_hdlc() {
