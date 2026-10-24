@@ -23,7 +23,9 @@ the cross-daemon stream revision contract and wider rollout remain unfinished.
 opaque publisher epoch and an exact positive state revision. Their cached snapshot
 RPCs capture the same value/watermark atomically, including loading/unavailable
 errors. Each publisher is independent; unchanged observations do not advance and
-watch coalescing may skip revisions. Counter exhaustion starts a fresh epoch at 1.
+watch coalescing may skip revisions. Counter exhaustion starts a fresh epoch at 1
+with `previous_epoch` naming its predecessor, retained for that epoch so even a
+coalesced rollover can be verified. Unrelated/retired epochs cannot replace it.
 Mutation acknowledgements and embedded operation/scan snapshots are **not** part
 of this publication order: consumers must reconcile through the authoritative
 watch/read rather than overwrite live state with those observations. Old clients

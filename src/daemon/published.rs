@@ -9,6 +9,8 @@ pub(super) const MAX_REVISION: u64 = (1_u64 << 53) - 1;
 pub(super) struct Watermark {
     epoch: String,
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_epoch: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -24,6 +26,7 @@ impl<T> Published<T> {
             watermark: Watermark {
                 epoch: uuid::Uuid::new_v4().to_string(),
                 revision: 1,
+                previous_epoch: None,
             },
         }
     }
@@ -47,6 +50,10 @@ impl<T: PartialEq> Published<T> {
                 return false;
             }
             if current.watermark.revision == MAX_REVISION {
+                // A coalescing watch may skip the final revision of the old
+                // epoch. Explicit lineage allows that transition without
+                // accepting an unrelated or retired epoch from a late read.
+                current.watermark.previous_epoch = Some(current.watermark.epoch.clone());
                 current.watermark.epoch = uuid::Uuid::new_v4().to_string();
                 current.watermark.revision = 1;
             } else {
@@ -107,5 +114,10 @@ mod tests {
         assert_eq!(next["error"]["code"], "bluez-unavailable");
         assert_eq!(next["data"]["state"]["revision"], 1);
         assert_ne!(next["data"]["state"]["epoch"], epoch);
+        assert_eq!(next["data"]["state"]["previous_epoch"], epoch);
+        Published::update(&sender, json!({"ok": true, "data": {"audio_devices": []}}));
+        let coalesced = sender.borrow().response();
+        assert_eq!(coalesced["data"]["state"]["revision"], 2);
+        assert_eq!(coalesced["data"]["state"]["previous_epoch"], epoch);
     }
 }
