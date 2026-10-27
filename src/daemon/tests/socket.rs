@@ -12,6 +12,8 @@ use tokio::{
     sync::oneshot,
 };
 
+mod late_owner;
+mod operation;
 mod probe;
 
 struct Rig {
@@ -259,7 +261,28 @@ async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let state = call(&mut b, "bluetooth.requests.snapshot", json!({})).await;
-            if state["data"]["requests"]["operations"]["active"] == json!([])
+            // Operation snapshots are now caller-private; a foreign empty list
+            // is not evidence of cleanup. Re-admission on the same device is.
+            let admitted = call(
+                &mut b,
+                "bluetooth.device.operation",
+                json!({"key":"device-socket", "operation":"connect"}),
+            )
+            .await;
+            if admitted["ok"] == true {
+                let peer_id = admitted["data"]["operation"]["request_id"]
+                    .as_str()
+                    .unwrap();
+                send(
+                    &mut b,
+                    json!({"op":"cancel", "id":"peer-cleanup", "request_id":peer_id}),
+                )
+                .await;
+                assert_eq!(next(&mut b).await["response"]["ok"], true);
+            } else {
+                assert_eq!(admitted["error"]["code"], "device-busy");
+            }
+            if admitted["ok"] == true
                 && state["data"]["requests"]["scans"]["active"]
                     .as_array()
                     .unwrap()

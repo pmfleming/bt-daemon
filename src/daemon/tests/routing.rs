@@ -30,6 +30,7 @@ async fn dispatch_validates_commands_and_routes_supported_methods() {
         "bluetooth.audio.setProfile",
         "bluetooth.audio.setDefault",
         "bluetooth.device.operation",
+        "bluetooth.operation.status",
         "bluetooth.setPowered",
         "bluetooth.adapter.operation",
         "bluetooth.device.policy.update",

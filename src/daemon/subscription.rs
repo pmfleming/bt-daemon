@@ -132,6 +132,7 @@ async fn start_target(
     tracing::info!(%subscription_id, %owner, ?streams, "subscription started");
     let response =
         api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string();
+    let operation_owner = owner.clone();
     let events = async move {
         let wants = |target| streams.iter().any(|stream| stream == target);
         let mut forwarders = JoinSet::new();
@@ -164,7 +165,16 @@ async fn start_target(
             audio_fields
         );
         forward!(PAIRING_STREAM, pairing_events);
-        forward!(OPERATION_STREAM, operation_events);
+        if wants(OPERATION_STREAM) {
+            forwarders.spawn(forward_events_filtered(
+                operation_events,
+                signal_emitter.clone(),
+                subscription_id.clone(),
+                OPERATION_STREAM,
+                |event| event.event,
+                move |event| event.visible_to(Some(&operation_owner)),
+            ));
+        }
         forward!(SCAN_STREAM, scan_events);
         forward!(OBEX_STREAM, obex_events);
         if let Some(Err(error)) = forwarders.join_next().await {
@@ -191,9 +201,37 @@ async fn forward_events<T>(
 ) where
     T: Clone + Send + Serialize + 'static,
 {
+    forward_events_filtered(
+        receiver,
+        emitter,
+        subscription_id,
+        stream,
+        event_name,
+        |_| true,
+    )
+    .await;
+}
+
+async fn forward_events_filtered<T>(
+    receiver: broadcast::Receiver<T>,
+    emitter: Target,
+    subscription_id: String,
+    stream: &'static str,
+    event_name: fn(&T) -> &str,
+    visible: impl Fn(&T) -> bool + Send + Sync + 'static,
+) where
+    T: Clone + Send + Serialize + 'static,
+{
     let emitter = &emitter;
+    let visible = &visible;
     let subscription_id = subscription_id.as_str();
     forward_broadcast(receiver, move |update| async move {
+        if let BroadcastEvent::Item(event) = &update
+            && !visible(event)
+        {
+            return;
+        }
+        // Broadcast lag is explicit loss, not a sequence after owner filtering.
         if let BroadcastEvent::Lagged(skipped) = &update {
             tracing::warn!(%subscription_id, %stream, skipped, "subscription events were dropped");
         }

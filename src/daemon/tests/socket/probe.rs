@@ -119,7 +119,15 @@ async fn quickshell(root: &Path, runtime: &Path, bus: &str, mode: &str, path: &P
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("RUST_LOG", "off")
         .args(["--no-color", "--path"])
-        .arg(root.join("tests/e2e/unix-jsonl.qml"))
+        .arg(root.join(if mode == "bt-operations" {
+            "tests/e2e/bluetooth-operations.qml"
+        } else {
+            "tests/e2e/unix-jsonl.qml"
+        }))
+        .env(
+            "SHELLLIST_BT_SOCKET",
+            if mode == "bt-operations" { "1" } else { "0" },
+        )
         .env("QML_IMPORT_PATH", root.join("qml"))
         .env("QML2_IMPORT_PATH", root.join("qml"))
         .env("QT_QPA_PLATFORM", "offscreen")
@@ -294,6 +302,60 @@ async fn native_qt_cases(root: &Path, rig: &mut Rig) -> Value {
         results.insert(mode.into(), result);
     }
     results.into()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "explicit private lifecycle probe: requires matching bt-daemon binary, Quickshell and Shelllist source"]
+async fn bluetooth_operation_recovery_probe() {
+    let root =
+        std::path::PathBuf::from(std::env::var_os("SHELLLIST_SOURCE").expect("SHELLLIST_SOURCE"));
+    let report_path = std::env::var_os("BT_OPERATION_REPORT").expect("BT_OPERATION_REPORT");
+    let mut rig = Rig::new().await;
+    let result = quickshell(
+        &root,
+        rig.directory.path(),
+        &rig.bus.address,
+        "bt-operations",
+        &rig.path(),
+    )
+    .await;
+    let counts = {
+        let interface = rig
+            .connection
+            .object_server()
+            .interface::<_, api_daemon::BluetoothDaemon>(api_daemon::OBJECT_PATH)
+            .await
+            .unwrap();
+        interface.get().await.operations.counts().await
+    };
+    let executable = quickshell_binary();
+    let report = json!({"scope":"two logical consumers on one private socket owner: aggregate active/terminal authority, same-device draft, owned cancellation and surviving-peer read; not OS-process crash or performance",
+        "result":result, "active_operations":counts.0, "retained_terminals":counts.1,
+        "quickshell":executable, "test_executable":std::env::current_exe().unwrap(),
+        "sha256":{"quickshell_launcher":hash(&executable), "test_executable":hash(&std::env::current_exe().unwrap()),
+            "qml_probe":hash(&root.join("tests/e2e/bluetooth-operations.qml")),
+            "recovery":hash(&root.join("bluetooth/BluetoothOperationRecovery.qml")),
+            "operation_controller":hash(&root.join("bluetooth/BluetoothOperationController.qml")),
+            "backend":hash(&root.join("bluetooth/BluetoothBackend.qml")),
+            "bindings":hash(&root.join("bluetooth/BtProtocol.generated.js"))}});
+    std::fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    rig.stop().await;
+    assert_eq!(
+        report["result"]["passed"], true,
+        "native lifecycle probe failed; see private report"
+    );
+    assert!(
+        report["result"]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("shared-owner-active-terminal-and-peer-release"),
+        "both consumers must finish the shared-owner authority checks"
+    );
+    assert_eq!(
+        counts,
+        (0, 1),
+        "exactly one admitted operation, no replay or orphan"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

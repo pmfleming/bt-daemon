@@ -77,7 +77,9 @@ const METHOD_REGISTRY: MethodRegistry = method_registry! {
     "bluetooth.audio.setDefault", r#"{"device_key":"device-opaque","endpoint_key":"audio-endpoint-opaque"}"#, "audio_devices", Some(stream::AUDIO),
     "Make a Bluetooth sink or source the PipeWire default.";
     "bluetooth.requests.snapshot", "{}", "requests", None,
-    "Recover active and recent request state after reconnect or event loss.";
+    "Recover caller-owned operations and current scan/pairing observations after reconnect or event loss. Absence is not an operation outcome.";
+    "bluetooth.operation.status", r#"{"request_id":"operation-opaque"}"#, "operation_status", None,
+    "Read caller-owned active or retained terminal device-operation status without replay. Terminal results retain at most 64 entries for five minutes; missing, foreign or expired IDs return request-not-found, never success.";
     "bluetooth.device.operation", r#"{"key":"device-opaque","operation":"connect","power_on":true,"trust":false,"wait_for_services":true}"#, "operation", Some(stream::OPERATION),
     "Start a cancellable staged device operation.";
     "bluetooth.pairing.respond", r#"{"request_id":"pairing-1","accept":true,"value":null}"#, "result", Some(stream::PAIRING),
@@ -142,6 +144,7 @@ fn parameter_contract(name: &str, encoded: &str) -> (Value, Value) {
 fn required_parameters(name: &str) -> &'static [&'static str] {
     match name {
         "bluetooth.setPowered" => &["powered"],
+        "bluetooth.operation.status" => &["request_id"],
         "bluetooth.adapter.operation" | "bluetooth.device.operation" => &["key", "operation"],
         "bluetooth.adapter.update" => &["key", "changes"],
         "bluetooth.device.policy.update" => &["key"],
@@ -299,6 +302,16 @@ pub fn registry() -> Value {
             "request_unknown_fields": "method-dependent",
             "response_unknown_fields": "ignore",
             "event_recovery_method": "bluetooth.requests.snapshot",
+            "operation_ordering": {
+                "status_method": "bluetooth.operation.status",
+                "identity": "never-reused-request-id",
+                "revision": "exact-positive-integer-per-operation",
+                "visibility": "caller-owned-receipts-status-snapshot-events",
+                "terminal_limit": 64,
+                "terminal_retention_ms": 300000,
+                "missing": "unknown-not-success-no-replay",
+                "cancellation": "worker-stopped-not-effect-rollback"
+            },
             "snapshot_ordering": {
                 "streams": [stream::CHANGED, stream::AUDIO],
                 "reads": ["bluetooth.snapshot", "bluetooth.audio.snapshot"],
@@ -361,6 +374,8 @@ fn fixture_from(encoded: &str) -> anyhow::Result<Value> {
             .context("serialize protocol event fixture")?;
         }
     }
+    fixture["operation_ordering"] = crate::daemon::operation_ordering_fixture();
+    fixture["operation_event"]["data"] = fixture["operation_ordering"]["completed"].clone();
     fixture["snapshot_ordering"] = crate::daemon::snapshot_ordering_fixture();
     fixture["snapshot"]["data"]["state"] =
         fixture["snapshot_ordering"]["old_read"]["data"]["state"].clone();
@@ -374,6 +389,49 @@ fn fixture_from(encoded: &str) -> anyhow::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{METHODS, STREAMS, VERSION, contract_fixture, registry};
+
+    #[test]
+    fn operation_fixture_keeps_status_read_only_and_owner_identity_private() {
+        use shelllist_daemon_tokio::CorrelationPolicy;
+
+        let fixture = contract_fixture().unwrap();
+        let ordering = &fixture["operation_ordering"];
+        let method = fixture["registry"]["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|method| method["name"] == "bluetooth.operation.status")
+            .unwrap();
+        assert_eq!(method["response_key"], "operation_status");
+        assert_eq!(method["cancellable"], false);
+        assert_eq!(
+            ordering["status"]["data"]["operation_status"],
+            fixture["operation_event"]["data"]
+        );
+        assert!(
+            crate::client::BluetoothCorrelation
+                .operation_id(&ordering["status"])
+                .is_none(),
+            "a status read must not register another accepted-work route"
+        );
+        for name in [
+            "queued",
+            "started",
+            "progress",
+            "completed",
+            "failed",
+            "cancelled",
+        ] {
+            let operation = &ordering[name];
+            assert!(
+                operation.get("owner").is_none(),
+                "{name} leaks owner identity"
+            );
+            assert_eq!(operation["request_id"], ordering["queued"]["request_id"]);
+            let revision = operation["revision"].as_u64().unwrap();
+            assert!((1..=(1_u64 << 53) - 1).contains(&revision));
+        }
+    }
 
     #[test]
     fn registry_preserves_the_wire_contract_and_rejects_invalid_examples() {

@@ -145,7 +145,7 @@ fn test_adapter(key: &str) -> Adapter {
     }
 }
 
-fn test_backend(
+pub(super) fn test_backend(
     complete: bool,
     fail_scan_stop: bool,
     scanning: ScanningCalls,
@@ -286,7 +286,12 @@ async fn operation_completion_and_cancellation_publish_one_recoverable_terminal_
         );
         assert!(!daemon.operations.cancel_owned(id, Some(":owner")).await);
         let response = daemon
-            .dispatch_call("bluetooth.requests.snapshot", json!({}), None, None)
+            .dispatch_call(
+                "bluetooth.requests.snapshot",
+                json!({}),
+                Some(":owner"),
+                None,
+            )
             .await;
         let recovered = &response["data"]["requests"]["operations"];
         assert_eq!(recovered["active"], json!([]));

@@ -85,15 +85,23 @@ impl BluetoothDaemon {
             }
             "bluetooth.requests.snapshot" => api::success(json!({
                 "requests": {
-                    "operations": self.operations.snapshot().await,
+                    "operations": self.operations.snapshot(owner).await,
                     "scans": self.scans.snapshot().await,
                     "pairing": { "active": self.pairing.pending_events() },
                 }
             })),
+            "bluetooth.operation.status" => self.operations.status(&params, owner).await,
             "bluetooth.device.operation" => {
-                self.operations
+                let response = self
+                    .operations
                     .start_owned(params, owner.map(str::to_owned))
-                    .await
+                    .await;
+                if response["ok"] == true
+                    && let (Some(owner), Some(connection)) = (owner, connection)
+                {
+                    self.watch_request_owner(connection, owner.to_owned()).await;
+                }
+                response
             }
             "bluetooth.snapshot" => self.snapshots.borrow().response(),
             "bluetooth.pairing.respond" => match self.pairing.respond(&params).await {
@@ -115,25 +123,42 @@ impl BluetoothDaemon {
         if response["ok"].as_bool() == Some(true)
             && let Some(connection) = connection
         {
-            self.watch_scan_owner(connection, owner.to_owned()).await;
+            self.watch_request_owner(connection, owner.to_owned()).await;
         }
         response
     }
 
-    async fn watch_scan_owner(&self, connection: &zbus::Connection, owner: String) {
+    async fn watch_request_owner(&self, connection: &zbus::Connection, owner: String) {
         let mut watches = self.scan_owner_watches.lock().await;
         if !watches.insert(owner.clone()) {
+            drop(watches);
+            // A previously admitted call can register after the existing
+            // loss task captured its cleanup IDs but before it removes this
+            // watch entry. Reconcile that late registration, failing closed
+            // if monitoring itself is unavailable.
+            if !self
+                .subscriptions
+                .owner_monitor(connection)
+                .has_owner(&owner)
+                .await
+                .unwrap_or(false)
+            {
+                self.operations.cancel_owner(&owner).await;
+                self.scans.stop_owner(&owner).await;
+            }
             return;
         }
         drop(watches);
         let scans = self.scans.clone();
+        let operations = Arc::clone(&self.operations);
         let watches = Arc::clone(&self.scan_owner_watches);
         let monitor = self.subscriptions.owner_monitor(connection);
-        self.tasks.spawn("scan-owner-watch", async move {
+        self.tasks.spawn("request-owner-watch", async move {
             if let Err(error) = monitor.wait(&owner).await {
-                tracing::warn!(%owner, %error, "scan owner monitoring failed; releasing scans");
+                tracing::warn!(%owner, %error, "request owner monitoring failed; cancelling owned requests");
             }
-            tracing::info!(%owner, "D-Bus owner disappeared; releasing its Bluetooth scans");
+            tracing::info!(%owner, "D-Bus owner disappeared; cancelling its Bluetooth requests");
+            operations.cancel_owner(&owner).await;
             scans.stop_owner(&owner).await;
             watches.lock().await.remove(&owner);
         });
@@ -352,6 +377,10 @@ pub async fn run(backend: Arc<dyn BluetoothBackend>, pairing: Arc<PairingBroker>
 
 pub(crate) fn snapshot_ordering_fixture() -> Value {
     subscription::snapshot_ordering_fixture()
+}
+
+pub(crate) fn operation_ordering_fixture() -> Value {
+    operation::ordering_fixture()
 }
 
 async fn receive_refresh(
