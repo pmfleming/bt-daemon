@@ -360,15 +360,35 @@ async fn lease_expiry_and_owner_loss_preserve_shared_adapters_until_the_last_sto
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_scan_stop_is_reported_and_remains_retryable() {
-    let scanning = Arc::new(StdMutex::new(Vec::new()));
-    let backend = test_backend(true, true, scanning);
-    let scans = ScanCoordinator::new(backend);
-    let response = start_scan(&scans, "adapter-1", 60_000).await;
-    let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
-
-    let stopped = scans.stop(Some(request_id), "cancelled").await;
-    assert_eq!(stopped["error"]["code"], "scan-stop-failed");
-    assert!(scans.contains(request_id).await);
+    for timeout in [false, true] {
+        let scanning = Arc::new(StdMutex::new(Vec::new()));
+        let scans = ScanCoordinator::new(test_backend(true, true, Arc::clone(&scanning)));
+        let response = start_scan(&scans, "adapter-1", if timeout { 1_000 } else { 60_000 }).await;
+        let request_id = response["data"]["scan"]["request_id"].as_str().unwrap();
+        let mut events = scans.subscribe();
+        if timeout {
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+            let terminal = events.recv().await.unwrap();
+            assert_eq!(terminal.request_id, request_id);
+            assert_eq!(
+                (terminal.event.as_str(), terminal.state.as_str()),
+                ("failed", "failed")
+            );
+            assert!(serde_json::to_value(terminal).unwrap()["error"].is_object());
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(stopped_calls(&scanning).len(), 2);
+        } else {
+            let stopped = scans.stop(Some(request_id), "cancelled").await;
+            assert_eq!(stopped["error"]["code"], "scan-stop-failed");
+        }
+        assert!(scans.contains(request_id).await);
+        assert!(
+            events.try_recv().is_err(),
+            "cleanup retries never publish another terminal"
+        );
+    }
 }

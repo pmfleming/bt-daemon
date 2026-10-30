@@ -108,3 +108,15 @@ sizes = 24 framing cases, each with recovery and a bounded-buffer assertion.
 Independent Sony/Maestro wire vectors and transport tests remain.
 `cargo test --locked --lib`: 83 passed, two probes ignored (`stage1-tests.log`).
 Formatting and `git diff --check` passed.
+
+## Improvement 2 — scan leases
+
+`select_scans` evaluates ownership/ID selection once per task and subtracts
+retained adapter leases after collecting borrowed keys. The deterministic sorted
+stop order is unchanged. The existing failure test now uses paused time and
+covers explicit failed stop, timeout failure, another cleanup attempt two seconds
+later, continued active-state retention and no duplicate terminal event.
+The independent shared-adapter/owner-loss matrix remains unchanged.
+`cargo test --locked --lib`: 83 passed, two probes ignored (`stage2-tests.log`).
+Formatting and diff checks passed. Additional failure evidence increases test LOC;
+this is not a claim of lower test volume or a measured throughput improvement.

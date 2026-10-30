@@ -315,27 +315,23 @@ fn select_scans(
     request_id: Option<&str>,
     owner: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
-    let selected = |id: &str, task: &ScanTask| {
-        request_id.is_none_or(|requested| requested == id)
-            && owner.is_none_or(|owner| task.event.owner == owner)
-    };
-    let retained = tasks
-        .iter()
-        .filter(|(id, task)| !selected(id, task))
-        .flat_map(|(_, task)| &task.event.adapter_keys)
-        .collect::<HashSet<_>>();
     let mut ids = Vec::new();
+    let mut retained = HashSet::new();
     let mut adapters = HashSet::new();
-    for (id, task) in tasks.iter().filter(|(id, task)| selected(id, task)) {
-        ids.push(id.clone());
-        adapters.extend(
-            task.event
-                .adapter_keys
-                .iter()
-                .filter(|key| !retained.contains(key)),
-        );
+    for (id, task) in tasks {
+        if request_id.is_none_or(|requested| requested == id)
+            && owner.is_none_or(|owner| task.event.owner == owner)
+        {
+            ids.push(id.clone());
+            adapters.extend(&task.event.adapter_keys);
+        } else {
+            retained.extend(&task.event.adapter_keys);
+        }
     }
-    let mut adapters = adapters.into_iter().cloned().collect::<Vec<_>>();
+    let mut adapters = adapters
+        .difference(&retained)
+        .map(|key| (*key).clone())
+        .collect::<Vec<_>>();
     adapters.sort(); // Stable ordering also makes the first backend failure deterministic.
     (ids, adapters)
 }
