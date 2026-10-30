@@ -71,3 +71,40 @@ revision-exhaustion and protocol-fixture tests own the behavioral evidence.
 Validation: `cargo test --locked --all-features` passed all 85 runnable tests
 (two probes ignored), strict all-target/all-feature Clippy passed, and formatting
 and `git diff --check` passed. Stage logs: `stage0-{tests,clippy}.log`.
+
+## Next five, ranked after the initial refactor
+
+1. **Framing state machine:** the fresh static extraction identifies `push` as
+   the largest production cognitive hotspot (11). Express the existing states
+   directly; retain both protocol decoders and the independent boundary matrix.
+2. **Scan lease selection and failure evidence:** selection currently evaluates
+   the same ownership predicate twice and scans tasks twice. Partition leased
+   adapters in one pass; strengthen the existing failed-stop owner with timeout
+   retries and single-terminal publication. Preserve overlapping leases.
+3. **Authenticated command reservations:** `fetch_add` can wrap the generation
+   token used by cancellation-safe Drop. Fail closed on exhaustion and use map
+   entries to avoid repeated lookup; retain timeout/write/ACK/cancellation rules.
+4. **Remote presentation text:** disconnect diagnostics and Audio Switch repeat
+   the same Unicode/control/bidi filter. Give that policy one model owner, retain
+   their distinct 256/128-character limits and invalid-UTF-8 behavior, and exercise
+   both real decoding paths. Do not apply it to filenames or trusted identities.
+5. **Credential persistence:** repository-wide caller inspection finds no caller
+   of `AccountKeyStore::load` with `None`. Remove the private no-path mode and
+   its write bypass, retaining public interfaces, atomic private writes and
+   transactional insert/replace/remove behavior. Extend the existing persistence
+   owner with malformed/unsupported stored credentials.
+
+These outrank cosmetic module movement, unrelated match-shaped clone reports and
+additional forwarding wrappers. Safety branches are retained even when their
+cyclomatic entry counts rise. No assertion or policy exclusion is removed.
+
+## Improvement 1 — framing
+
+`DelimitedFrames::push` now matches the closed/end/full/body states explicitly.
+End delimiters are still processed before the size bound; shared HDLC idle flags,
+Sony empty-frame rejection and the exact encoded-length limit are unchanged.
+The existing matrix covers 2 delimiter styles × 4 boundary lengths × 3 chunk
+sizes = 24 framing cases, each with recovery and a bounded-buffer assertion.
+Independent Sony/Maestro wire vectors and transport tests remain.
+`cargo test --locked --lib`: 83 passed, two probes ignored (`stage1-tests.log`).
+Formatting and `git diff --check` passed.

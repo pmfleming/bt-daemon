@@ -96,23 +96,22 @@ impl DelimitedFrames {
     ) -> Vec<Result<T>> {
         let mut frames = Vec::new();
         for &byte in bytes {
-            if !self.open {
-                self.open = byte == start;
-                continue;
-            }
-            if byte == end {
-                // HDLC closing flags also open the next frame; consecutive flags are idle.
-                if start != end || !self.body.is_empty() {
-                    frames.push(decode(&self.body));
+            match (self.open, byte) {
+                (false, byte) => self.open = byte == start,
+                (true, byte) if byte == end => {
+                    // HDLC closing flags also open the next frame; consecutive flags are idle.
+                    if start != end || !self.body.is_empty() {
+                        frames.push(decode(&self.body));
+                    }
+                    self.body.clear();
+                    self.open = start == end;
                 }
-                self.body.clear();
-                self.open = start == end;
-            } else if self.body.len() < MAX_FRAME - 1 {
-                self.body.push(byte);
-            } else {
-                self.body.clear();
-                self.open = false;
-                frames.push(Err(anyhow!("{label} frame exceeds {MAX_FRAME} bytes")));
+                (true, _) if self.body.len() >= MAX_FRAME - 1 => {
+                    self.body.clear();
+                    self.open = false;
+                    frames.push(Err(anyhow!("{label} frame exceeds {MAX_FRAME} bytes")));
+                }
+                (true, byte) => self.body.push(byte),
             }
         }
         frames
