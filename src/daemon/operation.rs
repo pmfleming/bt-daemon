@@ -63,18 +63,16 @@ impl OperationEvent {
         self.owner.as_deref() == owner
     }
 
-    fn with_state(mut self, event: &'static str, state: &'static str) -> Self {
+    fn set_state(&mut self, event: &'static str, state: &'static str) {
         self.revision += 1;
         self.event = event;
         self.state = state;
         self.stage = state;
-        self
     }
 
-    fn progress(&self, stage: &'static str) -> Self {
-        let mut update = self.clone().with_state("progress", "running");
-        update.stage = stage;
-        update
+    fn progress(&mut self, stage: &'static str) {
+        self.set_state("progress", "running");
+        self.stage = stage;
     }
 
     fn finished(mut self, result: anyhow::Result<crate::model::Snapshot>) -> Self {
@@ -87,7 +85,8 @@ impl OperationEvent {
         } else {
             "completed"
         };
-        self.with_state(terminal, terminal)
+        self.set_state(terminal, terminal);
+        self
     }
 }
 
@@ -160,12 +159,11 @@ impl OperationCoordinator {
             Err(error) => return api::error("validation-error", error.to_string()),
         };
         let mut state = self.state.lock().await;
-        let event = state
-            .active
+        let OperationState { active, recent } = &mut *state;
+        let event = active
             .get_owned(request_id, owner)
             .map(|task| &task.event)
-            .cloned()
-            .or_else(|| state.recent.get_owned(request_id, owner).cloned());
+            .or_else(|| recent.get_owned(request_id, owner));
         match event {
             // Deliberately distinct from an admission receipt: status reads must
             // not register/rebind accepted-work routes in the retained client.
@@ -240,13 +238,13 @@ impl OperationCoordinator {
         owner: Option<&str>,
     ) -> bool {
         let mut state = self.state.lock().await;
-        if state.active.get_owned(request_id, owner).is_none() {
-            return false;
-        }
-        let task = state
+        let Some(task) = state
             .active
             .get_mut(request_id)
-            .expect("checked owned task");
+            .filter(|task| task.event.visible_to(owner))
+        else {
+            return false;
+        };
         let Some(handle) = task.handle.take() else {
             return true; // Cancellation already owns the worker's terminal claim.
         };
@@ -262,10 +260,9 @@ impl OperationCoordinator {
             let mut state = coordinator.state.lock().await;
             if let Some(task) = state.active.claim(&id) {
                 tracing::info!(request_id = %id, "Bluetooth device operation cancelled; effects are not rolled back");
-                coordinator.retain_terminal(
-                    &mut state,
-                    task.value.event.with_state("cancelled", "cancelled"),
-                );
+                let mut event = task.value.event;
+                event.set_state("cancelled", "cancelled");
+                coordinator.retain_terminal(&mut state, event);
             }
             let _ = finished.send(());
         });
@@ -325,7 +322,7 @@ impl OperationCoordinator {
         let Some(task) = state.active.get_mut(&event.request_id) else {
             return false;
         };
-        task.event = task.event.clone().with_state("started", "running");
+        task.event.set_state("started", "running");
         let _ = self.events.send(task.event.clone());
         true
     }
@@ -343,7 +340,7 @@ impl OperationCoordinator {
                 && task.handle.is_some()
                 && task.event.revision < MAX_REVISION - 1
             {
-                task.event = task.event.progress(stage);
+                task.event.progress(stage);
                 let _ = coordinator.events.send(task.event.clone());
             }
         })
@@ -367,15 +364,18 @@ pub(super) fn ordering_fixture() -> Value {
         "connect",
         Some("fixture-owner".into()),
     );
-    let started = queued.clone().with_state("started", "running");
-    let progress = started.progress("connecting");
+    let mut started = queued.clone();
+    started.set_state("started", "running");
+    let mut progress = started.clone();
+    progress.progress("connecting");
     let completed = progress
         .clone()
         .finished(Ok(crate::model::Snapshot::default()));
     let failed = progress
         .clone()
         .finished(Err(anyhow::anyhow!("fixture failure")));
-    let cancelled = progress.clone().with_state("cancelled", "cancelled");
+    let mut cancelled = progress.clone();
+    cancelled.set_state("cancelled", "cancelled");
     json!({"queued": queued, "started": started, "progress": progress, "completed": completed,
         "failed": failed, "cancelled": cancelled, "status": api::success(json!({"operation_status": completed}))})
 }
