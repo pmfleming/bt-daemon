@@ -1,0 +1,291 @@
+{
+  "baseline_sha": "8fe2f64d8528b66289548af0c1ea5238d9247195",
+  "scope": {
+    "static": "Authored functions under src; unexpanded macros make these advisory.",
+    "physical_loc": "src + test_support; cfg(test) modules/files and individual test-gated helpers counted as test code.",
+    "coverage": "Executed LLVM totals, including inline tests; branch coverage unavailable.",
+    "dependency_source": "Same frozen framework capture in both runs; no Git history."
+  },
+  "identity": {
+    "evaluator_sha256": "423a8b2f8222b9840871efdabc82f29e700a949ba5d83cfd7f8c3c27386f0158",
+    "rqlens_toml_sha256": "aac4a80902e3222faeadc1a7350fddf34f6eabf03d4dbe06150e3bbf7e762512",
+    "helper_digest": "86462b346ebcd322",
+    "config_digest": "216c43f77027d2d1",
+    "source_digests": {
+      "baseline": "6b993c60e5ec0ed0",
+      "final": "b1185c76abfbd3b8"
+    },
+    "fingerprinted_files_per_run": 349,
+    "reports": {
+      "baseline": "target/quality-campaign/baseline/analysis-corrected",
+      "final": "target/quality-campaign/final/analysis-corrected"
+    }
+  },
+  "metrics": {
+    "production_function_count": {
+      "baseline": 717,
+      "final": 718
+    },
+    "production_sloc": {
+      "baseline": 11380,
+      "final": 11365
+    },
+    "production_cognitive_complexity": {
+      "baseline": 1026,
+      "final": 1024
+    },
+    "production_cyclomatic_complexity": {
+      "baseline": 2520,
+      "final": 2522
+    },
+    "production_halstead_effort": {
+      "baseline": 7262296.212303956,
+      "final": 7252992.372849809
+    },
+    "test_function_count": {
+      "baseline": 171,
+      "final": 171
+    },
+    "test_sloc": {
+      "baseline": 5376,
+      "final": 5434
+    },
+    "test_cognitive_complexity": {
+      "baseline": 286,
+      "final": 296
+    },
+    "test_cyclomatic_complexity": {
+      "baseline": 382,
+      "final": 388
+    },
+    "test_halstead_effort": {
+      "baseline": 6082871.911378641,
+      "final": 6170664.344525819
+    },
+    "production_physical_rust_lines": {
+      "baseline": 15226,
+      "final": 15214
+    },
+    "test_physical_rust_lines": {
+      "baseline": 6547,
+      "final": 6605
+    },
+    "explicit_clone_calls": {
+      "baseline": 319,
+      "final": 321
+    },
+    "cloned_calls": {
+      "baseline": 13,
+      "final": 10
+    },
+    "physical_rust_lines": {
+      "baseline": 21773,
+      "final": 21819
+    },
+    "duplicate_lines": {
+      "baseline": 555,
+      "final": 553
+    },
+    "high_crap_functions": {
+      "baseline": 81,
+      "final": 81
+    },
+    "mean_locality_risk": {
+      "baseline": 1.5888157894736843,
+      "final": 1.5888157894736843
+    },
+    "mean_leverage_pressure": {
+      "baseline": 33.76973684210526,
+      "final": 33.76973684210526
+    },
+    "mean_observed_leverage": {
+      "baseline": 24.473684210526315,
+      "final": 24.473684210526315
+    },
+    "escape_hatches": {
+      "baseline": 6,
+      "final": 6
+    },
+    "production_reliability_findings": {
+      "baseline": 4,
+      "final": 3
+    },
+    "architecture_violations": {
+      "baseline": 1,
+      "final": 1
+    },
+    "test_quality_findings": {
+      "baseline": 2,
+      "final": 2
+    }
+  },
+  "coverage": {
+    "lines": {
+      "baseline": {
+        "available": true,
+        "count": 13526,
+        "covered": 8102,
+        "percent": 59.9
+      },
+      "final": {
+        "available": true,
+        "count": 13532,
+        "covered": 8125,
+        "percent": 60.04
+      }
+    },
+    "functions": {
+      "baseline": {
+        "available": true,
+        "count": 1593,
+        "covered": 865,
+        "percent": 54.3
+      },
+      "final": {
+        "available": true,
+        "count": 1591,
+        "covered": 865,
+        "percent": 54.37
+      }
+    },
+    "regions": {
+      "baseline": {
+        "available": true,
+        "count": 20731,
+        "covered": 12306,
+        "percent": 59.36
+      },
+      "final": {
+        "available": true,
+        "count": 20773,
+        "covered": 12376,
+        "percent": 59.58
+      }
+    },
+    "branches": {
+      "baseline": {
+        "available": false,
+        "count": 0,
+        "covered": 0,
+        "percent": null
+      },
+      "final": {
+        "available": false,
+        "count": 0,
+        "covered": 0,
+        "percent": null
+      }
+    }
+  },
+  "native_tests": {
+    "baseline_passed": 85,
+    "final_passed": 85,
+    "baseline_ignored": 2,
+    "final_ignored": 2,
+    "python_passed": 2
+  },
+  "complete_evidence": {
+    "baseline": {
+      "hotspots": false,
+      "coverage": true,
+      "clones": false,
+      "locality_metrics": false,
+      "leverage_metrics": false,
+      "correctness_review": false,
+      "api_health": false,
+      "rust_escape_hatches": false,
+      "reliability_findings": false,
+      "architecture_rules": false
+    },
+    "final": {
+      "hotspots": false,
+      "coverage": true,
+      "clones": false,
+      "locality_metrics": false,
+      "leverage_metrics": false,
+      "correctness_review": false,
+      "api_health": false,
+      "rust_escape_hatches": false,
+      "reliability_findings": false,
+      "architecture_rules": false
+    }
+  },
+  "function_line_evidence": {
+    "baseline": [
+      {
+        "function": "framing::DelimitedFrames::push",
+        "covered_lines": 21,
+        "instrumented_lines": 21
+      },
+      {
+        "function": "fast_pair::keys::AccountKeyStore::load",
+        "covered_lines": 19,
+        "instrumented_lines": 23
+      },
+      {
+        "function": "daemon::scan::select_scans",
+        "covered_lines": 21,
+        "instrumented_lines": 21
+      },
+      {
+        "function": "fast_pair::keys::AccountKeyStore::persist",
+        "covered_lines": 9,
+        "instrumented_lines": 10
+      },
+      {
+        "function": "fast_pair::commands::PendingCommands::reserve",
+        "covered_lines": 11,
+        "instrumented_lines": 11
+      }
+    ],
+    "final": [
+      {
+        "function": "framing::DelimitedFrames::push",
+        "covered_lines": 18,
+        "instrumented_lines": 18
+      },
+      {
+        "function": "fast_pair::keys::AccountKeyStore::load",
+        "covered_lines": 20,
+        "instrumented_lines": 20
+      },
+      {
+        "function": "daemon::scan::select_scans",
+        "covered_lines": 19,
+        "instrumented_lines": 19
+      },
+      {
+        "function": "model::remote_text",
+        "covered_lines": 8,
+        "instrumented_lines": 8
+      },
+      {
+        "function": "fast_pair::commands::PendingCommands::reserve",
+        "covered_lines": 12,
+        "instrumented_lines": 12
+      },
+      {
+        "function": "fast_pair::keys::AccountKeyStore::persist",
+        "covered_lines": 7,
+        "instrumented_lines": 7
+      }
+    ]
+  },
+  "gates": {
+    "native_rust_tests": "passed: 85, ignored: 2",
+    "native_clippy": "passed",
+    "native_rustfmt": "passed",
+    "python_tests": "passed: 2",
+    "diff_check": "passed",
+    "rqlens_measure_all": "published baseline and final, partial static evidence",
+    "rqlens_verify": {
+      "error_failures": 0,
+      "warning_failures": 4,
+      "optional_skipped": 11
+    },
+    "strict_rqlens_check": "failed final corrected run: partial evidence, reliability and architecture findings",
+    "repository_quality_gate": "failed baseline and final: API evidence incomplete",
+    "audit": "failed: RUSTSEC-2026-0387; four warnings",
+    "coverage_threshold": "passed: cargo llvm-cov report --summary-only --fail-under-lines 50, 60.04%"
+  }
+}

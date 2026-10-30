@@ -14,24 +14,19 @@ struct KeyFile {
 }
 
 pub(super) struct AccountKeyStore {
-    path: Option<PathBuf>,
+    path: PathBuf,
     keys: Mutex<HashMap<String, [u8; 16]>>,
 }
 
 impl AccountKeyStore {
     pub(super) fn load_default() -> Result<Self> {
-        Self::load(Some(
-            crate::state::directory()?.join("fast-pair-account-keys.json"),
-        ))
+        Self::load(crate::state::directory()?.join("fast-pair-account-keys.json"))
     }
 
-    fn load(path: Option<PathBuf>) -> Result<Self> {
+    fn load(path: PathBuf) -> Result<Self> {
         let mut keys = HashMap::new();
-        if let Some(file) = path
-            .as_deref()
-            .map(|path| crate::state::read_json::<KeyFile>(path, "Fast Pair account key store"))
-            .transpose()?
-            .flatten()
+        if let Some(file) =
+            crate::state::read_json::<KeyFile>(&path, "Fast Pair account key store")?
         {
             if file.version != STORE_VERSION {
                 bail!(
@@ -87,16 +82,13 @@ impl AccountKeyStore {
     }
 
     fn persist<'a>(&self, keys: impl Iterator<Item = (&'a String, &'a [u8; 16])>) -> Result<()> {
-        if let Some(path) = &self.path {
-            let file = KeyFile {
-                version: STORE_VERSION,
-                account_keys: keys
-                    .map(|(device, key)| (device.clone(), hex::encode(key)))
-                    .collect(),
-            };
-            crate::state::write_json(path, &file, "Fast Pair account key store")?;
-        }
-        Ok(())
+        let file = KeyFile {
+            version: STORE_VERSION,
+            account_keys: keys
+                .map(|(device, key)| (device.clone(), hex::encode(key)))
+                .collect(),
+        };
+        crate::state::write_json(&self.path, &file, "Fast Pair account key store")
     }
 
     pub(super) fn insert(&self, device_key: String, key: [u8; 16]) -> Result<()> {
@@ -133,13 +125,13 @@ mod tests {
     fn failed_key_writes_leave_insert_replace_and_remove_retryable() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("keys.json");
-        let mut store = AccountKeyStore::load(Some(path.clone())).unwrap();
+        let mut store = AccountKeyStore::load(path.clone()).unwrap();
         let original = AccountKeyStore::generate();
         assert_eq!(original[0], 4);
         let replacement = [4, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         store.insert("peer".into(), original).unwrap();
         store.insert("other".into(), original).unwrap();
-        store.path = Some(path.join("blocked.json"));
+        store.path = path.join("blocked.json");
         assert!(store.insert("new".into(), replacement).is_err());
         assert!(store.insert("peer".into(), replacement).is_err());
         assert!(store.remove("peer").is_err());
@@ -147,19 +139,39 @@ mod tests {
         assert_eq!(store.get("other"), Some(original));
         assert_eq!(store.get("new"), None);
         store.remove("missing").unwrap();
-        store.path = Some(path.clone());
+        store.path = path.clone();
         assert!(store.insert("peer".into(), [0; 16]).is_err());
-        let saved = AccountKeyStore::load(Some(path.clone())).unwrap();
+        let saved = AccountKeyStore::load(path.clone()).unwrap();
         assert_eq!(saved.get("peer"), Some(original));
         assert_eq!(saved.get("new"), None);
         store.insert("peer".into(), replacement).unwrap();
         store.remove("other").unwrap();
-        let saved = AccountKeyStore::load(Some(path.clone())).unwrap();
+        let saved = AccountKeyStore::load(path.clone()).unwrap();
         assert_eq!(saved.get("peer"), Some(replacement));
         assert_eq!(saved.get("other"), None);
         assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        let valid = fs::read(&path).unwrap();
+        for invalid in [
+            "{",
+            r#"{"version":2,"account_keys":{}}"#,
+            r#"{"version":1,"account_keys":{"peer":"xx"}}"#,
+            r#"{"version":1,"account_keys":{"peer":"04"}}"#,
+            r#"{"version":1,"account_keys":{"peer":"00000000000000000000000000000000"}}"#,
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(
+                AccountKeyStore::load(path.clone()).is_err(),
+                "accepted {invalid}"
+            );
+            assert_eq!(store.get("peer"), Some(replacement));
+        }
+        fs::write(&path, valid).unwrap();
+        assert_eq!(
+            AccountKeyStore::load(path).unwrap().get("peer"),
+            Some(replacement)
         );
     }
 }
