@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use bluer::Address;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -65,12 +65,15 @@ impl PendingCommands {
 
     pub fn reserve(&self, key: Key) -> Result<(Reservation<'_>, oneshot::Receiver<Reply>)> {
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        if entries.contains_key(&key) {
+        let Entry::Vacant(entry) = entries.entry(key) else {
             bail!("a matching Fast Pair control command is already pending");
-        }
-        let generation = self.sequence.fetch_add(1, Ordering::Relaxed);
+        };
+        let generation = self
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| anyhow::anyhow!("Fast Pair command generation exhausted"))?;
         let (sender, receiver) = oneshot::channel();
-        entries.insert(key, (generation, sender));
+        entry.insert((generation, sender));
         Ok((
             Reservation {
                 pending: self,
@@ -116,11 +119,10 @@ impl Drop for Reservation<'_> {
             .entries
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if entries
-            .get(&self.key)
-            .is_some_and(|(id, _)| *id == self.generation)
+        if let Entry::Occupied(entry) = entries.entry(self.key)
+            && entry.get().0 == self.generation
         {
-            entries.remove(&self.key);
+            entry.remove();
         }
     }
 }
@@ -191,5 +193,16 @@ mod tests {
         assert!(pending.reserve(key).is_err());
         pending.resolve(key, Ok(()));
         assert!(receiver.await.unwrap().is_ok());
+
+        // Exhaustion cannot wrap into the token still owned by an older guard.
+        pending
+            .sequence
+            .store(u64::MAX - 1, super::Ordering::Relaxed);
+        let (last, _) = pending.reserve(key).unwrap();
+        pending.resolve(key, Ok(()));
+        assert!(pending.reserve(key).is_err());
+        drop(last);
+        assert!(pending.entries.lock().unwrap().is_empty());
+        assert_eq!(pending.sequence.load(super::Ordering::Relaxed), u64::MAX);
     }
 }

@@ -120,3 +120,15 @@ The independent shared-adapter/owner-loss matrix remains unchanged.
 `cargo test --locked --lib`: 83 passed, two probes ignored (`stage2-tests.log`).
 Formatting and diff checks passed. Additional failure evidence increases test LOC;
 this is not a claim of lower test volume or a measured throughput improvement.
+
+## Improvement 3 — authenticated command reservations
+
+Map entry ownership now performs admission/removal without a second lookup.
+Generation allocation uses checked atomic advancement: exhaustion is a terminal
+admission error, never wraparound into an earlier guard's identity. The existing
+paused-time lifecycle test retains stalled writer/ACK deadlines, cancellation,
+negative ACK, transport failure, disconnect and stale-guard cases, and now checks
+last-token admission, exhaustion, unchanged maximum counter and no orphan slot.
+`cargo test --locked --lib`: 83 passed, two probes ignored (`stage3-tests.log`).
+Formatting and diff checks passed. The new exhaustion guard deliberately adds
+code; no allocation benchmark or normal-runtime performance gain is claimed.
