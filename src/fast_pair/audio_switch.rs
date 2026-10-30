@@ -22,13 +22,7 @@ pub(super) fn notification(payload: &[u8]) -> Result<FastPairSwitchEvent> {
     };
     // This is a remote-controlled display string, not markup, a shell argument,
     // or a trustworthy identity. Strip controls/bidi formatting and bound it.
-    let name = std::str::from_utf8(&payload[2..])?
-        .chars()
-        .filter(|c| {
-            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
-        .take(128)
-        .collect::<String>();
+    let name = crate::model::remote_text(std::str::from_utf8(&payload[2..])?, 128);
     Ok(FastPairSwitchEvent {
         reason: reason.into(),
         target: target.into(),

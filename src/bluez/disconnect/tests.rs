@@ -48,15 +48,23 @@ async fn private_bus_accepts_only_bluez_device_signals_and_recovers_with_a_new_l
         )
         .await
         .unwrap();
-    emit(&bluez, path, "org.bluez.Reason.Timeout", "link timeout").await;
-    let (adapter, _, report) = tokio::time::timeout(Duration::from_secs(2), events.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(adapter, "hci1");
-    assert_eq!(report.reason, DisconnectReason::Timeout);
-    assert_eq!(report.message, "link timeout");
+    for (message, expected) in [
+        (
+            "\n\u{202e}link timeout\u{2066}".into(),
+            "link timeout".into(),
+        ),
+        ("é".repeat(300), "é".repeat(256)),
+    ] {
+        emit(&bluez, path, "org.bluez.Reason.Timeout", &message).await;
+        let (adapter, _, report) = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(adapter, "hci1");
+        assert_eq!(report.reason, DisconnectReason::Timeout);
+        assert_eq!(report.message, expected);
+    }
     drop(events);
     bluez.release_name("org.bluez").await.unwrap();
     let replacement = bus

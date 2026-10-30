@@ -1698,24 +1698,23 @@ mod tests {
             assert!(noise_control_payload(&unsupported, "off").is_err());
         }
 
-        let mut payload = vec![1, 2];
-        payload.extend_from_slice("\n\u{202e}Buds".as_bytes());
-        let event = audio_switch::notification(&payload).unwrap();
-        assert_eq!(
-            (event.reason.as_str(), event.target.as_str()),
-            ("media", "another-device")
-        );
-        assert_eq!(event.target_name.as_deref(), Some("Buds"));
-        payload.extend_from_slice(&[b'x'; 200]);
-        assert_eq!(
-            audio_switch::notification(&payload)
-                .unwrap()
-                .target_name
-                .unwrap()
-                .chars()
-                .count(),
-            128
-        );
+        for (name, expected) in [
+            ("\n\u{202e}Buds".into(), Some("Buds".into())),
+            (
+                format!("Buds{}", "x".repeat(200)),
+                Some(format!("Buds{}", "x".repeat(124))),
+            ),
+            ("é".repeat(200), Some("é".repeat(128))),
+            ("\0\n\u{2066}".into(), None),
+        ] {
+            let payload = [vec![1, 2], name.into_bytes()].concat();
+            let event = audio_switch::notification(&payload).unwrap();
+            assert_eq!(
+                (event.reason.as_str(), event.target.as_str()),
+                ("media", "another-device")
+            );
+            assert_eq!(event.target_name, expected);
+        }
         for invalid in [&[1][..], &[1, 2, 0xff][..]] {
             assert!(audio_switch::notification(invalid).is_err());
         }

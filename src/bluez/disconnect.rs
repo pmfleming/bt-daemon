@@ -108,13 +108,7 @@ fn report(reason: &str, message: &str) -> DeviceDisconnect {
     };
     DeviceDisconnect {
         reason,
-        message: message
-            .chars()
-            .filter(|c| {
-                !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            })
-            .take(256)
-            .collect(),
+        message: crate::model::remote_text(message, 256),
         observed_at_ms: crate::time::unix_time_ms(),
     }
 }

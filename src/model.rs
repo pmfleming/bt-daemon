@@ -220,6 +220,17 @@ impl Battery {
     }
 }
 
+// Remote display text is bounded in Unicode characters, after stripping controls
+// and bidi formatting. Different protocols keep their existing length limits.
+pub(crate) fn remote_text(text: &str, limit: usize) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(limit)
+        .collect()
+}
+
 pub(crate) fn presentation_type(icon: Option<&str>, battery: &[Battery]) -> &'static str {
     if battery.iter().any(is_earbud_component) {
         return "Earbuds";

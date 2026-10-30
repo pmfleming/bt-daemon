@@ -132,3 +132,14 @@ last-token admission, exhaustion, unchanged maximum counter and no orphan slot.
 `cargo test --locked --lib`: 83 passed, two probes ignored (`stage3-tests.log`).
 Formatting and diff checks passed. The new exhaustion guard deliberately adds
 code; no allocation benchmark or normal-runtime performance gain is claimed.
+
+## Improvement 4 — remote display text
+
+`model::remote_text` owns the existing control/bidi stripping and Unicode-character
+bound; both callers retain their own limits. The Audio Switch owner now compares
+exact outputs for sanitized names, long ASCII, multibyte text and control-only
+names, retaining malformed UTF-8 rejection. The real private-bus disconnect
+listener checks control/bidi stripping and a 256-character multibyte bound,
+retaining sender identity, malformed signals and owner-replacement regressions.
+`cargo test --locked --lib`: 83 passed, two probes ignored (`stage4-tests.log`).
+Formatting and diff checks passed. No remote identifier/filename rules changed.
