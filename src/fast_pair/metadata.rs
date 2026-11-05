@@ -54,11 +54,9 @@ impl Catalog {
             "too many Fast Pair model entries"
         );
         let mut models = HashMap::new();
-        for (id, model) in file.models {
-            let bytes = hex::decode(id)?;
-            let id: [u8; 3] = bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("model ID must be three bytes"))?;
+        for (encoded, model) in file.models {
+            let mut id = [0; 3];
+            hex::decode_to_slice(encoded, &mut id).context("model ID must be three bytes")?;
             ensure!(
                 !model.name.is_empty()
                     && model.name.len() <= 256
@@ -132,20 +130,34 @@ pub(super) fn advertisement(data: &[u8]) -> Option<Advertisement> {
 #[cfg(test)]
 mod tests {
     use super::{Catalog, advertisement};
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     #[test]
     fn sharing_advertisements_are_bounded_versioned_and_not_account_filters() {
-        let parsed = advertisement(&[0, 0x37, 0xaa, 0xbb, 0xcc, 0x18, 3]).unwrap();
-        assert_eq!(parsed.model_id, [0xaa, 0xbb, 0xcc]);
-        let capabilities = parsed.capabilities.unwrap();
-        assert!(capabilities.le_audio_sharing && capabilities.factory_new);
-        // Extension fields, longer capability maps and reserved bits are harmless.
-        let extended = [0, 0x19, 0xff, 0x28, 0xfc, 0xff, 0x37, 1, 2, 3];
-        let parsed = advertisement(&extended).unwrap();
-        assert_eq!(parsed.model_id, [1, 2, 3]);
-        assert!(!parsed.capabilities.unwrap().le_audio_sharing);
+        for (wire, flags) in [
+            (&[1, 2, 3][..], None),
+            (&[0, 0x37, 1, 2, 3, 0x18, 3], Some((true, true))),
+            // Reordered fields, repeated unknown extensions and longer maps are valid.
+            (
+                &[0, 0x19, 0xff, 0x19, 0, 0x28, 0xfc, 0xff, 0x37, 1, 2, 3],
+                Some((false, false)),
+            ),
+            (&[0, 0x18, 1, 0x37, 1, 2, 3], Some((false, true))),
+            (&[0, 0x18, 2, 0x37, 1, 2, 3], Some((true, false))),
+        ] {
+            let parsed = advertisement(wire).map(|ad| {
+                (
+                    ad.model_id,
+                    ad.capabilities.map(|c| (c.le_audio_sharing, c.factory_new)),
+                )
+            });
+            assert_eq!(parsed, Some(([1, 2, 3], flags)), "wire={wire:?}");
+        }
         for bad in [
             &[][..],
             &[0],
+            &[0, 0x37, 1, 2, 3, 0x18, 3, 0x09], // Empty unknown field.
+            &[0, 1, 2, 3],
             &[0, 0x37],
             &[0, 0x37, 1, 2],
             &[0x10, 0x37, 1, 2, 3, 0x18, 3],
@@ -164,16 +176,33 @@ mod tests {
     }
 
     #[test]
-    fn catalog_checks_public_key_and_model_identity() {
+    fn catalog_checks_public_key_model_identity_and_private_bounded_files() -> anyhow::Result<()> {
         // SEC1 P-256 generator coordinates, for parser tests only (not production metadata).
         let key = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
         let data = serde_json::json!({"version":1,"models":{"aabbcc":{"name":"Test","anti_spoofing_public_key":key}}});
-        let catalog = Catalog::parse(&serde_json::to_vec(&data).unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&data)?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("models.json");
+        assert!(Catalog::load(&path)?.is_empty());
+        fs::write(&path, &bytes)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let catalog = Catalog::load(&path)?;
         assert!(catalog.get(&[0xaa, 0xbb, 0xcc]).is_some());
         assert!(catalog.get(&[0, 0, 0]).is_none());
-        assert!(Catalog::parse(br#"{"version":2,"models":{}}"#).is_err());
-        assert!(Catalog::parse(br#"{"version":1,"models":{"aabbcc":{"name":"Invalid","anti_spoofing_public_key":"00"}}}"#).is_err());
-        assert_eq!(advertisement(&[1, 2, 3]).unwrap().model_id, [1, 2, 3]);
-        assert_eq!(advertisement(&[0, 1, 2, 3]), None);
+        for invalid in [
+            serde_json::json!({"version":2,"models":{}}),
+            serde_json::json!({"version":1,"models":{"aabbcc":{"name":"Invalid","anti_spoofing_public_key":"00"}}}),
+            serde_json::json!({"version":1,"models":{"aabb":{"name":"Test","anti_spoofing_public_key":key}}}),
+            serde_json::json!({"version":1,"models":{"aabbcc":{"name":"Test","anti_spoofing_public_key":key},"AABBCC":{"name":"Test","anti_spoofing_public_key":key}}}),
+        ] {
+            assert!(Catalog::parse(&serde_json::to_vec(&invalid)?).is_err());
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o622))?;
+        assert!(Catalog::load(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::write(&path, vec![b' '; 1_048_577])?;
+        assert!(Catalog::load(&path).is_err());
+        assert!(Catalog::load(directory.path()).is_err());
+        Ok(())
     }
 }

@@ -189,15 +189,9 @@ impl OutgoingTransfers {
 
     pub(super) async fn cancel_owner(&self, owner: &str) {
         let mut cancellations = self.cancellations.lock().await;
-        let ids = cancellations
-            .iter()
-            .filter(|(_, c)| c.owner.as_deref() == Some(owner))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in ids {
-            if let Some(cancellation) = cancellations.remove(&id) {
-                let _ = cancellation.sender.send(());
-            }
+        for (_, cancellation) in cancellations.extract_if(|_, c| c.owner.as_deref() == Some(owner))
+        {
+            let _ = cancellation.sender.send(());
         }
     }
 
@@ -216,5 +210,45 @@ impl OutgoingTransfers {
         let _ = cancel.sender.send(());
         tracing::info!(%request_id, "outgoing OBEX transfer cancellation sent");
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arc, OutgoingCancellation, OutgoingTransfers, broadcast, oneshot};
+
+    #[tokio::test]
+    async fn owner_cleanup_releases_all_and_only_its_transfers() {
+        let transfers = OutgoingTransfers::new(
+            crate::daemon::tests::test_backend(false, false, Arc::default()),
+            broadcast::channel(1).0,
+        );
+        let mut receivers = Vec::new();
+        for (id, owner) in [
+            ("a", Some("owner")),
+            ("b", Some("owner")),
+            ("c", Some("peer")),
+            ("d", None),
+        ] {
+            let (sender, receiver) = oneshot::channel();
+            transfers.cancellations.lock().await.insert(
+                id.into(),
+                OutgoingCancellation {
+                    owner: owner.map(str::to_owned),
+                    sender,
+                },
+            );
+            receivers.push((id, owner, receiver));
+        }
+        transfers.cancel_owner("missing").await;
+        assert!(!transfers.cancel_owned("c", Some("owner")).await);
+        transfers.cancel_owner("owner").await;
+        transfers.cancel_owner("owner").await; // Idempotent after removal.
+        for (id, owner, mut receiver) in receivers {
+            let removed = owner == Some("owner");
+            assert_eq!(receiver.try_recv().is_ok(), removed);
+            assert_eq!(transfers.cancel_owned(id, owner).await, !removed);
+            assert!(removed || receiver.try_recv().is_ok());
+        }
     }
 }

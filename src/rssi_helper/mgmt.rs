@@ -81,21 +81,19 @@ fn reply(packet: &[u8], index: u16, peer: &[u8; 7]) -> Option<Reply> {
     {
         return None;
     }
-    let status = packet[8];
-    if status != 0 {
-        return Some(match status {
-            NOT_CONNECTED => Reply::NotConnected,
-            PERMISSION_DENIED => Reply::Denied,
-            _ => Reply::Unavailable,
-        });
-    }
-    if event != COMMAND_COMPLETE || packet.len() != 19 || &packet[9..16] != peer {
-        return None;
-    }
-    Some(if packet[16] == 127 {
-        Reply::Unavailable
-    } else {
-        Reply::Reading(i16::from(packet[16] as i8))
+    Some(match (packet[8], event, &packet[9..]) {
+        // Matching the seven-byte peer also enforces the exact reply length.
+        (0, COMMAND_COMPLETE, [target @ .., rssi, _, _]) if target == peer => {
+            if *rssi == 127 {
+                Reply::Unavailable
+            } else {
+                Reply::Reading(i16::from(*rssi as i8))
+            }
+        }
+        (0, _, _) => return None,
+        (NOT_CONNECTED, _, _) => Reply::NotConnected,
+        (PERMISSION_DENIED, _, _) => Reply::Denied,
+        _ => Reply::Unavailable,
     })
 }
 
@@ -192,48 +190,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_correlates_wire_replies_for_classic_and_both_le_address_types() {
+    async fn transport_correlates_wire_replies_for_classic_and_both_le_address_types()
+    -> anyhow::Result<()> {
         for (random, classic, rssi, expected) in [
             (false, true, 0, Reply::Reading(0)),
+            (false, true, 12, Reply::Reading(12)),
             (false, false, (-42_i8) as u8, Reply::Reading(-42)),
+            (true, false, 128, Reply::Reading(-128)),
             (true, false, 127, Reply::Unavailable),
         ] {
             let (client, server) = pair();
-            let address = "01:23:45:67:89:AB".parse().unwrap();
+            let address = "01:23:45:67:89:AB".parse()?;
             let worker = tokio::spawn(read_from(client, 0x1234, address, random));
             let mut buffer = [0; 32];
-            let count = server.recv(&mut buffer).await.unwrap();
+            let count = server.recv(&mut buffer).await?;
             // Independent wire expectation, not the same request encoder as production.
-            assert_eq!(
-                &buffer[..count],
-                &[
-                    0x31,
-                    0,
-                    0x34,
-                    0x12,
-                    7,
-                    0,
-                    0xab,
-                    0x89,
-                    0x67,
-                    0x45,
-                    0x23,
-                    1,
-                    if random { 2 } else { 0 }
-                ]
-            );
+            let mut request = [
+                0x31, 0, 0x34, 0x12, 7, 0, 0xab, 0x89, 0x67, 0x45, 0x23, 1, 0,
+            ];
+            request[12] = if random { 2 } else { 0 };
+            assert_eq!(&buffer[..count], request);
             if !random && !classic {
                 server
                     .send(&[1, 0, 0x34, 0x12, 3, 0, 0x31, 0, NOT_CONNECTED])
-                    .await
-                    .unwrap();
-                let count = server.recv(&mut buffer).await.unwrap();
-                assert_eq!(
-                    &buffer[..count],
-                    &[
-                        0x31, 0, 0x34, 0x12, 7, 0, 0xab, 0x89, 0x67, 0x45, 0x23, 1, 1
-                    ]
-                );
+                    .await?;
+                let count = server.recv(&mut buffer).await?;
+                request[12] = 1;
+                assert_eq!(&buffer[..count], request);
             }
             let kind = if classic {
                 0
@@ -243,32 +226,31 @@ mod tests {
                 1
             };
             let packet = complete(0x1234, &peer(address, kind), rssi);
-            server.send(&[0; 2048]).await.unwrap();
-            server
-                .send(&complete(0x1235, &peer(address, kind), 20))
-                .await
-                .unwrap();
             let mut wrong_peer = peer(address, kind);
             wrong_peer[0] ^= 1;
-            server
-                .send(&complete(0x1234, &wrong_peer, 20))
-                .await
-                .unwrap();
-            for end in [3, 9, 18] {
-                server.send(&packet[..end]).await.unwrap();
-            }
+            let mut rejected = vec![
+                vec![0; 2048],
+                complete(0x1235, &peer(address, kind), 20),
+                complete(0x1234, &wrong_peer, 20),
+                vec![2, 0, 0x34, 0x12, 3, 0, 0x31, 0, 0], // Status alone is not success.
+            ];
+            rejected.extend([3, 9, 18].map(|end| packet[..end].to_vec()));
             for (offset, value) in [(0, 3), (4, 12), (6, 0x32)] {
                 let mut malformed = packet.clone();
                 malformed[offset] = value;
-                server.send(&malformed).await.unwrap();
+                rejected.push(malformed);
             }
-            server
-                .send(&[2, 0, 0x34, 0x12, 3, 0, 0x31, 0, 0])
-                .await
-                .unwrap();
-            server.send(&packet).await.unwrap();
-            assert_eq!(worker.await.unwrap().unwrap(), (expected, classic));
+            let mut oversized = packet.clone();
+            oversized.push(0);
+            oversized[4] = 14; // Consistent header length still cannot admit an extra byte.
+            rejected.push(oversized);
+            for malformed in rejected {
+                server.send(&malformed).await?;
+            }
+            server.send(&packet).await?;
+            assert_eq!(worker.await??, (expected, classic));
         }
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

@@ -8,13 +8,16 @@ use std::sync::Arc;
 pub(super) struct Service {
     pub connection: zbus::Connection,
 }
+
+impl Service {
+    async fn daemon(&self) -> zbus::Result<zbus::object_server::InterfaceRef<BluetoothDaemon>> {
+        self.connection.object_server().interface(OBJECT_PATH).await
+    }
+}
+
 impl LocalJsonlService for Service {
     async fn call(&self, session: &SocketSession, method: &str, params: Value) -> Result<Value> {
-        let interface = self
-            .connection
-            .object_server()
-            .interface::<_, BluetoothDaemon>(OBJECT_PATH)
-            .await?;
+        let interface = self.daemon().await?;
         let daemon = interface.get().await;
         let admitted =
             match daemon
@@ -31,11 +34,7 @@ impl LocalJsonlService for Service {
         decode(admitted.encode(&response))
     }
     async fn subscribe(&self, session: &SocketSession, streams: Vec<String>) -> Result<Value> {
-        let interface = self
-            .connection
-            .object_server()
-            .interface::<_, BluetoothDaemon>(OBJECT_PATH)
-            .await?;
+        let interface = self.daemon().await?;
         let daemon = interface.get().await;
         let admitted = match daemon.boundary.subscribe(Some(session.owner()), &streams) {
             Ok(admitted) => admitted,
@@ -44,11 +43,7 @@ impl LocalJsonlService for Service {
         decode(admitted.encoded(subscription::start_socket(&daemon, streams, session).await))
     }
     async fn cancel(&self, session: &SocketSession, id: &str) -> Result<Value> {
-        let interface = self
-            .connection
-            .object_server()
-            .interface::<_, BluetoothDaemon>(OBJECT_PATH)
-            .await?;
+        let interface = self.daemon().await?;
         let daemon = interface.get().await;
         let admitted = match daemon.boundary.cancel(Some(session.owner()), id) {
             Ok(admitted) => admitted,
@@ -57,12 +52,7 @@ impl LocalJsonlService for Service {
         decode(admitted.encoded(daemon.cancel_owned(id, Some(session.owner())).await))
     }
     async fn disconnected(&self, session: &SocketSession) {
-        if let Ok(interface) = self
-            .connection
-            .object_server()
-            .interface::<_, BluetoothDaemon>(OBJECT_PATH)
-            .await
-        {
+        if let Ok(interface) = self.daemon().await {
             let daemon = interface.get().await;
             // Subscription tasks already observe session.closed(). No D-Bus
             // watcher and no global cancellation of somebody else's work.

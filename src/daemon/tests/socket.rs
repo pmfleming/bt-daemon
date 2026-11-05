@@ -84,46 +84,57 @@ impl Rig {
     async fn client(&self) -> BufReader<UnixStream> {
         BufReader::new(UnixStream::connect(self.path()).await.unwrap())
     }
+    async fn proxy(&self) -> zbus::Result<zbus::Proxy<'static>> {
+        zbus::Proxy::new_owned(
+            self.bus.connection().await,
+            api_daemon::BUS_NAME,
+            api_daemon::OBJECT_PATH,
+            api_daemon::INTERFACE,
+        )
+        .await
+    }
 }
-async fn send(client: &mut BufReader<UnixStream>, value: Value) {
+
+async fn bus_call(proxy: &zbus::Proxy<'_>, method: &str, params: &Value) -> anyhow::Result<Value> {
+    bus_rpc(proxy, "Call", &(method, params.to_string())).await
+}
+
+async fn bus_rpc(
+    proxy: &zbus::Proxy<'_>,
+    method: &str,
+    body: &(impl serde::Serialize + zvariant::DynamicType),
+) -> anyhow::Result<Value> {
+    let response: String = proxy.call(method, body).await?;
+    Ok(serde_json::from_str(&response)?)
+}
+async fn send(client: &mut BufReader<UnixStream>, value: Value) -> std::io::Result<()> {
     client
         .get_mut()
         .write_all(format!("{value}\n").as_bytes())
         .await
-        .unwrap();
 }
-async fn next(client: &mut BufReader<UnixStream>) -> Value {
+async fn next(client: &mut BufReader<UnixStream>) -> anyhow::Result<Value> {
     let mut line = String::new();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap()
-            > 0
-    );
-    serde_json::from_str(&line).unwrap()
+    assert!(tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut line)).await?? > 0);
+    Ok(serde_json::from_str(&line)?)
 }
-async fn call(client: &mut BufReader<UnixStream>, method: &str, params: Value) -> Value {
+async fn call(
+    client: &mut BufReader<UnixStream>,
+    method: &str,
+    params: Value,
+) -> anyhow::Result<Value> {
     send(
         client,
         json!({"op":"call","id":"call","method":method,"params":params}),
     )
-    .await;
-    next(client).await["response"].clone()
+    .await?;
+    Ok(next(client).await?["response"].take())
 }
 
 #[tokio::test]
-async fn snapshot_reads_and_events_share_atomic_state_on_both_transports() {
+async fn snapshot_reads_and_events_share_atomic_state_on_both_transports() -> anyhow::Result<()> {
     let mut rig = Rig::new().await;
-    let bus_client = rig.bus.connection().await;
-    let proxy = zbus::Proxy::new(
-        &bus_client,
-        api_daemon::BUS_NAME,
-        api_daemon::OBJECT_PATH,
-        api_daemon::INTERFACE,
-    )
-    .await
-    .unwrap();
+    let proxy = rig.proxy().await?;
     for (stream, method) in [
         (api_daemon::CHANGED_STREAM, "bluetooth.snapshot"),
         (api_daemon::AUDIO_STREAM, "bluetooth.audio.snapshot"),
@@ -133,10 +144,10 @@ async fn snapshot_reads_and_events_share_atomic_state_on_both_transports() {
             &mut peer,
             json!({"op":"subscribe","id":"sub","streams":[stream]}),
         )
-        .await;
-        assert_eq!(next(&mut peer).await["kind"], "response");
-        let initial = next(&mut peer).await;
-        let captured_read = call(&mut peer, method, json!({})).await;
+        .await?;
+        assert_eq!(next(&mut peer).await?["kind"], "response");
+        let initial = next(&mut peer).await?;
+        let captured_read = call(&mut peer, method, json!({})).await?;
         assert_eq!(
             captured_read["data"]["state"],
             initial["event"]["data"]["state"]
@@ -161,11 +172,10 @@ async fn snapshot_reads_and_events_share_atomic_state_on_both_transports() {
                 );
             }
         }
-        let update = next(&mut peer).await;
+        let update = next(&mut peer).await?;
         assert_eq!(update["event"]["event"], "unavailable");
-        let read = call(&mut peer, method, json!({})).await;
-        let bus_read: String = proxy.call("Call", &(method, "{}")).await.unwrap();
-        assert_eq!(read, serde_json::from_str::<Value>(&bus_read).unwrap());
+        let read = call(&mut peer, method, json!({})).await?;
+        assert_eq!(read, bus_call(&proxy, method, &json!({})).await?);
         assert_eq!(read["data"]["state"], update["event"]["data"]["state"]);
         assert_eq!(
             read["data"]["state"]["epoch"],
@@ -179,51 +189,41 @@ async fn snapshot_reads_and_events_share_atomic_state_on_both_transports() {
         assert_eq!(read["ok"], false);
     }
     rig.stop().await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_work() {
+async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_work()
+-> anyhow::Result<()> {
     let mut rig = Rig::new().await;
-    let bus_client = rig.bus.connection().await;
-    let proxy = zbus::Proxy::new(
-        &bus_client,
-        api_daemon::BUS_NAME,
-        api_daemon::OBJECT_PATH,
-        api_daemon::INTERFACE,
-    )
-    .await
-    .unwrap();
+    let proxy = rig.proxy().await?;
     let mut a = rig.client().await;
     let mut b = rig.client().await;
-    let bus_snapshot: String = proxy
-        .call("Call", &("bluetooth.snapshot", "{}"))
-        .await
-        .unwrap();
+    let bus_snapshot = bus_call(&proxy, "bluetooth.snapshot", &json!({})).await?;
     assert_eq!(
-        call(&mut a, "bluetooth.snapshot", json!({})).await,
-        serde_json::from_str::<Value>(&bus_snapshot).unwrap()
+        call(&mut a, "bluetooth.snapshot", json!({})).await?,
+        bus_snapshot
     );
     let operation = call(
         &mut a,
         "bluetooth.device.operation",
         json!({"key":"device-socket","operation":"connect"}),
     )
-    .await;
+    .await?;
     let id = operation["data"]["operation"]["request_id"]
         .as_str()
         .unwrap();
-    let cancelled: String = proxy.call("Cancel", &(id,)).await.unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&cancelled).unwrap()["error"]["code"],
+        bus_rpc(&proxy, "Cancel", &(id,)).await?["error"]["code"],
         "request-not-found"
     );
     send(
         &mut b,
         json!({"op":"cancel","id":"foreign","request_id":id}),
     )
-    .await;
+    .await?;
     assert_eq!(
-        next(&mut b).await["response"]["error"]["code"],
+        next(&mut b).await?["response"]["error"]["code"],
         "request-not-found"
     );
     assert_eq!(
@@ -232,35 +232,30 @@ async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_
             "bluetooth.scan",
             json!({"enabled":true,"timeout_ms":60000})
         )
-        .await["ok"],
+        .await?["ok"],
         true
     );
-    let bus_scan: String = proxy
-        .call(
-            "Call",
-            &(
-                "bluetooth.scan",
-                json!({"enabled":true,"timeout_ms":60000}).to_string(),
-            ),
-        )
-        .await
-        .unwrap();
-    let bus_scan: Value = serde_json::from_str(&bus_scan).unwrap();
+    let bus_scan = bus_call(
+        &proxy,
+        "bluetooth.scan",
+        &json!({"enabled":true,"timeout_ms":60000}),
+    )
+    .await?;
     let bus_id = bus_scan["data"]["scan"]["request_id"].as_str().unwrap();
     let route = json!({"consumerId":"view","localId":"sub","generation":1,"kind":"subscription"});
     send(
         &mut a,
         json!({"op":"subscribe","id":"sub","streams":["bluetooth.changed"],"route":route}),
     )
-    .await;
-    assert_eq!(next(&mut a).await["route"], route);
-    let event = next(&mut a).await;
+    .await?;
+    assert_eq!(next(&mut a).await?["route"], route);
+    let event = next(&mut a).await?;
     assert_eq!(event["event"]["event"], "subscribed");
     assert_eq!(event["route"], route);
     drop(a);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let state = call(&mut b, "bluetooth.requests.snapshot", json!({})).await;
+            let state = call(&mut b, "bluetooth.requests.snapshot", json!({})).await?;
             // Operation snapshots are now caller-private; a foreign empty list
             // is not evidence of cleanup. Re-admission on the same device is.
             let admitted = call(
@@ -268,7 +263,7 @@ async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_
                 "bluetooth.device.operation",
                 json!({"key":"device-socket", "operation":"connect"}),
             )
-            .await;
+            .await?;
             if admitted["ok"] == true {
                 let peer_id = admitted["data"]["operation"]["request_id"]
                     .as_str()
@@ -277,8 +272,8 @@ async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_
                     &mut b,
                     json!({"op":"cancel", "id":"peer-cleanup", "request_id":peer_id}),
                 )
-                .await;
-                assert_eq!(next(&mut b).await["response"]["ok"], true);
+                .await?;
+                assert_eq!(next(&mut b).await?["response"]["ok"], true);
             } else {
                 assert_eq!(admitted["error"]["code"], "device-busy");
             }
@@ -289,18 +284,13 @@ async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_
                     .len()
                     == 1
             {
-                break;
+                break Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await
-    .unwrap();
-    let cancelled: String = proxy.call("Cancel", &(bus_id,)).await.unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&cancelled).unwrap()["ok"],
-        true
-    );
+    .await??;
+    assert_eq!(bus_rpc(&proxy, "Cancel", &(bus_id,)).await?["ok"], true);
     rig.stop().await;
     let mut end = String::new();
     assert_eq!(b.read_line(&mut end).await.unwrap(), 0);
@@ -310,9 +300,10 @@ async fn socket_and_bus_share_dispatch_and_disconnect_cancels_only_socket_owned_
         &mut reopened,
         json!({"op":"subscribe","id":"fresh","streams":["bluetooth.changed"]}),
     )
-    .await;
-    next(&mut reopened).await;
-    assert_eq!(next(&mut reopened).await["event"]["event"], "subscribed");
+    .await?;
+    next(&mut reopened).await?;
+    assert_eq!(next(&mut reopened).await?["event"]["event"], "subscribed");
     drop(reopened);
     rig.stop().await;
+    Ok(())
 }

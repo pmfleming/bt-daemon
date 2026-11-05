@@ -1,0 +1,153 @@
+bt-daemon RQLens implementation review, 2026-11-05
+
+Scope and provenance
+Repository: /home/laufan/Projects/bt-daemon
+Starting tree: clean, HEAD 72104ab4e924df0f7ffd5184458954d776c0e1be.
+Implementation changes are confined to this repository. No public API, protocol,
+CLI, dependency, lockfile, threshold, framework source or panel changes.
+Raw before/after evidence, source inventory/audit scripts, comparison.json,
+source archive and analysis-only snapshots: target/rqlens-refactor/.
+The original before artifacts are retained separately from final after output.
+
+Both final comparisons use the original current-source analyzer executable:
+  source HEAD d137d8d8f219b4ee788935aff27115374626d2f8
+  SHA256 8f9a8852860c8e63c1f23e479e90f1ced9e711224e3c57299fca6a523f0afb9f
+The parent replaced target/debug/rqlens during work. Its original Cargo deps
+binary was recovered by exact hash and retained at target/rqlens-refactor/rqlens;
+no analyzer was edited/rebuilt here. Superseded captures were refreshed.
+Rust/Cargo 1.95.0, LLVM 21.1.8, cargo-llvm-cov 0.8.5; same Nix shell throughout.
+Configured RQLens source scope remains src; generated/build/vendor exclusions
+are unchanged. Actual Rust LOC additionally includes test_support.
+
+Framework HEAD stayed 8d4a773f7bbdd94375b8bfefb0ab9404e415544e. Another worker's
+Hyprland changes altered its whole tracked-tree SHA256:
+  before d754d605fd4f6fd3cf51b822d8cfd3e64032ea2335d6c4ca03a1a028065212fa
+  after  e6cdc69ebe5dc6a5c3e6a8f296c36be91169d76c54d4e5d07241d402c30dbc0d
+BT's two framework dependencies remained byte-identical, including manifests:
+  core  90ecbe7735c11c9e9993b02ecc56766df24e93ecb4171cf2a77c7480bef7a179
+  tokio 72324a59151c78111a1b6c3dd55dbe5ec8b91b4592b4b1e21ec89d19ce006bc4
+Fingerprints and statuses are retained beside both evidence roots.
+
+Ranked findings and implemented changes
+1. Repeated socket/D-Bus fixture setup and JSON reply decoding were the clearest
+   actionable duplication. Share owned test proxies and typed RPC decoding;
+   borrow D-Bus JSON parameters, move socket responses rather than cloning them,
+   and propagate fixture I/O failures. Retain transport parity, owner loss,
+   cancellation, private status, atomic snapshots and recreation assertions.
+   Production Service now owns its common exported-interface lookup as well.
+2. RSSI management reply correlation ranked near the production complexity
+   ceiling (cognitive 9). Match the successful payload's peer and shape together,
+   retaining adapter/opcode/event/declared-length/status guards. Consolidate
+   rejected datagrams into one transport table; add positive classic RSSI,
+   signed -128 LE and consistently length-prefixed oversized replies.
+3. Outgoing OBEX owner cleanup cloned every matching ID into a temporary Vec,
+   then performed another lookup. HashMap::extract_if moves only owned entries
+   directly. New table checks multiple same-owner transfers, foreign/unowned
+   isolation, missing owners, idempotence and actual cancellation delivery.
+4. Trusted Fast Pair catalog parsing allocated a Vec for every three-byte ID.
+   Decode directly into its fixed array. Extend existing tests through real
+   catalog loading: absent/private/writable/oversized/nonregular files, duplicate
+   normalized IDs and invalid widths. Advertisement tables add independent flag
+   combinations, repeated unknown fields and zero-length unknown rejection.
+   Its production rewrite was reverted after measurements showed no benefit.
+5. Larger orchestration functions (snapshot assembly, daemon startup and
+   subscription forwarding) remain important effort hotspots. Their ownership,
+   acknowledgement and retry boundaries did not justify fragmentation here.
+   The AST clone matches include unrelated small classification/shutdown bodies;
+   they were not forcibly unified. No production dead item was proven/removable;
+   no dead-code improvement is claimed. Strict compiler/Clippy checks are clean.
+
+Comparable measurements (before -> after)
+Raw per-production-function sums, classified with frozen cfg(test) source spans:
+  functions:             718 -> 719 (one shared Service accessor)
+  cognitive complexity: 1024 -> 1020
+  cyclomatic complexity:2522 -> 2520
+  Halstead effort sum: 7,252,992.37 -> 7,247,483.76 (-0.076%)
+These sums are advisory inventories, not whole-program effort or developer hours.
+Selected functions:                 cognitive  cyclomatic  Halstead effort
+  OBEX cancel_owner                 3 -> 1     3 -> 2      10,234.92 -> 4,289.27
+  Catalog::parse                    1 -> 1     6 -> 5      21,015.41 -> 18,072.74
+  RSSI reply                        9 -> 7    14 -> 13     34,261.36 -> 40,385.92
+RSSI effort regresses 17.88%; retain the direct peer/shape guard because it
+reduces nesting/decisions and keeps correlation together. Aggregate gains are
+small; no claim that every metric/function improved.
+
+  duplicated lines:                 553 -> 445 (-108, -19.53%)
+  token clone groups / AST groups: 40/2 -> 32/2
+  duplication percentage:          2.82 -> 2.28
+These are repeated-code findings, not .clone allocation counts. Separately,
+remove one production cloned-ID site and its staging allocation, one catalog
+allocation per ID, and the socket helper's response clone. Channel/connection
+handle clones required for ownership remain; no runtime allocation benchmark.
+
+Architecture needs matching evidence backends: auto identity timed out during
+the original baseline but resolved more references after, so its raw mean
+leverage 1.58 -> 24.61 and locality 98.65 -> 98.41 are NOT comparable gains.
+Supplementary before/after scans use identical identity_resolution="disabled"
+configs over source-only snapshots, linked to the same live framework (no fork).
+Across the same 76 modules: mean locality 98.6480 -> 98.6480; mean observed reuse
+leverage 20.2632 -> 20.3947. Only daemon::tests changes (10 -> 20), reflecting
+reuse of its backend fixture. Production locality/leverage do not improve.
+Both syntax-only architecture inventories remain partial for unresolved refs.
+
+Production/test Rust physical LOC: 15,214/6,605 -> 15,195/6,601 (-19/-4).
+Nonblank LOC: 14,174/6,391 -> 14,152/6,383 (-22/-8).
+Physical counts include comments/blanks; test modules, helpers, cfg(test) items
+and test_support are classified as test. See inventory.py and per-file masks.
+New risk coverage absorbs most of the removed setup volume. Test count is not
+being reduced by discarding scenarios: executed Rust passes 85 -> 86, ignored
+acceptance probes 2 -> 2; Python tests 2 -> 2. RQLens's syntax test inventory
+86 -> 87 omits one included integration case and is not execution authority.
+Test-quality findings remain two ignored probes; assertionless tests stay zero.
+Production reliability: three existing fixture-serialization expects unchanged.
+Test unwrap findings: 390 -> 352; expect/panic findings remain 8/2.
+Escape findings unchanged: one unsafe block, one repr layout, four glob imports.
+The existing privileged bind safety contract and all validation guards remain.
+
+Executed LLVM line coverage, identical all-target/all-feature/locked scope:
+  project (includes inline tests): 7396/12397 = 59.66% -> 7439/12413 = 59.93%
+  production-only source mask:     4978/9958 = 49.99% -> 4981/9934 = 50.14%
+  catalog production:                58/83 = 69.88% -> 74/81 = 91.36%
+  OBEX coordinator production:      48/143 = 33.57% -> 52/138 = 37.68%
+  RSSI production:                  88/112 = 78.57% -> 84/108 = 77.78%
+  socket adapter production:         54/74 = 72.97% -> 41/61 = 67.21%
+RSSI/socket percentages fall after removing covered repetition; their uncovered
+line counts stay 24/20. Denominators change; this is not branch coverage,
+unchanged-line coverage or proof of complete hardware/subprocess coverage.
+Production masks are an audit only: no coverage configuration was changed.
+
+Commands and verification
+Working directory for all commands: /home/laufan/Projects/bt-daemon.
+Environment was captured from:
+  nix develop . --override-input daemonFramework git+file:/home/laufan/Projects/daemon-framework --no-write-lock-file --command bash
+  source target/rqlens-refactor/environment.sh
+  export CARGO_BUILD_JOBS=2
+The path: override first encountered a changing sibling target directory;
+Git-filtered local input succeeded. Cargo still builds the live path dependencies.
+Before/after TOML copies change only project_root/output_dir to absolute paths;
+both primary captures have config digest 45345b9a6234c910 and helper digest
+7caa701fa05b90a9. Source-only capture started first; all baseline static evidence
+and executed coverage completed before implementation edits.
+  for p in hotspots locality leverage clones reliability test-quality escape-hatches; do /home/laufan/Projects/rust-quality-lens/target/debug/rqlens measure "$p" --config target/rqlens-refactor/before.toml; done
+  for p in hotspots locality leverage clones reliability test-quality escape-hatches; do target/rqlens-refactor/rqlens measure "$p" --config target/rqlens-refactor/after.toml; done
+  for phase in before after; do for p in locality leverage; do target/rqlens-refactor/rqlens measure "$p" --config "target/rqlens-refactor/$phase-syntax.toml"; done; done
+  cargo llvm-cov --all-targets --all-features --locked --lcov --output-path target/rqlens-refactor/before/coverage.lcov
+  cargo llvm-cov --all-targets --all-features --locked --lcov --output-path target/rqlens-refactor/after/coverage.lcov
+  cargo test --all-targets --all-features --locked
+  cargo clippy --all-targets --all-features --locked -- -D warnings
+  cargo fmt --all -- --check
+  python3 -m unittest discover -s scripts -p 'test_quality_gate.py'
+  python3 target/rqlens-refactor/inventory.py before
+  python3 target/rqlens-refactor/inventory.py after
+  python3 target/rqlens-refactor/compare.py
+  git diff --check
+Tests, coverage execution, strict Clippy, fmt, Python tests and whitespace checks
+pass. No locks, thresholds or exclusions were loosened; no lint suppression,
+unsafe code or unwrap escape was added. Final diff reviewed for accidental edits.
+
+Limits: no hardware, mutation, audit or ignored Quickshell acceptance experiment.
+Macro/identity evidence is explicitly partial. Full measure all/enforcement was
+not run or claimed green: current duplicated lines 445 still exceed the existing
+312 budget, and ignored-test findings remain. Three production fixture expects,
+large orchestration effort and missing hardware/branch evidence remain follow-up
+work. No commits, pushes, PRs, deployment or host service restarts were performed.
